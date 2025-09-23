@@ -1,0 +1,26 @@
+# project-local conda env
+.envs/
+.env/
+env/
+venv/
+
+# conda/mamba caches
+.conda/
+.mamba/
+
+# Python cruft
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# temporary artifacts
+*.tmp
+*.log
