@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# install_cupy.sh (robust v3.2)
-# - Detect NVIDIA/ROCm
-# - Try CuPy wheels (12x/11x)
-# - If NVRTC missing, install NVIDIA NVRTC/runtime shims and re-verify
+# install_cupy.sh (robust v3.3)
+# - Detect NVIDIA/ROCm (parse nvidia-smi header; no --query)
+# - Install CuPy (12x/11x)
+# - If NVRTC missing, install NVIDIA NVRTC/runtime shims,
+#   link their libs into $CONDA_PREFIX/lib, and add an activate hook
 # - Verify with a tiny GPU FFT
 set -Eeuo pipefail
 
@@ -11,21 +12,16 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 detect_cuda_major() {
   # Print ONLY CUDA major digits; no logging here.
-  local cuda_ver=""
+  local header_line cuda_ver
   if command -v nvidia-smi >/dev/null 2>&1; then
-    cuda_ver="$(nvidia-smi --query-gpu=cuda_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
-    if [[ -z "${cuda_ver//N\/A/}" ]]; then
-      local header_line
-      header_line="$(nvidia-smi 2>/dev/null | awk '/CUDA Version/ {print $0; exit}' || true)"
-      cuda_ver="$(sed -n 's/.*CUDA Version: \([0-9][0-9]*\)\(\.[0-9]*\)\?.*/\1/p' <<<"$header_line" || true)"
-    fi
+    header_line="$(nvidia-smi 2>/dev/null | awk '/CUDA Version/ {print $0; exit}' || true)"
+    cuda_ver="$(sed -n 's/.*CUDA Version: \([0-9][0-9]*\)\(\.[0-9]*\)\?.*/\1/p' <<<"$header_line" || true)"
   fi
   if [[ -z "$cuda_ver" ]] && command -v nvcc >/dev/null 2>&1; then
-    local nvcc_line
-    nvcc_line="$(nvcc --version 2>/dev/null | awk -F',|release' '/release/ {gsub(/ /,""); print $3; exit}' || true)"
-    cuda_ver="${nvcc_line%%.*}"
+    cuda_ver="$(nvcc --version 2>/dev/null | awk -F',|release' '/release/ {gsub(/ /,""); print $3; exit}')"
+    cuda_ver="${cuda_ver%%.*}"
   fi
-  [[ -n "$cuda_ver" ]] && printf '%s\n' "${cuda_ver%%.*}" || true
+  [[ "$cuda_ver" =~ ^[0-9]+$ ]] && printf '%s\n' "$cuda_ver" || true
 }
 
 verify_cupy() {
@@ -47,6 +43,64 @@ except Exception as e:
 PY
 }
 
+link_nvidia_shims_into_prefix() {
+  # Symlink NVRTC/runtime .so's from the PyPI shim packages into $CONDA_PREFIX/lib,
+  # and add a simple activate hook to append that path to LD_LIBRARY_PATH.
+  local prefix="${CONDA_PREFIX:-}"
+  if [[ -z "$prefix" ]]; then
+    prefix="$("$PYTHON_BIN" - <<'PY'
+import os
+print(os.environ.get("CONDA_PREFIX",""))
+PY
+)"
+  fi
+  if [[ -z "$prefix" ]]; then
+    log "CONDA_PREFIX not set; cannot link shims."
+    return 1
+  fi
+
+  local libdirs
+  libdirs="$("$PYTHON_BIN" - <<'PY'
+import os, importlib
+dirs=[]
+for name in ("nvidia.cuda_nvrtc","nvidia.cuda_runtime"):
+    try:
+        m=importlib.import_module(name)
+        d=os.path.join(os.path.dirname(m.__file__), "lib")
+        if os.path.isdir(d): dirs.append(d)
+    except Exception:
+        pass
+print(":".join(dirs))
+PY
+)"
+  if [[ -z "$libdirs" ]]; then
+    log "No NVRTC/runtime shim lib dirs found in site-packages."
+    return 1
+  fi
+
+  mkdir -p "$prefix/lib"
+  IFS=':' read -r -a arr <<< "$libdirs"
+  for d in "${arr[@]}"; do
+    for so in "$d"/*.so*; do
+      [[ -e "$so" ]] || continue
+      ln -sf "$so" "$prefix/lib/$(basename "$so")"
+    done
+  done
+
+  # Minimal activate/deactivate hooks: prepend $CONDA_PREFIX/lib to LD_LIBRARY_PATH
+  mkdir -p "$prefix/etc/conda/activate.d" "$prefix/etc/conda/deactivate.d"
+  cat > "$prefix/etc/conda/activate.d/10-cuda-shims.sh" <<'ACT'
+# added by install_cupy.sh
+export _CUDA_SHIMS_OLD_LDLP="${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+ACT
+  cat > "$prefix/etc/conda/deactivate.d/10-cuda-shims.sh" <<'DEACT'
+# added by install_cupy.sh
+export LD_LIBRARY_PATH="${_CUDA_SHIMS_OLD_LDLP:-}"
+unset _CUDA_SHIMS_OLD_LDLP
+DEACT
+}
+
 install_nvrtc_runtime() {
   local major="$1"
   if [[ "$major" == "12" ]]; then
@@ -57,6 +111,7 @@ install_nvrtc_runtime() {
     $PYTHON_BIN -m pip install -U nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 || true
     $PYTHON_BIN -m pip install -U nvidia-cuda-runtime-cu11 nvidia-cuda-nvrtc-cu11 || true
   fi
+  link_nvidia_shims_into_prefix || true
 }
 
 try_install_nvidia() {
@@ -80,7 +135,6 @@ try_install_nvidia() {
       continue
     fi
 
-    # First verify
     out="$(verify_cupy 2>&1)"; status=$?
     if [[ $status -eq 0 ]]; then
       log "✅ ${pkg} works. ${out}"
@@ -91,7 +145,6 @@ try_install_nvidia() {
     echo "$out" >&2
 
     if grep -qiE 'libnvrtc\.so\.(11|12)|nvrtc' <<<"$out"; then
-      # Determine which major to use for shims (prefer detected, else parse error text)
       local m="$major"
       [[ -z "$m" ]] && m="$(grep -oE 'libnvrtc\.so\.(11|12)' <<<"$out" | grep -oE '(11|12)' | head -n1 || true)"
       log "NVRTC missing → installing NVIDIA NVRTC/runtime shims for CUDA ${m:-unknown}…"
@@ -106,7 +159,7 @@ try_install_nvidia() {
         log "Still failing after NVRTC/runtime; uninstalling ${pkg}."
         $PYTHON_BIN -m pip uninstall -y "$pkg" || true
       fi
-    else
+    } else
       log "Failure wasn’t NVRTC-related; uninstalling ${pkg}."
       $PYTHON_BIN -m pip uninstall -y "$pkg" || true
     fi
