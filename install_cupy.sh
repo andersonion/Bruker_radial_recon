@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# install_cupy.sh (robust v3.1, no stray 'then')
+# install_cupy.sh (robust v3.2)
 # - Detect NVIDIA/ROCm
-# - Try matching CuPy wheel (12x/11x)
-# - If NVRTC missing, auto-install NVIDIA NVRTC/runtime shims
+# - Try CuPy wheels (12x/11x)
+# - If NVRTC missing, install NVIDIA NVRTC/runtime shims and re-verify
 # - Verify with a tiny GPU FFT
 set -Eeuo pipefail
 
@@ -26,6 +26,25 @@ detect_cuda_major() {
     cuda_ver="${nvcc_line%%.*}"
   fi
   [[ -n "$cuda_ver" ]] && printf '%s\n' "${cuda_ver%%.*}" || true
+}
+
+verify_cupy() {
+  # Prints JSON to stdout; returns 0 on success, 1 on failure.
+  "$PYTHON_BIN" - <<'PY'
+import sys, json
+try:
+    import cupy as cp
+    n = cp.cuda.runtime.getDeviceCount()
+    if n > 0:
+        x = cp.arange(1024, dtype=cp.float32)
+        _ = cp.fft.fft(x)
+        cp.cuda.Stream.null.synchronize()
+    print(json.dumps({"ok": True, "version": getattr(cp,"__version__","unknown"), "gpus": int(n)}))
+    sys.exit(0)
+except Exception as e:
+    print(json.dumps({"ok": False, "err": repr(e)}))
+    sys.exit(1)
+PY
 }
 
 install_nvrtc_runtime() {
@@ -61,61 +80,35 @@ try_install_nvidia() {
       continue
     fi
 
-    # Verify CuPy import + a small FFT; capture JSON in $out
-    local out
-    if out="$($PYTHON_BIN - <<'PY' 2>&1)"; then
-import sys, json
-try:
-    import cupy as cp
-    n = cp.cuda.runtime.getDeviceCount()
-    if n > 0:
-        x = cp.arange(1024, dtype=cp.float32)
-        _ = cp.fft.fft(x)
-        cp.cuda.Stream.null.synchronize()
-    print(json.dumps({"ok": True, "version": getattr(cp, "__version__", "unknown"), "gpus": int(n)}))
-    sys.exit(0)
-except Exception as e:
-    print(json.dumps({"ok": False, "err": repr(e)}))
-    sys.exit(1)
-PY
-    then
+    # First verify
+    out="$(verify_cupy 2>&1)"; status=$?
+    if [[ $status -eq 0 ]]; then
       log "✅ ${pkg} works. ${out}"
       return 0
-    else
-      log "Import failed after ${pkg}. Inspecting cause…"
-      echo "$out" >&2
-      if grep -qiE 'libnvrtc\.so\.(11|12)|nvrtc' <<<"$out"; then
-        local m="$major"
-        [[ -z "$m" ]] && m="$(grep -oE 'libnvrtc\.so\.(11|12)' <<<"$out" | grep -oE '(11|12)' | head -n1 || true)"
-        log "NVRTC missing → installing NVIDIA NVRTC/runtime shims for CUDA ${m:-unknown}…"
-        install_nvrtc_runtime "${m:-}"
-        # Re-verify after NVRTC install
-        if out="$($PYTHON_BIN - <<'PY' 2>&1)"; then
-import sys, json
-try:
-    import cupy as cp
-    n = cp.cuda.runtime.getDeviceCount()
-    if n > 0:
-        x = cp.arange(1024, dtype=cp.float32)
-        _ = cp.fft.fft(x)
-        cp.cuda.Stream.null.synchronize()
-    print(json.dumps({"ok": True, "version": getattr(cp, "__version__", "unknown"), "gpus": int(n)}))
-    sys.exit(0)
-except Exception as e:
-    print(json.dumps({"ok": False, "err": repr(e)}))
-    sys.exit(1)
-PY
-        then
-          log "✅ ${pkg} works after NVRTC/runtime shims. ${out}"
-          return 0
-        else
-          log "Still failing after NVRTC/runtime; uninstalling ${pkg}."
-          $PYTHON_BIN -m pip uninstall -y "$pkg" || true
-        fi
+    fi
+
+    log "Import failed after ${pkg}. Inspecting cause…"
+    echo "$out" >&2
+
+    if grep -qiE 'libnvrtc\.so\.(11|12)|nvrtc' <<<"$out"; then
+      # Determine which major to use for shims (prefer detected, else parse error text)
+      local m="$major"
+      [[ -z "$m" ]] && m="$(grep -oE 'libnvrtc\.so\.(11|12)' <<<"$out" | grep -oE '(11|12)' | head -n1 || true)"
+      log "NVRTC missing → installing NVIDIA NVRTC/runtime shims for CUDA ${m:-unknown}…"
+      install_nvrtc_runtime "${m:-}"
+
+      # Re-verify
+      out="$(verify_cupy 2>&1)"; status=$?
+      if [[ $status -eq 0 ]]; then
+        log "✅ ${pkg} works after NVRTC/runtime shims. ${out}"
+        return 0
       else
-        log "Failure wasn’t NVRTC-related; uninstalling ${pkg}."
+        log "Still failing after NVRTC/runtime; uninstalling ${pkg}."
         $PYTHON_BIN -m pip uninstall -y "$pkg" || true
       fi
+    else
+      log "Failure wasn’t NVRTC-related; uninstalling ${pkg}."
+      $PYTHON_BIN -m pip uninstall -y "$pkg" || true
     fi
   done
   return 1
@@ -129,23 +122,14 @@ try_install_rocm() {
   local pkg="cupy-rocm-$(echo "$rocm_ver" | tr '.' '-')"
   log "ROCm ${rocm_ver} detected → installing ${pkg}…"
   if $PYTHON_BIN -m pip install -U "$pkg"; then
-    $PYTHON_BIN - <<'PY' || { log "ROCm verify failed."; return 1; }
-import sys, json
-try:
-    import cupy as cp
-    n = cp.cuda.runtime.getDeviceCount()
-    if n > 0:
-        x = cp.arange(1024, dtype=cp.float32)
-        _ = cp.fft.fft(x)
-        cp.cuda.Stream.null.synchronize()
-    print(json.dumps({"ok": True, "version": getattr(cp, "__version__", "unknown"), "gpus": int(n)}))
-    sys.exit(0)
-except Exception as e:
-    print(json.dumps({"ok": False, "err": repr(e)}))
-    sys.exit(1)
-PY
-    log "✅ ${pkg} works."
-    return 0
+    out="$(verify_cupy 2>&1)"; status=$?
+    if [[ $status -eq 0 ]]; then
+      log "✅ ${pkg} works. ${out}"
+      return 0
+    else
+      log "ROCm verify failed. ${out}"
+      return 1
+    fi
   fi
   return 1
 }
