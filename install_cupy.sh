@@ -138,4 +138,14 @@ PY
 
 log "Detecting GPU runtime…"
 cuda_major="$(detect_cuda_major || true)"
-if command -v nvidia-smi
+if command -v nvidia-smi >/dev/null 2>&1; then
+  if try_install_nvidia "${cuda_major:-}"; then exit 0; fi
+fi
+if try_install_rocm; then exit 0; fi
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  log "NVIDIA runtime present but wheels failed. Staying CPU-only."
+else
+  log "No supported GPU runtime found. Staying CPU-only."
+fi
+exit 0
