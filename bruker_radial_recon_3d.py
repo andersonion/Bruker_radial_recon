@@ -158,18 +158,22 @@ def load_bruker_series(series_dir: str):
 
 # ---------- Trajectory ----------
 def make_ga_traj_3d(nspokes: int, nread: int) -> np.ndarray:
-    """Golden-angle-ish 3D radial coords (M, 3) in ~[-0.5, 0.5)."""
+    # Directions on the sphere (Fibonacci / phyllotaxis)
     i = np.arange(nspokes, dtype=np.float64) + 0.5
     phi = (1 + np.sqrt(5)) / 2
     z = 1.0 - 2.0 * i / (nspokes + 1.0)
     r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
     theta = 2.0 * np.pi * i / (phi ** 2)
     dirs = np.stack([r * np.cos(theta), r * np.sin(theta), z], axis=1)  # (nspokes, 3)
-    kmax = 0.5
+
+    # Readout radii in **radians** per FOV (SigPy expects radian coords)
+    kmax = np.pi   # full-FOV coverage ~ [-π, π]
     t = np.linspace(-1.0, 1.0, nread, endpoint=False, dtype=np.float64)
-    radii = (kmax * t).astype(np.float64)[:, None]                         # (nread, 1)
-    ktraj = (radii * dirs[None, :, :]).reshape(-1, 3)                      # (M, 3)
+    radii = (kmax * t)[:, None, None]  # <-- FIX: (nread, 1, 1)
+
+    ktraj = (radii * dirs[None, :, :]).reshape(-1, 3)  # (M, 3) with M = nread * nspokes
     return ktraj.astype(np.float32)
+
 
 # ---------- Recon (adjoint + SoS) ----------
 def recon_radial_3d_adjoint(kdata: np.ndarray, matrix: tuple[int,int,int],
