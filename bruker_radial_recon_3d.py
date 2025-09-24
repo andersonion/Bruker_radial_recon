@@ -207,6 +207,41 @@ def make_ga_traj_3d(nspokes: int, nread: int) -> np.ndarray:
     ktraj = (radii * dirs[None, :, :]).reshape(-1, 3)  # (M, 3) with M = nread * nspokes
     return ktraj.astype(np.float32)
 
+# --- DCF compatibility helper ---
+def compute_dcf(coords: np.ndarray, mode: str = "pipe") -> np.ndarray:
+    """
+    Returns density compensation weights for non-Cartesian samples.
+    - Tries SigPy's Pipe–Menon (new name: pipe_menon_dcf) if available.
+    - Fallback: simple radial r^p weighting (p=2 for 3D) if SigPy DCF is missing.
+    coords: (M, 3)
+    """
+    if mode == "none":
+        return None
+
+    # Try SigPy's implementations first (name varies by version)
+    dcf = None
+    try:
+        import sigpy.mri as mr
+        if hasattr(mr.dcf, "pipe_menon"):
+            dcf = mr.dcf.pipe_menon(coords, niter=30)
+        elif hasattr(mr.dcf, "pipe_menon_dcf"):
+            dcf = mr.dcf.pipe_menon_dcf(coords, max_iter=30)
+    except Exception:
+        dcf = None
+
+    # Fallback: radial weighting ~ r^2 (3D)
+    if dcf is None:
+        kx, ky, kz = coords[:, 0], coords[:, 1], coords[:, 2]
+        r = np.sqrt(kx*kx + ky*ky + kz*kz)
+        dcf = r**2
+        # avoid exact zeros at k=0
+        dcf = dcf + 1e-6
+
+    dcf = dcf.astype(np.float32, copy=False)
+    # Normalize so average weight ~1 to keep intensities stable
+    dcf *= (dcf.size / (dcf.sum() + 1e-8))
+    return dcf
+
 
 # ---------- Recon (adjoint + SoS) ----------
 def recon_radial_3d_adjoint(kdata: np.ndarray, matrix: tuple[int,int,int],
@@ -221,27 +256,18 @@ def recon_radial_3d_adjoint(kdata: np.ndarray, matrix: tuple[int,int,int],
     if traj_kind != "ga":
         raise NotImplementedError("Only 'ga' trajectory is implemented.")
 
-    coords = make_ga_traj_3d(nspokes, nread)        # (M, 3), M = nread*nspokes
-
-    # --- Density compensation ---
-    if dcf_mode == "pipe":
-        # Pipe–Menon iterative DCF (works for 3D too)
-        dcf = mr.dcf.pipe_menon(coords, niter=30).astype(np.float32)  # (M,)
-        # normalize to keep intensity roughly stable
-        dcf *= (dcf.size / (dcf.sum() + 1e-8))
-    else:
-        dcf = None
+    coords = make_ga_traj_3d(nspokes, nread)  # (M, 3)
+    dcf = compute_dcf(coords, mode=dcf_mode)  # <-- new
 
     img_shape = tuple(int(x) for x in matrix)
-
     coils_img = []
     for c in range(ncoils):
-        y = kdata[:, :, c].reshape(-1)              # (M,)
+         y = kdata[:, :, c].reshape(-1)
         if dcf is not None:
             y = y * dcf
         x = sp.nufft_adjoint(y, coords, oshape=img_shape)
         coils_img.append(x)
-
+	
     coils_img = np.stack(coils_img, axis=0)         # (ncoils, nz, ny, nx)
     sos = np.sqrt((np.abs(coils_img) ** 2).sum(axis=0))
     return sos
@@ -275,6 +301,7 @@ def main():
         traj_kind=args.traj,
         dcf_mode=args.dcf
     )
+
 
 
     vox = meta.get("vox", np.array([1,1,1], float))
