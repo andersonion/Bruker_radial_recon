@@ -1,32 +1,98 @@
 #!/usr/bin/env python3
-import json, os, re, sys, glob, shutil, subprocess, importlib
+"""
+CuPy installer (v4.1) with papertrail:
+- Detect CUDA major (nvidia-smi header or nvcc)
+- Purge any stale CuPy installs
+- Try CuPy wheels (12x -> 11x)
+- If CUDA libs missing (NVRTC, cuFFT, cuBLAS, etc.), install NVIDIA CUDA shim wheels
+- Symlink shim .so files into $CONDA_PREFIX/lib
+- Add activate hook to export LD_LIBRARY_PATH=$CONDA_PREFIX/lib (and driver paths if needed)
+- Verify with a tiny GPU FFT
+- Write a detailed JSON log to ./logs/install_cupy-YYYYmmdd-HHMMSS.json and install_cupy-latest.json
+- Always exit 0 (CPU-only fallback is not treated as fatal)
+"""
+import datetime as _dt
+import glob, importlib, json, os, pathlib, re, shutil, site, subprocess, sys
+from typing import List, Dict, Any, Tuple
 
-def run(cmd):
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+LOG_DIR = SCRIPT_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+def _ts() -> str:
+    return _dt.datetime.now().astimezone().isoformat()
+
+LOG: Dict[str, Any] = {"version": "4.1", "start": _ts(), "steps": []}
+
+def log_step(step: str, **kwargs):
+    entry = {"ts": _ts(), "step": step}
+    entry.update(kwargs)
+    LOG["steps"].append(entry)
+
+def write_logs(summary: Dict[str, Any]) -> None:
+    LOG["end"] = _ts()
+    LOG["summary"] = summary
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = LOG_DIR / f"install_cupy-{stamp}.json"
+    latest = LOG_DIR / "install_cupy-latest.json"
+    try:
+        path.write_text(json.dumps(LOG, indent=2))
+        latest.write_text(json.dumps(LOG, indent=2))
+        summary["log_file"] = str(path)
+    except Exception as e:
+        summary["log_write_error"] = repr(e)
+
+def run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-def has(cmd): return shutil.which(cmd) is not None
+def has(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
 
-def detect_cuda_major():
-    # Parse header from nvidia-smi; fallback to nvcc
+def detect_cuda_major() -> str | None:
+    # Parse nvidia-smi header; fallback to nvcc
     if has("nvidia-smi"):
         r = run(["nvidia-smi"])
-        m = re.search(r"CUDA Version:\s*([0-9]+)", r.stdout)
+        m = re.search(r"CUDA Version:\s*([0-9]+)", r.stdout or "")
         if m:
             return m.group(1)
+        log_step("detect.cuda", method="nvidia-smi", note="no CUDA Version in header")
     if has("nvcc"):
         r = run(["nvcc", "--version"])
-        m = re.search(r"release\s+([0-9]+)\.", r.stdout)
+        m = re.search(r"release\s+([0-9]+)\.", r.stdout or "")
         if m:
             return m.group(1)
+        log_step("detect.cuda", method="nvcc", note="no release match")
     return None
 
-def pip_install(*pkgs):
-    return run([sys.executable, "-m", "pip", "install", "-U", *pkgs]).returncode == 0
+def pip_install(*pkgs: str) -> bool:
+    log_step("pip.install", pkgs=list(pkgs))
+    rc = run([sys.executable, "-m", "pip", "install", "-U", *pkgs])
+    log_step("pip.install.result", returncode=rc.returncode, stdout=rc.stdout[-4000:], stderr=rc.stderr[-4000:])
+    return rc.returncode == 0
 
-def pip_uninstall(*pkgs):
+def pip_uninstall(*pkgs: str) -> None:
+    log_step("pip.uninstall", pkgs=list(pkgs))
     run([sys.executable, "-m", "pip", "uninstall", "-y", *pkgs])
 
-def verify_cupy():
+def purge_cupy_files() -> None:
+    # Remove stray folders/files named cupy*, cupy_cuda*
+    removed = []
+    paths = set(site.getsitepackages() + [site.getusersitepackages()])
+    for p in paths:
+        for pat in ("cupy*", "cupy_cuda*"):
+            for x in glob.glob(os.path.join(p, pat)):
+                try:
+                    if os.path.isdir(x):
+                        shutil.rmtree(x)
+                        removed.append(x)
+                    elif os.path.isfile(x):
+                        os.remove(x)
+                        removed.append(x)
+                except Exception as e:
+                    log_step("purge.warn", path=x, err=repr(e))
+    log_step("purge.files", removed=removed)
+
+def verify_cupy() -> Tuple[bool, Dict[str, Any]]:
     try:
         import cupy as cp
         n = cp.cuda.runtime.getDeviceCount()
@@ -38,13 +104,9 @@ def verify_cupy():
     except Exception as e:
         return False, {"err": repr(e)}
 
-def cuda_shim_packages(major_hint: str):
-    # Use CUDA 12 shim family when driver >=12 or unknown; fall back to 11 as needed
-    if major_hint and major_hint.isdigit() and int(major_hint) <= 11:
-        suf = "cu11"
-    else:
-        suf = "cu12"
-    # Core pieces CuPy may pull at runtime
+def cuda_shim_packages(major_hint: str | None) -> List[str]:
+    # Prefer CUDA 12 shim family unless driver clearly <=11
+    suf = "cu11" if (major_hint and major_hint.isdigit() and int(major_hint) <= 11) else "cu12"
     return [
         f"nvidia-cuda-runtime-{suf}",
         f"nvidia-cuda-nvrtc-{suf}",
@@ -56,22 +118,26 @@ def cuda_shim_packages(major_hint: str):
         f"nvidia-cufft-{suf}",
     ]
 
-def link_shims_into_prefix():
-    # Symlink shim .so files into $CONDA_PREFIX/lib and add an activate hook (LD_LIBRARY_PATH)
+def link_shims_into_prefix() -> Dict[str, Any]:
+    # Symlink shim .so files into $CONDA_PREFIX/lib and add LD_LIBRARY_PATH hook
+    summary: Dict[str, Any] = {"linked": [], "hook_written": False}
     prefix = os.environ.get("CONDA_PREFIX") or sys.prefix
     libdir = os.path.join(prefix, "lib")
     os.makedirs(libdir, exist_ok=True)
 
+    mods = [
+        "nvidia.cuda_runtime", "nvidia.cuda_nvrtc", "nvidia.cuda_cupti", "nvidia.nvjitlink",
+        "nvidia.cublas", "nvidia.cusolver", "nvidia.cusparse", "nvidia.cufft"
+    ]
     shim_dirs = []
-    for name in ("nvidia.cuda_nvrtc", "nvidia.cuda_runtime", "nvidia.cublas", "nvidia.cusolver",
-                 "nvidia.cusparse", "nvidia.cufft", "nvidia.cuda_cupti", "nvidia.nvjitlink"):
+    for name in mods:
         try:
             m = importlib.import_module(name)
             d = os.path.join(os.path.dirname(m.__file__), "lib")
             if os.path.isdir(d):
                 shim_dirs.append(d)
-        except Exception:
-            pass
+        except Exception as e:
+            log_step("shim.module.miss", module=name, err=repr(e))
 
     for d in shim_dirs:
         for src in glob.glob(os.path.join(d, "*.so*")):
@@ -83,6 +149,7 @@ def link_shims_into_prefix():
                 pass
             try:
                 os.symlink(src, dst)
+                summary["linked"].append(dst)
             except FileExistsError:
                 pass
 
@@ -96,48 +163,104 @@ def link_shims_into_prefix():
     with open(os.path.join(deactdir, "10-cuda-shims.sh"), "w") as f:
         f.write('export LD_LIBRARY_PATH="${_CUDA_SHIMS_OLD_LDLP:-}"\n')
         f.write('unset _CUDA_SHIMS_OLD_LDLP\n')
+    summary["hook_written"] = True
+    return summary
 
-def ensure_cuda_libs(major_hint: str):
-    # Install shims and link them into the env
-    pkgs = cuda_shim_packages(major_hint)
-    pip_install(*pkgs)
-    link_shims_into_prefix()
+def find_driver_lib_dirs() -> List[str]:
+    # Try common locations for libcuda.so.* (no guarantees)
+    candidates = [
+        "/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib/nvidia", "/lib/x86_64-linux-gnu",
+        "/usr/local/nvidia/lib64", "/usr/local/cuda/lib64", "/usr/lib/wsl/lib"
+    ]
+    found = []
+    for d in candidates:
+        try:
+            if os.path.isdir(d) and glob.glob(os.path.join(d, "libcuda.so*")):
+                found.append(d)
+        except Exception:
+            pass
+    return found
 
-def main():
-    info = {}
+def add_driver_dirs_to_hook(dirs: List[str]) -> bool:
+    if not dirs:
+        return False
+    prefix = os.environ.get("CONDA_PREFIX") or sys.prefix
+    actdir = os.path.join(prefix, "etc", "conda", "activate.d")
+    deactdir = os.path.join(prefix, "etc", "conda", "deactivate.d")
+    os.makedirs(actdir, exist_ok=True)
+    os.makedirs(deactdir, exist_ok=True)
+    act_path = os.path.join(actdir, "11-cuda-driver.sh")
+    deact_path = os.path.join(deactdir, "11-cuda-driver.sh")
+    with open(act_path, "w") as f:
+        f.write('export _CUDA_DRV_OLD_LDLP="${LD_LIBRARY_PATH:-}"\n')
+        f.write('export LD_LIBRARY_PATH="{}${{LD_LIBRARY_PATH:+:${{LD_LIBRARY_PATH}}}}"\n'.format(
+            ":".join(dirs) + ":$LD_LIBRARY_PATH" if dirs else "${LD_LIBRARY_PATH:-}"
+        ))
+        f.write('export _CUDA_DRIVER_PATHS="{}"\n'.format(":".join(dirs)))
+    with open(deact_path, "w") as f:
+        f.write('export LD_LIBRARY_PATH="${_CUDA_DRV_OLD_LDLP:-}"\n')
+        f.write('unset _CUDA_DRV_OLD_LDLP\n')
+        f.write('unset _CUDA_DRIVER_PATHS\n')
+    return True
+
+def main() -> int:
+    # Detect CUDA
     major = detect_cuda_major()
-    info["detected_cuda_major"] = major
+    log_step("detect.result", cuda_major=major, nvidia_smi=shutil.which("nvidia-smi"), nvcc=shutil.which("nvcc"))
 
-    # Prefer CUDA12 wheel; fall back to 11 if needed
+    # Purge any stale CuPy
+    pip_uninstall("cupy", "cupy-cuda12x", "cupy-cuda11x")
+    purge_cupy_files()
+
+    # Choose wheel candidates
     candidates = ["cupy-cuda12x", "cupy-cuda11x"] if (not major or int(major) >= 12) else ["cupy-cuda11x", "cupy-cuda12x"]
+    LOG["candidates"] = candidates
 
-    tried = []
+    tried: List[str] = []
     for pkg in candidates:
         tried.append(pkg)
-        pip_install(pkg)
+        if not pip_install(pkg):
+            continue
 
         ok, meta = verify_cupy()
+        log_step("verify.after_wheel", pkg=pkg, ok=ok, meta=meta)
         if ok:
-            info.update({"result": "ok", "cupy": meta, "used": pkg})
-            print(json.dumps(info))
+            summary = {"result": "ok", "used": pkg, "cupy": meta}
+            print(json.dumps(summary))
+            write_logs(summary)
             return 0
 
         err = str(meta.get("err", "")).lower()
 
-        # If NVRTC or cuFFT (or general CUDA libs) are missing, install shims and re-verify
-        if any(k in err for k in ("nvrtc", "libnvrtc.so", "cufft", "from 'cupy.cuda'")):
-            ensure_cuda_libs(major or "")
+        # If backend CUDA libs missing, install shims + link + re-verify
+        if any(k in err for k in ("nvrtc", "libnvrtc.so", "cufft", "from 'cupy.cuda'", "cublas", "cusolver", "cusparse")):
+            shims = cuda_shim_packages(major)
+            pip_install(*shims)
+            link_info = link_shims_into_prefix()
+            log_step("shims.installed", packages=shims, link_info=link_info)
+
+            # If driver libcuda missing, add system driver dirs to hook as well
+            if "libcuda.so" in err:
+                drv_dirs = find_driver_lib_dirs()
+                added = add_driver_dirs_to_hook(drv_dirs)
+                log_step("driver.paths", found=drv_dirs, added_to_hook=added)
+
             ok2, meta2 = verify_cupy()
+            log_step("verify.after_shims", pkg=pkg, ok=ok2, meta=meta2)
             if ok2:
-                info.update({"result": "ok", "cupy": meta2, "used": pkg, "cuda_shims": True})
-                print(json.dumps(info))
+                summary = {"result": "ok", "used": pkg, "cupy": meta2, "cuda_shims": True}
+                print(json.dumps(summary))
+                write_logs(summary)
                 return 0
 
-        # This wheel didn't work; remove and try next
+        # Uninstall and try the next wheel
         pip_uninstall(pkg)
 
-    info.update({"result": "cpu-only", "tried": tried, "verify": verify_cupy()[1]})
-    print(json.dumps(info))
+    # CPU-only fallback
+    ok_last, meta_last = verify_cupy()
+    summary = {"result": "cpu-only", "tried": tried, "verify": meta_last}
+    print(json.dumps(summary))
+    write_logs(summary)
     return 0
 
 if __name__ == "__main__":
