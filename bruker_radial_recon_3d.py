@@ -10,6 +10,12 @@ import nibabel as nib
 import sigpy as sp
 import sigpy.mri as mr  # only for DCF if available
 
+try:
+    import cupy as cp
+except Exception:
+    cp = None  # CPU fallback
+
+
 # ---------------- JCAMP parsing ----------------
 def _parse_jcamp(path: Path) -> dict:
     d, key = {}, None
@@ -263,20 +269,41 @@ def save_quicklook_pngs(img: np.ndarray, out_path: str, pct: float = 99.5) -> No
 
 # ---------------- Recon (adjoint + SoS) ----------------
 def recon_adj_sos(kdata: np.ndarray, img_shape: tuple[int,int,int],
-                  coords: np.ndarray, dcf_mode: str = "pipe") -> np.ndarray:
+                  coords: np.ndarray, dcf_mode: str = "pipe",
+                  gpu: int = -1) -> np.ndarray:
+    """Adjoint NUFFT per coil + SoS. Returns numpy array (nz, ny, nx)."""
     nread, nspokes, ncoils = kdata.shape
-    if coords.shape != (nread * nspokes, 3):
-        raise RuntimeError(f"coords shape {coords.shape} != ({nread*nspokes}, 3)")
-    dcf = compute_dcf(coords, mode=dcf_mode)
-    coils = []
-    for c in range(ncoils):
-        y = kdata[:,:,c].reshape(-1)
-        if dcf is not None:
-            y = y * dcf
-        x = sp.nufft_adjoint(y, coords, oshape=img_shape)
-        coils.append(x)
-    coils = np.stack(coils, axis=0)
-    return np.sqrt((np.abs(coils) ** 2).sum(axis=0))
+    assert coords.shape == (nread * nspokes, 3)
+
+    # CPU path
+    if gpu < 0 or cp is None:
+        dcf = compute_dcf(coords, mode=dcf_mode)  # numpy
+        coils = []
+        for c in range(ncoils):
+            y = kdata[:, :, c].reshape(-1)
+            if dcf is not None:
+                y = y * dcf
+            x = sp.nufft_adjoint(y, coords, oshape=img_shape)
+            coils.append(x)
+        coils = np.stack(coils, axis=0)
+        return np.sqrt((np.abs(coils) ** 2).sum(axis=0))
+
+    # GPU path
+    with sp.Device(gpu):
+        coords_g = cp.asarray(coords, dtype=cp.float32)
+        dcf = compute_dcf(coords, mode=dcf_mode)            # compute on CPU
+        dcf_g = cp.asarray(dcf, dtype=cp.float32) if dcf is not None else None
+
+        coils_g = []
+        for c in range(ncoils):
+            y_g = cp.asarray(kdata[:, :, c].reshape(-1))    # complex64
+            if dcf_g is not None:
+                y_g = y_g * dcf_g
+            x_g = sp.nufft_adjoint(y_g, coords_g, oshape=img_shape)
+            coils_g.append(x_g)
+        coils_g = cp.stack(coils_g, axis=0)
+        sos_g = cp.sqrt((cp.abs(coils_g) ** 2).sum(axis=0))
+        return cp.asnumpy(sos_g)
 
 # ---------------- CLI ----------------
 def main():
@@ -289,6 +316,8 @@ def main():
     ap.add_argument("--dcf", choices=["none","pipe"], default="pipe",
                     help="Density compensation (pipe=Pipe–Menon, default)")
     ap.add_argument("--png", action="store_true", help="Write axial/cor/sag PNGs")
+    ap.add_argument("--gpu", type=int, default=-1,
+                help="GPU id to use (e.g., 0). -1 = CPU (default)")
     args = ap.parse_args()
 
     kdata, meta, hdr = load_bruker_series(args.series)
@@ -310,7 +339,9 @@ def main():
     else:
         coords = full_coords
 
-    img = recon_adj_sos(kdata, tuple(args.matrix), coords, dcf_mode=args.dcf)
+    img = recon_adj_sos(kdata, tuple(args.matrix), coords,
+                    dcf_mode=args.dcf, gpu=args.gpu)
+
 
     affine = np.diag([vox[0], vox[1], vox[2], 1.0])
     nib.save(nib.Nifti1Image(np.asarray(img, np.float32), affine), args.out)
