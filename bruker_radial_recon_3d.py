@@ -259,7 +259,7 @@ def main():
     ap.add_argument("--png", action="store_true",
                 help="Write axial/coronal/sagittal PNG quicklooks (default: off)")
 	ap.add_argument("--dcf", choices=["none", "pipe"], default="pipe",
-				help="Density compensation: 'pipe' (Pipe–Menon, default) or 'none'")
+                help="Density compensation: 'pipe' (Pipe–Menon, default) or 'none'")
 
 
     args = ap.parse_args()
@@ -267,7 +267,7 @@ def main():
     kdata, meta, hdr = load_bruker_series(args.series)
     print(f"Loaded: nread={meta['nread']}, nspokes={meta['nspokes']}, ncoils={meta['ncoils']}, SW_h={meta['SW_h']} Hz")
     if args.spoke_step > 1:
-        print(f"Decimating spokes by {args.spoke_step}...")
+    	print(f"Decimating spokes by {args.spoke_step}...")
 
 	img = recon_radial_3d_adjoint(
 		kdata, tuple(args.matrix),
