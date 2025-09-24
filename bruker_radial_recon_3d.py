@@ -269,12 +269,12 @@ def main():
     if args.spoke_step > 1:
     	print(f"Decimating spokes by {args.spoke_step}...")
 
-	img = recon_radial_3d_adjoint(
-		kdata, tuple(args.matrix),
-		spoke_step=args.spoke_step,
-		traj_kind=args.traj,
-		dcf_mode=args.dcf
-	)
+    img = recon_radial_3d_adjoint(
+        kdata, tuple(args.matrix),
+        spoke_step=args.spoke_step,
+        traj_kind=args.traj,
+        dcf_mode=args.dcf
+    )
 
 
     vox = meta.get("vox", np.array([1,1,1], float))
