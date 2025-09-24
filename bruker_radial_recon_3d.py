@@ -1,35 +1,16 @@
 #!/usr/bin/env python3
-"""
-Bruker 3D Radial Recon (CPU-first, no brkraw)
+# Bruker 3D radial recon (auto-uses "traj" file if present)
+# Deps: pip install sigpy nibabel numpy pillow
 
-- Parses JCAMP headers (acqp/method/visu_pars) directly
-- Reads interleaved complex 'fid' with correct endianness/format
-- Robustly infers nread (uses TD, TD//2, and divisibility checks)
-- Shapes to (nread, nspokes, ncoils)
-- Builds 3D golden-angle-ish trajectory
-- NUFFT adjoint per coil (sigpy.nufft_adjoint) + Sum-of-Squares
-- Saves NIfTI; optional PNGs
-
-Deps:  pip install sigpy nibabel numpy pillow
-Example:
-  python bruker_radial_recon_3d.py \
-    --series /path/to/Bruker/series \
-    --out recon3d_radial.nii.gz \
-    --matrix 192 192 192 \
-    --traj ga \
-    --spoke-step 4 --png
-"""
 from __future__ import annotations
-import argparse, re
+import argparse, os, re
 from pathlib import Path
 import numpy as np
 import nibabel as nib
-import sigpy as sp  # <-- use sp.nufft_adjoint
-from PIL import Image
-import sigpy.mri as mr
+import sigpy as sp
+import sigpy.mri as mr  # only for DCF if available
 
-
-# ---------- JCAMP parsing ----------
+# ---------------- JCAMP parsing ----------------
 def _parse_jcamp(path: Path) -> dict:
     d, key = {}, None
     if not path.exists():
@@ -58,44 +39,14 @@ def _nums(s: str) -> list[float]:
             except ValueError: out.append(float(v))
     return out
 
-def _get_int(d: dict, key: str, default=1) -> int:
+def _get_int(d: dict, key: str, default=0) -> int:
     try:
         v = _nums(d.get(key, ""))
         return int(v[0]) if v else default
     except Exception:
         return default
 
-
-# ---------- Data visualization ----------
-def save_quicklook_pngs(img: np.ndarray, out_path: str, pct: float = 99.5) -> None:
-    """
-    Save axial/coronal/sagittal PNG quicklooks with percentile clipping.
-    img: (nz, ny, nx) magnitude or real-valued volume
-    """
-    outdir = Path(out_path).with_suffix("").with_suffix("")
-    outdir = Path(str(outdir) + "_png")
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # Robust contrast
-    vmax = float(np.percentile(img, pct))
-    vmin = 0.0
-    rng = max(vmax - vmin, 1e-8)
-
-    # Middle slices
-    zc, yc, xc = [s // 2 for s in img.shape]
-    planes = {
-        "ax":  img[zc, :, :],
-        "cor": img[:, yc, :],
-        "sag": img[:, :, xc],
-    }
-
-    for name, sl in planes.items():
-        sln = np.clip((sl - vmin) / rng, 0, 1)
-        im = (sln * 255.0).astype(np.uint8)
-        Image.fromarray(im).save(outdir / f"{name}.png")
-
-
-# ---------- Data loading ----------
+# ---------------- Bruker loader ----------------
 def load_bruker_series(series_dir: str):
     series = Path(series_dir)
     acqp   = _parse_jcamp(series / "acqp")
@@ -106,16 +57,13 @@ def load_bruker_series(series_dir: str):
     if dim != 3:
         raise RuntimeError(f"ACQ_dim={dim} (expected 3 for 3D)")
 
-    acq_size = _nums(acqp.get("ACQ_size", ""))  # often [3, NPROJ, 1] for 3D radial
+    acq_size = _nums(acqp.get("ACQ_size", ""))  # often [3, NPROJ, 1]
     nspokes_hint = int(acq_size[1]) if len(acq_size) > 1 else None
 
-    # Coils
     rec_sel = (acqp.get("ACQ_ReceiverSelect", "") or "").lower().split()
-    ncoils = rec_sel.count("yes")
-    if ncoils == 0:
-        ncoils = _get_int(method, "PVM_EncNReceivers", 1)
+    ncoils = rec_sel.count("yes") or _get_int(method, "PVM_EncNReceivers", 1) or 1
 
-    # Read FID (interleaved real/imag)
+    # FID (interleaved real/imag)
     fid_path = series / "fid"
     if not fid_path.exists():
         raise RuntimeError(f"Missing FID: {fid_path}")
@@ -126,203 +74,251 @@ def load_bruker_series(series_dir: str):
 
     dt_map = {"GO_16BIT_SGN_INT": np.int16, "GO_32BIT_SGN_INT": np.int32, "GO_32BIT_FLOAT": np.float32}
     base = dt_map.get(fmt, np.int32)
-    basecode = np.dtype(base).str[1:]  # 'i2', 'i4', 'f4'
-    raw = np.fromfile(fid_path, dtype=endian + basecode)
+    raw  = np.fromfile(fid_path, dtype=endian + np.dtype(base).str[1:])
     if raw.size % 2 != 0:
         raise RuntimeError("Raw FID length is odd; expected interleaved real/imag pairs.")
-    complex_samples = raw.size // 2
     ri = raw.reshape(-1, 2).astype(np.float32)
-    data = ri[:, 0] + 1j * ri[:, 1]  # (complex_samples,)
+    data = ri[:, 0] + 1j * ri[:, 1]
 
-    # ---- Infer nread robustly ----
+    # Infer nread robustly
+    complex_samples = data.size
     nread = None
-    td = _get_int(acqp, "TD", 0)  # Bruker 'TD' can be real-sample count or complex count depending on sequence
+    td = _get_int(acqp, "TD", 0)
     for cand in [td, td // 2]:
         if cand and cand > 8 and (complex_samples % cand == 0):
-            nread = cand
-            break
-    # If TD didn't help, try to use hints (nspokes_hint, ncoils, reps)
-    if nread is None:
-        NR       = _get_int(acqp, "NR", 1)
-        NECHOES  = _get_int(acqp, "NECHOES", 1)
-        NA       = _get_int(acqp, "NA", 1) or _get_int(acqp, "ACQ_averages", 1)
-        NI       = _get_int(acqp, "NI", 1)
-        mult = max(1, NR) * max(1, NECHOES) * max(1, NA) * max(1, NI)
-        if nspokes_hint and ncoils and mult:
-            denom = nspokes_hint * ncoils * mult
-            if denom > 0 and complex_samples % denom == 0:
-                cand = complex_samples // denom
-                if 8 < cand < 8192:
-                    nread = int(cand)
-    # Last resort: sweep divisors in a sane range
+            nread = cand; break
+    if nread is None and nspokes_hint and ncoils:
+        NR, NECHOES, NA, NI = (_get_int(acqp, k, 1) or 1 for k in ("NR","NECHOES","NA","NI"))
+        denom = nspokes_hint * ncoils * max(1, NR) * max(1, NECHOES) * max(1, NA) * max(1, NI)
+        if denom > 0 and complex_samples % denom == 0:
+            cand = complex_samples // denom
+            if 8 < cand < 8192: nread = int(cand)
     if nread is None:
         for cand in (128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024):
             if complex_samples % cand == 0:
-                nread = cand
-                break
+                nread = cand; break
     if nread is None:
-        raise RuntimeError("Failed to infer nread (readout points).")
+        raise RuntimeError("Failed to infer nread.")
 
-    # Now shape to readout vectors
+    # Optional readout flip (env knob)
+    if os.environ.get("RADIAL_FLIP_READ","0") == "1":
+        data = data.reshape(-1, nread)[:, ::-1].reshape(-1)
+
+    # Shape
     if data.size % nread != 0:
-        raise RuntimeError(f"Readout length mismatch: nread={nread}, total complex samples={data.size}")
-    vecs = data.reshape(-1, nread)  # (nvecs, nread)
+        raise RuntimeError(f"Readout mismatch: nread={nread}, complex={data.size}")
+    vecs = data.reshape(-1, nread)
     total_vecs = vecs.shape[0]
     if total_vecs % ncoils != 0:
         raise RuntimeError(f"Vector count {total_vecs} not divisible by ncoils={ncoils}")
     per_coil = total_vecs // ncoils
-    nspokes = per_coil  # assume spoke-major ordering per coil
+    nspokes  = per_coil
     if nspokes_hint and nspokes_hint != nspokes:
         print(f"[warn] ACQ_size hinted nspokes={nspokes_hint}, inferred from FID={nspokes}.")
 
     arr   = vecs.reshape(ncoils, nspokes, nread)
     kdata = np.transpose(arr, (2, 1, 0)).astype(np.complex64)  # (nread, nspokes, ncoils)
 
-    # Meta
     SW_h  = float((_nums(acqp.get("SW_h", "0")) or [0])[0])
     dwell = (1.0 / SW_h) if SW_h > 0 else None
     TE_s  = float((_nums(acqp.get("ACQ_echo_time", "0")) or [0])[0])
     TR_s  = float((_nums(acqp.get("ACQ_repetition_time", "0")) or [0])[0])
-    vox   = np.array(_nums(visu.get("VisuCoreVoxelSize", "")) or [1, 1, 1], dtype=float)
+    vox   = np.array(_nums(visu.get("VisuCoreVoxelSize", "")) or [1,1,1], dtype=float)
 
     meta = dict(nread=nread, nspokes=nspokes, ncoils=ncoils, SW_h=SW_h, dwell=dwell,
                 TE_s=TE_s, TR_s=TR_s, vox=vox)
     return kdata, meta, dict(acqp=acqp, method=method, visu=visu)
 
-# ---------- Trajectory ----------
+# -------------- Trajectory (GA fallback) --------------
 def make_ga_traj_3d(nspokes: int, nread: int) -> np.ndarray:
-    # Directions on the sphere (Fibonacci / phyllotaxis)
     i = np.arange(nspokes, dtype=np.float64) + 0.5
     phi = (1 + np.sqrt(5)) / 2
     z = 1.0 - 2.0 * i / (nspokes + 1.0)
-    r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    r = np.sqrt(np.maximum(0.0, 1.0 - z*z))
     theta = 2.0 * np.pi * i / (phi ** 2)
-    dirs = np.stack([r * np.cos(theta), r * np.sin(theta), z], axis=1)  # (nspokes, 3)
-
-    # Readout radii in **radians** per FOV (SigPy expects radian coords)
-    kmax = np.pi   # full-FOV coverage ~ [-π, π]
+    dirs = np.stack([r*np.cos(theta), r*np.sin(theta), z], axis=1)  # (nspokes,3)
+    kmax = np.pi
     t = np.linspace(-1.0, 1.0, nread, endpoint=False, dtype=np.float64)
-    radii = (kmax * t)[:, None, None]  # <-- FIX: (nread, 1, 1)
-
-    ktraj = (radii * dirs[None, :, :]).reshape(-1, 3)  # (M, 3) with M = nread * nspokes
+    radii = (kmax * t)[:, None, None]  # (nread,1,1)  <-- broadcasting-safe
+    ktraj = (radii * dirs[None, :, :]).reshape(-1, 3)  # (M,3)
     return ktraj.astype(np.float32)
 
-# --- DCF compatibility helper ---
-def compute_dcf(coords: np.ndarray, mode: str = "pipe") -> np.ndarray:
-    """
-    Returns density compensation weights for non-Cartesian samples.
-    - Tries SigPy's Pipe–Menon (new name: pipe_menon_dcf) if available.
-    - Fallback: simple radial r^p weighting (p=2 for 3D) if SigPy DCF is missing.
-    coords: (M, 3)
-    """
+# ---- External 'traj' loader (auto text/binary; auto units) ----
+def _read_txt_array(path: Path) -> np.ndarray:
+    rows = []
+    with path.open("r", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or s.startswith("//"): continue
+            parts = re.split(r"[,\s]+", s)
+            try:
+                row = [float(p) for p in parts if p != ""]
+                if row: rows.append(row)
+            except ValueError:
+                continue
+    return np.array(rows, dtype=np.float64) if rows else np.empty((0,))
+
+def _scale_to_radians(k: np.ndarray, img_shape: tuple[int,int,int], vox: np.ndarray) -> np.ndarray:
+    """Auto-infer units: cycles/FOV (~<=1), radians (~<=π), or 1/mm (larger)."""
+    if k.size == 0:
+        return k
+    Nx, Ny, Nz = img_shape
+    dxi = np.array(vox if vox is not None and len(vox) >= 3 else [1,1,1], float)
+    k = np.asarray(k, float)
+    kabs = np.percentile(np.linalg.norm(k, axis=1), 99.0)
+    if kabs <= 1.2:  # cycles/FOV
+        scale = np.array([2*np.pi/Nx, 2*np.pi/Ny, 2*np.pi/Nz], float)
+        return (k * scale[None, :])
+    elif kabs <= 4.2:  # radians
+        return k
+    else:  # 1/mm
+        scale = 2*np.pi * dxi  # per-dim Δx
+        return (k * scale[None, :])
+
+def load_series_traj(series_dir: str, nread: int, nspokes: int,
+                     img_shape: tuple[int,int,int], vox: np.ndarray) -> np.ndarray | None:
+    p = Path(series_dir) / "traj"
+    if not p.exists():
+        return None
+    M = nread * nspokes
+
+    # Try text first
+    arr = _read_txt_array(p)
+    if arr.ndim == 2 and arr.size > 0:
+        if arr.shape[0] == M and arr.shape[1] >= 3:      # per-sample (M,3)
+            k = arr[:, :3]
+            return _scale_to_radians(k, img_shape, vox).astype(np.float32)
+        if arr.shape[0] == nspokes and arr.shape[1] >= 3:  # directions (nspokes,3)
+            dirs = arr[:, :3]
+            kmax = np.pi
+            t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
+            k = (kmax * t)[:, None] * dirs[None, :, :]
+            return k.reshape(-1, 3).astype(np.float32)
+        if arr.shape[0] == nspokes and arr.shape[1] == 2:  # angles (theta,phi)
+            th, ph = arr[:,0], arr[:,1]
+            dirs = np.stack([np.sin(ph)*np.cos(th), np.sin(ph)*np.sin(th), np.cos(ph)], axis=1)
+            kmax = np.pi
+            t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
+            k = (kmax * t)[:, None] * dirs[None, :, :]
+            return k.reshape(-1, 3).astype(np.float32)
+
+    # Try binary float32 / float64
+    for dtype in (np.float32, np.float64):
+        try:
+            flat = np.fromfile(p, dtype=dtype)
+        except Exception:
+            continue
+        if flat.size == M * 3:
+            k = flat.reshape(M, 3).astype(np.float64)
+            return _scale_to_radians(k, img_shape, vox).astype(np.float32)
+        if flat.size == nspokes * 3:
+            dirs = flat.reshape(nspokes, 3).astype(np.float64)
+            kmax = np.pi
+            t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
+            k = (kmax * t)[:, None] * dirs[None, :, :]
+            return k.reshape(-1, 3).astype(np.float32)
+        if flat.size == nspokes * 2:
+            ang = flat.reshape(nspokes, 2).astype(np.float64)
+            th, ph = ang[:,0], ang[:,1]
+            dirs = np.stack([np.sin(ph)*np.cos(th), np.sin(ph)*np.sin(th), np.cos(ph)], axis=1)
+            kmax = np.pi
+            t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
+            k = (kmax * t)[:, None] * dirs[None, :, :]
+            return k.reshape(-1, 3).astype(np.float32)
+
+    print(f"[warn] Could not parse 'traj'; using golden-angle fallback.")
+    return None
+
+# ---------------- DCF (version-safe) ----------------
+def compute_dcf(coords: np.ndarray, mode: str = "pipe") -> np.ndarray | None:
     if mode == "none":
         return None
-
-    # Try SigPy's implementations first (name varies by version)
     dcf = None
     try:
-        import sigpy.mri as mr
         if hasattr(mr.dcf, "pipe_menon"):
             dcf = mr.dcf.pipe_menon(coords, niter=30)
         elif hasattr(mr.dcf, "pipe_menon_dcf"):
             dcf = mr.dcf.pipe_menon_dcf(coords, max_iter=30)
     except Exception:
         dcf = None
-
-    # Fallback: radial weighting ~ r^2 (3D)
     if dcf is None:
-        kx, ky, kz = coords[:, 0], coords[:, 1], coords[:, 2]
-        r = np.sqrt(kx*kx + ky*ky + kz*kz)
-        dcf = r**2
-        # avoid exact zeros at k=0
-        dcf = dcf + 1e-6
-
+        r = np.linalg.norm(coords, axis=1)  # fallback ~ r^2 for 3D
+        dcf = (r**2 + 1e-6)
     dcf = dcf.astype(np.float32, copy=False)
-    # Normalize so average weight ~1 to keep intensities stable
     dcf *= (dcf.size / (dcf.sum() + 1e-8))
     return dcf
 
+# ---------------- Quicklooks ----------------
+def save_quicklook_pngs(img: np.ndarray, out_path: str, pct: float = 99.5) -> None:
+    from PIL import Image
+    outdir = Path(out_path).with_suffix("").with_suffix("")
+    outdir = Path(str(outdir) + "_png")
+    outdir.mkdir(parents=True, exist_ok=True)
+    vmax = float(np.percentile(img, pct)); vmin = 0.0; rng = max(vmax - vmin, 1e-8)
+    zc, yc, xc = [s // 2 for s in img.shape]
+    planes = {"ax": img[zc,:,:], "cor": img[:,yc,:], "sag": img[:,:,xc]}
+    for name, sl in planes.items():
+        sln = np.clip((sl - vmin) / rng, 0, 1)
+        Image.fromarray((sln * 255.0).astype(np.uint8)).save(outdir / f"{name}.png")
 
-# ---------- Recon (adjoint + SoS) ----------
-def recon_radial_3d_adjoint(kdata: np.ndarray, matrix: tuple[int,int,int],
-                            spoke_step: int = 1, traj_kind: str = "ga",
-                            dcf_mode: str = "pipe") -> np.ndarray:
-    """kdata: (nread, nspokes, ncoils) -> |img| as (nz, ny, nx)"""
+# ---------------- Recon (adjoint + SoS) ----------------
+def recon_adj_sos(kdata: np.ndarray, img_shape: tuple[int,int,int],
+                  coords: np.ndarray, dcf_mode: str = "pipe") -> np.ndarray:
     nread, nspokes, ncoils = kdata.shape
-    if spoke_step > 1:
-        kdata = kdata[:, ::spoke_step, :]
-        nspokes = kdata.shape[1]
-
-    if traj_kind != "ga":
-        raise NotImplementedError("Only 'ga' trajectory is implemented.")
-
-    coords = make_ga_traj_3d(nspokes, nread)  # (M, 3)
-    dcf = compute_dcf(coords, mode=dcf_mode)  # <-- new
-
-    img_shape = tuple(int(x) for x in matrix)
-    coils_img = []
+    if coords.shape != (nread * nspokes, 3):
+        raise RuntimeError(f"coords shape {coords.shape} != ({nread*nspokes}, 3)")
+    dcf = compute_dcf(coords, mode=dcf_mode)
+    coils = []
     for c in range(ncoils):
-        y = kdata[:, :, c].reshape(-1)
+        y = kdata[:,:,c].reshape(-1)
         if dcf is not None:
             y = y * dcf
         x = sp.nufft_adjoint(y, coords, oshape=img_shape)
-        coils_img.append(x)
-	
-    coils_img = np.stack(coils_img, axis=0)         # (ncoils, nz, ny, nx)
-    sos = np.sqrt((np.abs(coils_img) ** 2).sum(axis=0))
-    return sos
+        coils.append(x)
+    coils = np.stack(coils, axis=0)
+    return np.sqrt((np.abs(coils) ** 2).sum(axis=0))
 
-
-# ---------- CLI ----------
+# ---------------- CLI ----------------
 def main():
-    ap = argparse.ArgumentParser(description="Bruker 3D radial reconstruction (NUFFT adjoint)")
-    ap.add_argument("--series", required=True, help="Path to Bruker scan folder (acqp, method, fid)")
+    ap = argparse.ArgumentParser(description="Bruker 3D radial recon (auto 'traj' or GA)")
+    ap.add_argument("--series", required=True, help="Path with acqp/method/visu_pars/fid[/traj]")
     ap.add_argument("--out", required=True, help="Output NIfTI filename")
     ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX","NY","NZ"), required=True)
-    ap.add_argument("--traj", default="ga", choices=["ga"])
     ap.add_argument("--spoke-step", dest="spoke_step", type=int, default=1,
-                    help="Take every Nth spoke (e.g., 4) for quick tests")
-    ap.add_argument("--png", action="store_true",
-                help="Write axial/coronal/sagittal PNG quicklooks (default: off)")
-    ap.add_argument("--dcf", choices=["none", "pipe"], default="pipe",
-                help="Density compensation: 'pipe' (Pipe–Menon, default) or 'none'")
-
-
+                    help="Take every Nth spoke for speed (e.g., 4)")
+    ap.add_argument("--dcf", choices=["none","pipe"], default="pipe",
+                    help="Density compensation (pipe=Pipe–Menon, default)")
+    ap.add_argument("--png", action="store_true", help="Write axial/cor/sag PNGs")
     args = ap.parse_args()
 
     kdata, meta, hdr = load_bruker_series(args.series)
-    print(f"Loaded: nread={meta['nread']}, nspokes={meta['nspokes']}, ncoils={meta['ncoils']}, SW_h={meta['SW_h']} Hz")
-    if args.spoke_step > 1:
-    	print(f"Decimating spokes by {args.spoke_step}...")
+    nread, nspokes = meta["nread"], meta["nspokes"]
+    print(f"Loaded: nread={nread}, nspokes={nspokes}, ncoils={meta['ncoils']}, SW_h={meta['SW_h']} Hz")
 
-    img = recon_radial_3d_adjoint(
-        kdata, tuple(args.matrix),
-        spoke_step=args.spoke_step,
-        traj_kind=args.traj,
-        dcf_mode=args.dcf
-    )
-
-
-
+    # Build/load coords, then apply SAME decimation to kdata & coords
     vox = meta.get("vox", np.array([1,1,1], float))
+    full_coords = load_series_traj(args.series, nread, nspokes, tuple(args.matrix), vox)
+    if full_coords is None:
+        full_coords = make_ga_traj_3d(nspokes, nread)
+
+    if args.spoke_step > 1:
+        take = slice(0, nspokes, max(1, args.spoke_step))
+        kdata   = kdata[:, take, :]
+        coords  = full_coords.reshape(nread, nspokes, 3)[:, take, :].reshape(-1, 3)
+        nspokes = kdata.shape[1]
+        print(f"Decimated spokes by {args.spoke_step}: nspokes={nspokes}")
+    else:
+        coords = full_coords
+
+    img = recon_adj_sos(kdata, tuple(args.matrix), coords, dcf_mode=args.dcf)
+
     affine = np.diag([vox[0], vox[1], vox[2], 1.0])
     nib.save(nib.Nifti1Image(np.asarray(img, np.float32), affine), args.out)
     print(f"Wrote {args.out}")
 
     if args.png:
-        try:
-            from PIL import Image
-            outdir = Path(args.out).with_suffix("").with_suffix("")
-            outdir = Path(str(outdir) + "_png")
-            outdir.mkdir(parents=True, exist_ok=True)
-            zc, yc, xc = [s // 2 for s in img.shape]
-            planes = {"ax": img[zc,:,:], "cor": img[:,yc,:], "sag": img[:,:,xc]}
-            for name, sl in planes.items():
-                im = (sl / (sl.max() + 1e-8) * 255.0).astype(np.uint8)
-                Image.fromarray(im).save(outdir / f"{name}.png")
-            print(f"Saved PNGs → {outdir}")
-        except Exception as e:
-            print(f"[warn] PNG export failed: {e}")
+        save_quicklook_pngs(img, args.out)
+        print(f"Saved PNGs → {Path(args.out).with_suffix('').with_suffix('')}_png")
 
 if __name__ == "__main__":
     main()
