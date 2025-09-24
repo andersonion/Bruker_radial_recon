@@ -262,7 +262,7 @@ def recon_radial_3d_adjoint(kdata: np.ndarray, matrix: tuple[int,int,int],
     img_shape = tuple(int(x) for x in matrix)
     coils_img = []
     for c in range(ncoils):
-         y = kdata[:, :, c].reshape(-1)
+        y = kdata[:, :, c].reshape(-1)
         if dcf is not None:
             y = y * dcf
         x = sp.nufft_adjoint(y, coords, oshape=img_shape)
