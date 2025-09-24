@@ -258,7 +258,7 @@ def main():
                     help="Take every Nth spoke (e.g., 4) for quick tests")
     ap.add_argument("--png", action="store_true",
                 help="Write axial/coronal/sagittal PNG quicklooks (default: off)")
-	ap.add_argument("--dcf", choices=["none", "pipe"], default="pipe",
+    ap.add_argument("--dcf", choices=["none", "pipe"], default="pipe",
                 help="Density compensation: 'pipe' (Pipe–Menon, default) or 'none'")
 
 
