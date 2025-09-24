@@ -26,6 +26,7 @@ import numpy as np
 import nibabel as nib
 import sigpy as sp  # <-- use sp.nufft_adjoint
 from PIL import Image
+import sigpy.mri as mr
 
 
 # ---------- JCAMP parsing ----------
@@ -209,25 +210,42 @@ def make_ga_traj_3d(nspokes: int, nread: int) -> np.ndarray:
 
 # ---------- Recon (adjoint + SoS) ----------
 def recon_radial_3d_adjoint(kdata: np.ndarray, matrix: tuple[int,int,int],
-                            spoke_step: int = 1, traj_kind: str = "ga") -> np.ndarray:
+                            spoke_step: int = 1, traj_kind: str = "ga",
+                            dcf_mode: str = "pipe") -> np.ndarray:
     """kdata: (nread, nspokes, ncoils) -> |img| as (nz, ny, nx)"""
     nread, nspokes, ncoils = kdata.shape
     if spoke_step > 1:
         kdata = kdata[:, ::spoke_step, :]
         nspokes = kdata.shape[1]
+
     if traj_kind != "ga":
         raise NotImplementedError("Only 'ga' trajectory is implemented.")
-    coords = make_ga_traj_3d(nspokes, nread)  # (M, 3)
+
+    coords = make_ga_traj_3d(nspokes, nread)        # (M, 3), M = nread*nspokes
+
+    # --- Density compensation ---
+    if dcf_mode == "pipe":
+        # Pipe–Menon iterative DCF (works for 3D too)
+        dcf = mr.dcf.pipe_menon(coords, niter=30).astype(np.float32)  # (M,)
+        # normalize to keep intensity roughly stable
+        dcf *= (dcf.size / (dcf.sum() + 1e-8))
+    else:
+        dcf = None
+
     img_shape = tuple(int(x) for x in matrix)
 
     coils_img = []
     for c in range(ncoils):
-        y = kdata[:, :, c].reshape(-1)       # (M,)
-        x = sp.nufft_adjoint(y, coords, oshape=img_shape)  # complex (nz, ny, nx)
+        y = kdata[:, :, c].reshape(-1)              # (M,)
+        if dcf is not None:
+            y = y * dcf
+        x = sp.nufft_adjoint(y, coords, oshape=img_shape)
         coils_img.append(x)
-    coils_img = np.stack(coils_img, axis=0)  # (ncoils, nz, ny, nx)
+
+    coils_img = np.stack(coils_img, axis=0)         # (ncoils, nz, ny, nx)
     sos = np.sqrt((np.abs(coils_img) ** 2).sum(axis=0))
     return sos
+
 
 # ---------- CLI ----------
 def main():
@@ -240,6 +258,9 @@ def main():
                     help="Take every Nth spoke (e.g., 4) for quick tests")
     ap.add_argument("--png", action="store_true",
                 help="Write axial/coronal/sagittal PNG quicklooks (default: off)")
+	ap.add_argument("--dcf", choices=["none", "pipe"], default="pipe",
+				help="Density compensation: 'pipe' (Pipe–Menon, default) or 'none'")
+
 
     args = ap.parse_args()
 
@@ -248,8 +269,13 @@ def main():
     if args.spoke_step > 1:
         print(f"Decimating spokes by {args.spoke_step}...")
 
-    img = recon_radial_3d_adjoint(kdata, tuple(args.matrix),
-                                  spoke_step=args.spoke_step, traj_kind=args.traj)
+	img = recon_radial_3d_adjoint(
+		kdata, tuple(args.matrix),
+		spoke_step=args.spoke_step,
+		traj_kind=args.traj,
+		dcf_mode=args.dcf
+	)
+
 
     vox = meta.get("vox", np.array([1,1,1], float))
     affine = np.diag([vox[0], vox[1], vox[2], 1.0])
