@@ -25,6 +25,8 @@ from pathlib import Path
 import numpy as np
 import nibabel as nib
 import sigpy as sp  # <-- use sp.nufft_adjoint
+from PIL import Image
+
 
 # ---------- JCAMP parsing ----------
 def _parse_jcamp(path: Path) -> dict:
@@ -61,6 +63,36 @@ def _get_int(d: dict, key: str, default=1) -> int:
         return int(v[0]) if v else default
     except Exception:
         return default
+
+
+# ---------- Data visualization ----------
+def save_quicklook_pngs(img: np.ndarray, out_path: str, pct: float = 99.5) -> None:
+    """
+    Save axial/coronal/sagittal PNG quicklooks with percentile clipping.
+    img: (nz, ny, nx) magnitude or real-valued volume
+    """
+    outdir = Path(out_path).with_suffix("").with_suffix("")
+    outdir = Path(str(outdir) + "_png")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Robust contrast
+    vmax = float(np.percentile(img, pct))
+    vmin = 0.0
+    rng = max(vmax - vmin, 1e-8)
+
+    # Middle slices
+    zc, yc, xc = [s // 2 for s in img.shape]
+    planes = {
+        "ax":  img[zc, :, :],
+        "cor": img[:, yc, :],
+        "sag": img[:, :, xc],
+    }
+
+    for name, sl in planes.items():
+        sln = np.clip((sl - vmin) / rng, 0, 1)
+        im = (sln * 255.0).astype(np.uint8)
+        Image.fromarray(im).save(outdir / f"{name}.png")
+
 
 # ---------- Data loading ----------
 def load_bruker_series(series_dir: str):
@@ -206,7 +238,9 @@ def main():
     ap.add_argument("--traj", default="ga", choices=["ga"])
     ap.add_argument("--spoke-step", dest="spoke_step", type=int, default=1,
                     help="Take every Nth spoke (e.g., 4) for quick tests")
-    ap.add_argument("--png", action="store_true", help="Write axial/coronal/sagittal PNGs")
+    ap.add_argument("--png", action="store_true",
+                help="Write axial/coronal/sagittal PNG quicklooks (default: off)")
+
     args = ap.parse_args()
 
     kdata, meta, hdr = load_bruker_series(args.series)
