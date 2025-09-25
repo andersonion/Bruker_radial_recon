@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# Bruker 3D radial recon — UPDATED v3 (FOV crop + metrics)
+# Bruker 3D radial recon — UPDATED v4
+# Adds: --traj-order {sample,spoke}, --alt-rev, --rev-all, --auto-pi
+# Keeps: FOV scaling, PSF metrics, single tripanel
 # Deps: pip install sigpy nibabel numpy pillow
 
 from __future__ import annotations
@@ -123,12 +125,13 @@ def load_bruker_series(series_dir: str):
     if nread is None:
         raise RuntimeError("Failed to infer nread.")
 
+    # Optional full read reversal knob
     if os.environ.get("RADIAL_FLIP_READ","0") == "1":
         data = data.reshape(-1, nread)[:, ::-1].reshape(-1)
 
     if data.size % nread != 0:
         raise RuntimeError(f"Readout mismatch: nread={nread}, complex={data.size}")
-    vecs = data.reshape(-1, nread)
+    vecs = data.reshape(-1, nread)              # (#vectors, nread)
     total_vecs = vecs.shape[0]
     if total_vecs % ncoils != 0:
         raise RuntimeError(f"Vector count {total_vecs} not divisible by ncoils={ncoils}")
@@ -197,15 +200,24 @@ def _scale_to_radians(k: np.ndarray, img_shape_xyz: tuple[int,int,int], fov_mm_x
         return (k * scale_unit) * (2*np.pi) * dxi
 
 def load_series_traj(series_dir: str, nread: int, nspokes: int,
-                     img_shape_xyz: tuple[int,int,int], fov_mm_xyz: np.ndarray | None, vox_mm_xyz: np.ndarray) -> np.ndarray | None:
+                     img_shape_xyz: tuple[int,int,int], fov_mm_xyz: np.ndarray | None, vox_mm_xyz: np.ndarray,
+                     traj_order: str) -> np.ndarray | None:
     p = Path(series_dir) / "traj"
     if not p.exists():
         return None
     M = nread * nspokes
     arr = _read_txt_array(p)
+    def maybe_reorder(arrM3: np.ndarray) -> np.ndarray:
+        if traj_order == "sample":
+            return arrM3  # already sample-major
+        # traj_order == "spoke": convert spoke-major (spoke contiguous) -> sample-major
+        try:
+            return arrM3.reshape(nspokes, nread, 3).transpose(1,0,2).reshape(M,3)
+        except Exception:
+            return arrM3  # best effort
     if arr.ndim == 2 and arr.size > 0:
         if arr.shape[0] == M and arr.shape[1] >= 3:
-            k = arr[:, :3]
+            k = maybe_reorder(arr[:, :3])
             return _scale_to_radians(k, img_shape_xyz, fov_mm_xyz, vox_mm_xyz).astype(np.float32)
         if arr.shape[0] == nspokes and arr.shape[1] >= 3:
             dirs = arr[:, :3]
@@ -226,7 +238,7 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
         except Exception:
             continue
         if flat.size == M * 3:
-            k = flat.reshape(M, 3).astype(np.float64)
+            k = maybe_reorder(flat.reshape(M, 3).astype(np.float64))
             return _scale_to_radians(k, img_shape_xyz, fov_mm_xyz, vox_mm_xyz).astype(np.float32)
         if flat.size == nspokes * 3:
             dirs = flat.reshape(nspokes, 3).astype(np.float64)
@@ -297,7 +309,6 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
         draw.text((tx+1, ty+1), lab, fill=0, font=font)
         draw.text((tx,   ty),   lab, fill=240, font=font)
         canvas.paste(im, (x, y_img))
-        x += w + gap
     return canvas
 
 # ---------- Recon ----------
@@ -311,7 +322,7 @@ def recon_adj_sos(kdata: np.ndarray, img_shape_zyx: tuple[int,int,int],
         dcf = compute_dcf(coords, mode=dcf_mode, os=os_fac, width=width)
         coils = []
         for c in range(ncoils):
-            y = kdata[:, :, c].reshape(-1)
+            y = kdata[:, :, c].reshape(-1)     # sample-major flatten
             if dcf is not None:
                 y = y * dcf
             x = sp.nufft_adjoint(y, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
@@ -356,7 +367,7 @@ def anisotropy_metrics(vol: np.ndarray) -> tuple[float,float,float]:
 
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v3")
+    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v4")
     ap.add_argument("--series", required=True, help="Path with acqp/method/visu_pars/fid[/traj]")
     ap.add_argument("--out", required=True, help="Output NIfTI filename")
     ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX","NY","NZ"), required=True)
@@ -368,8 +379,14 @@ def main():
     ap.add_argument("--psf", action="store_true", help="Also save PSF tripanel")
     ap.add_argument("--gpu", type=int, default=-1, help="GPU id to use (e.g., 0). -1 = CPU")
     ap.add_argument("--fov-scale", type=float, default=1.0, help="Scale the effective FOV (e.g., 0.85 to crop by 15%)")
+    ap.add_argument("--traj-order", choices=["sample","spoke"], default="sample",
+                    help="If 'traj' is per-sample Mx3, specify its layout. 'spoke' = spoke-major on disk.")
+    ap.add_argument("--alt-rev", action="store_true", help="Reverse every other spoke's readout (odd spokes)")
+    ap.add_argument("--rev-all", action="store_true", help="Reverse all spokes' readouts")
+    ap.add_argument("--auto-pi", action="store_true", help="Uniformly scale coords so |k|_p99 = π (guards against over/under-scaling)")
     args = ap.parse_args()
 
+    # Device
     use_gpu = (args.gpu >= 0 and cp is not None)
     if use_gpu:
         try:
@@ -390,6 +407,7 @@ def main():
             print("[warn] --gpu set but CuPy/CUDA not available — falling back to CPU.")
         print("Using CPU.")
 
+    # Load series
     kdata, meta, hdr = load_bruker_series(args.series)
     nread, nspokes = meta["nread"], meta["nspokes"]
     vox = meta.get("vox", np.array([1,1,1], float))
@@ -397,14 +415,25 @@ def main():
     print(f"Loaded: nread={nread}, nspokes={nspokes}, ncoils={meta['ncoils']}, SW_h={meta['SW_h']} Hz")
     if fovmm is not None: print(f"Header FOV (mm): {fovmm}")
 
+    # Shapes
     NX, NY, NZ = [int(x) for x in args.matrix]
     img_shape_xyz = (NX, NY, NZ)
     img_shape_zyx = (NZ, NY, NX)
 
-    coords = load_series_traj(args.series, nread, nspokes, img_shape_xyz, fovmm, vox)
+    # Coords
+    coords = load_series_traj(args.series, nread, nspokes, img_shape_xyz, fovmm, vox, args.traj_order)
     if coords is None:
         coords = make_ga_traj_3d(nspokes, nread)
 
+    # Readout direction fixes (align kdata with assumed coord radii direction)
+    if args.rev_all:
+        kdata = kdata[::-1, :, :]
+        print("[readout] Reversed all spokes.")
+    elif args.alt_rev:
+        kdata[:, 1::2, :] = kdata[::-1, 1::2, :]
+        print("[readout] Reversed every other (odd) spoke.")
+
+    # Spoke decimation
     if args.spoke_step > 1:
         take = slice(0, nspokes, max(1, args.spoke_step))
         kdata   = kdata[:, take, :]
@@ -412,6 +441,7 @@ def main():
         nspokes = kdata.shape[1]
         print(f"Decimated spokes by {args.spoke_step}: nspokes={nspokes}")
 
+    # FOV crop
     if args.fov_scale != 1.0:
         if args.fov_scale <= 0:
             print("[warn] --fov-scale must be >0. Ignoring.")
@@ -419,31 +449,34 @@ def main():
             coords = coords / float(args.fov_scale)
             print(f"[fov] Applying effective FOV scale = {args.fov_scale:.3f} (smaller = more crop)")
 
+    # Auto-π scaling
+    p99 = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
+    if args.auto_pi and p99 > 0:
+        s = float(np.pi / p99)
+        coords = coords * s
+        print(f"[auto-pi] Scaled coords by {s:.4f} so |k|_p99 ≈ π.")
+
+    # |k| stats
     norm = np.linalg.norm(coords, axis=1)
     p = np.percentile(norm, [0, 50, 95, 99, 100])
     print(f"|k| percentiles (radians): {p} (expect max ≈ π={np.pi:.3f})")
 
-    if fovmm is not None:
-        fov_iso = float(min(fovmm[:3])) * float(args.fov_scale)
-        kmax_est = nread / (2.0 * fov_iso)
-        fov_max = (1.0 / kmax_est) * np.sqrt(2.0 * max(1, nspokes) / np.pi)
-        nproj_need = (np.pi / 2.0) * (kmax_est * fov_iso) ** 2
-        print(f"[views] FOV_max for Nproj={nspokes}: {fov_max:.1f} mm | Nproj_min for FOV_iso={fov_iso:.1f} mm: {int(np.ceil(nproj_need))}")
-        if fov_iso > fov_max + 1e-6:
-            print("[warn] Effective FOV exceeds alias-free views — honeycomb likely. Use --fov-scale < 1.0 or more spokes.")
-
+    # Recon
     img = recon_adj_sos(kdata, img_shape_zyx, coords, dcf_mode=args.dcf, os_fac=args.os_fac, width=args.width, gpu=args.gpu)
 
+    # Save NIfTI
     affine = np.diag([vox[0], vox[1], vox[2], 1.0])
     nib.save(nib.Nifti1Image(np.asarray(img, np.float32), affine), args.out)
     print(f"Wrote {args.out}")
 
+    # Tripanel
     if args.png:
         trip = _tripanel_from_volume(img, labels=("Axial","Coronal","Sagittal"))
         trip_path = str(Path(args.out).with_suffix("")) + "_tripanel.png"
         trip.save(trip_path)
         print(f"Saved tripanel PNG → {trip_path}")
 
+    # PSF
     if args.psf:
         psf_mag = psf_volume(coords, img_shape_zyx, os_fac=args.os_fac, width=args.width)
         vz, vy, vx = anisotropy_metrics(psf_mag)
