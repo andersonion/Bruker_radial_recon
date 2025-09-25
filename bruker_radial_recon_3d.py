@@ -13,7 +13,17 @@ import sigpy.mri as mr  # only for DCF if available
 try:
     import cupy as cp
 except Exception:
-    cp = None  # CPU fallback
+    cp = None
+
+if args.gpu >= 0 and cp is not None and cp.cuda.runtime.getDeviceCount() > args.gpu:
+    with sp.Device(args.gpu):
+        props = cp.cuda.runtime.getDeviceProperties(args.gpu)
+        name = props["name"].decode() if isinstance(props["name"], bytes) else props["name"]
+    print(f"Using GPU {args.gpu}: {name}")
+else:
+    if args.gpu >= 0:
+        print(f"[warn] Requested GPU {args.gpu} but CuPy/device not available -> falling back to CPU.")
+    print("Using CPU.")
 
 
 # ---------------- JCAMP parsing ----------------
