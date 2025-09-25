@@ -332,9 +332,9 @@ def main():
                     props = cp.cuda.runtime.getDeviceProperties(args.gpu)
                     name = props["name"].decode() if isinstance(props["name"], bytes) else props["name"]
                 print(f"Using GPU {args.gpu}: {name}")
-        else:
-            print(f"[warn] Requested GPU {args.gpu} but only {ndev} device(s) found — falling back to CPU.")
-            args.gpu = -1
+            else:
+                print(f"[warn] Requested GPU {args.gpu} but only {ndev} device(s) found — falling back to CPU.")
+                args.gpu = -1
         except Exception as e:
             print(f"[warn] CuPy GPU init failed ({e}) — falling back to CPU.")
             args.gpu = -1
