@@ -165,21 +165,24 @@ def _read_txt_array(path: Path) -> np.ndarray:
     return np.array(rows, dtype=np.float64) if rows else np.empty((0,))
 
 def _scale_to_radians(k: np.ndarray, img_shape: tuple[int,int,int], vox: np.ndarray) -> np.ndarray:
-    """Auto-infer units: cycles/FOV (~<=1), radians (~<=π), or 1/mm (larger)."""
     if k.size == 0:
         return k
     Nx, Ny, Nz = img_shape
     dxi = np.array(vox if vox is not None and len(vox) >= 3 else [1,1,1], float)
     k = np.asarray(k, float)
     kabs = np.percentile(np.linalg.norm(k, axis=1), 99.0)
-    if kabs <= 1.2:  # cycles/FOV
-        scale = np.array([2*np.pi/Nx, 2*np.pi/Ny, 2*np.pi/Nz], float)
-        return (k * scale[None, :])
-    elif kabs <= 4.2:  # radians
+
+    if kabs <= 1.2:             # cycles/FOV -> radians
+        # FIX: no division by N here. [-0.5,0.5) cycles/FOV should map to [-π, π) radians.
+        return k * (2*np.pi)
+    elif kabs <= 4.2:           # already radians
         return k
-    else:  # 1/mm
-        scale = 2*np.pi * dxi  # per-dim Δx
-        return (k * scale[None, :])
+    else:                        # 1/mm or 1/m
+        # If your traj is in 1/m, convert to 1/mm first: k_mm = k_m / 1000
+        # Auto-handle either by assuming 1/mm; if magnitudes look > 1000, scale down by 1000.
+        scale_unit = 1.0 if kabs < 1000 else (1/1000.0)
+        return (k * scale_unit) * (2*np.pi) * dxi   # ω = 2π * k_mm^-1 * Δx_mm
+	
 
 def load_series_traj(series_dir: str, nread: int, nspokes: int,
                      img_shape: tuple[int,int,int], vox: np.ndarray) -> np.ndarray | None:
@@ -338,6 +341,12 @@ def main():
         print(f"Decimated spokes by {args.spoke_step}: nspokes={nspokes}")
     else:
         coords = full_coords
+
+    norm = np.linalg.norm(coords, axis=1)
+    p = np.percentile(norm, [0, 50, 95, 99, 100])
+    print(f"|k| percentiles (radians): {p}  (expect max ≈ π = {np.pi:.3f})")
+    if p[-1] < 0.2*np.pi:
+        print("[warn] Coord magnitudes look too small; check units/scaling.")
 
     img = recon_adj_sos(kdata, tuple(args.matrix), coords,
                     dcf_mode=args.dcf, gpu=args.gpu)
