@@ -15,16 +15,6 @@ try:
 except Exception:
     cp = None
 
-if args.gpu >= 0 and cp is not None and cp.cuda.runtime.getDeviceCount() > args.gpu:
-    with sp.Device(args.gpu):
-        props = cp.cuda.runtime.getDeviceProperties(args.gpu)
-        name = props["name"].decode() if isinstance(props["name"], bytes) else props["name"]
-    print(f"Using GPU {args.gpu}: {name}")
-else:
-    if args.gpu >= 0:
-        print(f"[warn] Requested GPU {args.gpu} but CuPy/device not available -> falling back to CPU.")
-    print("Using CPU.")
-
 
 # ---------------- JCAMP parsing ----------------
 def _parse_jcamp(path: Path) -> dict:
@@ -332,6 +322,29 @@ def main():
     ap.add_argument("--gpu", type=int, default=-1,
                 help="GPU id to use (e.g., 0). -1 = CPU (default)")
     args = ap.parse_args()
+    # ---- Device banner (after args parsed) ----
+    use_gpu = (args.gpu >= 0 and cp is not None)
+    if use_gpu:
+        try:
+            ndev = cp.cuda.runtime.getDeviceCount()
+            if ndev > args.gpu:
+                with sp.Device(args.gpu):
+                    props = cp.cuda.runtime.getDeviceProperties(args.gpu)
+                    name = props["name"].decode() if isinstance(props["name"], bytes) else props["name"]
+                print(f"Using GPU {args.gpu}: {name}")
+        else:
+            print(f"[warn] Requested GPU {args.gpu} but only {ndev} device(s) found — falling back to CPU.")
+            args.gpu = -1
+    except Exception as e:
+        print(f"[warn] CuPy GPU init failed ({e}) — falling back to CPU.")
+        args.gpu = -1
+else:
+    if args.gpu >= 0:
+        print("[warn] --gpu set but CuPy/CUDA not available — falling back to CPU.")
+    print("Using CPU.")
+
+
+
 
     kdata, meta, hdr = load_bruker_series(args.series)
     nread, nspokes = meta["nread"], meta["nspokes"]
