@@ -335,13 +335,13 @@ def main():
         else:
             print(f"[warn] Requested GPU {args.gpu} but only {ndev} device(s) found — falling back to CPU.")
             args.gpu = -1
-    except Exception as e:
-        print(f"[warn] CuPy GPU init failed ({e}) — falling back to CPU.")
-        args.gpu = -1
-else:
-    if args.gpu >= 0:
-        print("[warn] --gpu set but CuPy/CUDA not available — falling back to CPU.")
-    print("Using CPU.")
+        except Exception as e:
+            print(f"[warn] CuPy GPU init failed ({e}) — falling back to CPU.")
+            args.gpu = -1
+    else:
+        if args.gpu >= 0:
+            print("[warn] --gpu set but CuPy/CUDA not available — falling back to CPU.")
+        print("Using CPU.")
 
 
 
