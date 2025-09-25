@@ -277,16 +277,19 @@ def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width:
     return dcf
 
 # ---------- Tripanel ----------
+
 def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")) -> Image.Image:
     Z, Y, X = vol.shape
     ax  = vol[Z//2,:,:]
     cor = vol[:,Y//2,:]
     sag = vol[:,:,X//2]
+
     def to_u8(a):
         vmin = np.percentile(a, 1.0); vmax = np.percentile(a, 99.0)
         a = np.clip((a - vmin) / (vmax - vmin + 1e-12), 0, 1)
         return (a * 255).astype(np.uint8)
-    imgs = [Image.fromarray(to_u8(x), mode="L") for x in (ax, cor, sag)]
+
+    imgs = [Image.fromarray(to_u8(x)) for x in (ax, cor, sag)]  # no deprecated 'mode' arg
     target_h = max(im.size[1] for im in imgs)
     rs = []
     for im in imgs:
@@ -294,6 +297,7 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
         if h != target_h:
             im = im.resize((int(round(w * (target_h / h))), target_h), Image.BICUBIC)
         rs.append(im)
+
     margin=20; gap=16; label_h=28
     total_w = margin*2 + sum(im.size[0] for im in rs) + gap*2
     total_h = margin*2 + label_h + target_h
@@ -301,6 +305,7 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
     draw = ImageDraw.Draw(canvas)
     try: font = ImageFont.truetype("DejaVuSans.ttf", 18)
     except Exception: font = ImageFont.load_default()
+
     x = margin; y_img = margin + label_h
     for im, lab in zip(rs, labels):
         w, h = im.size
@@ -309,6 +314,7 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
         draw.text((tx+1, ty+1), lab, fill=0, font=font)
         draw.text((tx,   ty),   lab, fill=240, font=font)
         canvas.paste(im, (x, y_img))
+        x += w + gap  # <— the missing increment that caused all three to overlap
     return canvas
 
 # ---------- Recon ----------
