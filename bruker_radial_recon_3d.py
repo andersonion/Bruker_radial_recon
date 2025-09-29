@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
-# Bruker 3D radial recon — v4.1
-# Fixes FOV unit handling (prefer PVM_Fov in mm; ACQ_fov_cm*10; ACQ_fov heuristic cm→mm)
-# Keeps: --traj-order, --alt-rev/--rev-all, --auto-pi, single tripanel, PSF metrics
+# Bruker 3D radial recon — v4.2
+# Adds:
+#   --center-out      : use center-out radii for fallback GA trajectory
+#   --axes ORDER      : permute k-axes (e.g., xyz, zyx, xzy, ...)
+#   --flip-x/y/z      : flip sign of a k-axis
+#   --rd-shift s      : constant read-direction shift in *samples*
+#   --auto-delay      : grid search rd-shift to round the PSF (min anisotropy)
+#
+# Keeps:
+#   --traj-order {sample,spoke}, --alt-rev/--rev-all, --auto-pi
+#   Single tripanel PNG, PSF PNG with anisotropy metrics
+#
+# Deps: pip install sigpy nibabel numpy pillow
 
 from __future__ import annotations
-import argparse, os, re
+import argparse, os, re, sys, math
 from pathlib import Path
 import numpy as np
 import nibabel as nib
@@ -34,7 +44,7 @@ def _parse_jcamp(path: Path) -> dict:
                 d[key] += " " + s
     return d
 
-_num_re = re.compile(r"[-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?")
+_num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 def _nums(s: str) -> list[float]:
     if not s: return []
     out = []
@@ -77,7 +87,6 @@ def _get_fov_mm(acqp: dict, method: dict) -> np.ndarray | None:
         v = np.array(_nums(acqp["ACQ_fov"]), float)
         if v.size >= 2:
             if v.size == 2: v = np.array([v[0], v[1], v[1]], float)
-            # Heuristic: if typical small values (<= 10), treat as cm
             if np.nanmax(v[:3]) <= 10.0:
                 v = v * 10.0
             return v[:3]
@@ -164,15 +173,18 @@ def load_bruker_series(series_dir: str):
     return kdata, meta, dict(acqp=acqp, method=method, visu=visu)
 
 # ---------- Trajectory ----------
-def make_ga_traj_3d(nspokes: int, nread: int) -> np.ndarray:
+def make_ga_traj_3d(nspokes: int, nread: int, center_out: bool = False) -> np.ndarray:
     i = np.arange(nspokes, dtype=np.float64) + 0.5
     phi = (1 + np.sqrt(5)) / 2
     z = 1.0 - 2.0 * i / (nspokes + 1.0)
     r = np.sqrt(np.maximum(0.0, 1.0 - z*z))
     theta = 2.0 * np.pi * i / (phi ** 2)
-    dirs = np.stack([r*np.cos(theta), r*np.sin(theta), z], axis=1)
+    dirs = np.stack([r*np.cos(theta), r*np.sin(theta), z], axis=1)  # (nspokes,3)
     kmax = np.pi
-    t = np.linspace(-1.0, 1.0, nread, endpoint=False, dtype=np.float64)
+    if center_out:
+        t = np.linspace(0.0, 1.0, nread, endpoint=False, dtype=np.float64)  # center→edge
+    else:
+        t = np.linspace(-1.0, 1.0, nread, endpoint=False, dtype=np.float64) # symmetric
     radii = (kmax * t)[:, None, None]
     ktraj = (radii * dirs[None, :, :]).reshape(-1, 3)
     return ktraj.astype(np.float32)
@@ -200,11 +212,11 @@ def _scale_to_radians(k: np.ndarray, img_shape_xyz: tuple[int,int,int], fov_mm_x
         dxi = np.array(vox_mm_xyz if vox_mm_xyz is not None and len(vox_mm_xyz) >= 3 else [1,1,1], float)
     k = np.asarray(k, float)
     kabs = np.percentile(np.linalg.norm(k, axis=1), 99.0)
-    if kabs <= 1.2:
+    if kabs <= 1.2:      # cycles/FOV -> radians
         return k * (2*np.pi)
-    elif kabs <= 4.2:
+    elif kabs <= 4.2:    # radians
         return k
-    else:
+    else:                 # 1/mm or 1/m
         scale_unit = 1.0 if kabs < 1000 else (1/1000.0)
         return (k * scale_unit) * (2*np.pi) * dxi
 
@@ -218,7 +230,7 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     arr = _read_txt_array(p)
     def maybe_reorder(arrM3: np.ndarray) -> np.ndarray:
         if traj_order == "sample":
-            return arrM3
+            return arrM3  # already sample-major
         try:
             return arrM3.reshape(nspokes, nread, 3).transpose(1,0,2).reshape(M,3)
         except Exception:
@@ -283,6 +295,51 @@ def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width:
     dcf = dcf.astype(np.float32, copy=False)
     dcf *= (dcf.size / (dcf.sum() + 1e-8))
     return dcf
+
+# ---------- Helpers: axes & delay ----------
+def apply_axes(coords: np.ndarray, order: str, flips: tuple[bool,bool,bool]) -> np.ndarray:
+    assert coords.shape[1] == 3
+    m = {'x':0, 'y':1, 'z':2}
+    if order not in ("xyz","xzy","yxz","yzx","zxy","zyx"):
+        return coords
+    idx = [m[c] for c in order]
+    out = coords[:, idx].copy()
+    for i,do_flip in enumerate(flips):
+        if do_flip:
+            out[:, i] *= -1.0
+    return out
+
+def apply_read_shift(coords: np.ndarray, nread: int, nspokes: int, shift_samples: float) -> np.ndarray:
+    if abs(shift_samples) < 1e-9:
+        return coords
+    delta = float(shift_samples) * (2*np.pi / float(nread))
+    uvw = coords.reshape(nread, nspokes, 3)
+    # approximate unit direction per spoke
+    dirs = uvw[-1,:,:] - uvw[0,:,:]
+    norm = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
+    dirs = dirs / norm
+    uvw = uvw + delta * dirs[None, :, :]
+    return uvw.reshape(-1, 3)
+
+def psf_volume(coords: np.ndarray, img_shape_zyx: tuple[int,int,int], os_fac: float = 1.75, width: int = 4) -> np.ndarray:
+    ones = np.ones(coords.shape[0], np.complex64)
+    psf = sp.nufft_adjoint(ones, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
+    psf_mag = np.abs(psf); psf_mag /= (psf_mag.max() + 1e-12)
+    return psf_mag
+
+def anisotropy_metrics(vol: np.ndarray) -> tuple[float,float,float]:
+    Z, Y, X = vol.shape
+    zc, yc, xc = Z//2, Y//2, X//2
+    r = min(Z, Y, X)//6
+    sub = vol[zc-r:zc+r+1, yc-r:yc+r+1, xc-r:xc+r+1]
+    def second_moment(a, axis):
+        idx = np.arange(a.shape[axis]) - a.shape[axis]/2.0
+        shape = [1,1,1]; shape[axis] = -1
+        w = idx.reshape(shape)
+        num = np.sum((w**2) * a); den = np.sum(a) + 1e-12
+        return float(num/den)
+    vz = second_moment(sub, 0); vy = second_moment(sub, 1); vx = second_moment(sub, 2)
+    return vz, vy, vx
 
 # ---------- Tripanel ----------
 def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")) -> Image.Image:
@@ -353,30 +410,9 @@ def recon_adj_sos(kdata: np.ndarray, img_shape_zyx: tuple[int,int,int],
         sos_g = cp.sqrt((cp.abs(coils_g) ** 2).sum(axis=0))
         return cp.asnumpy(sos_g)
 
-# ---------- PSF + metrics ----------
-def psf_volume(coords: np.ndarray, img_shape_zyx: tuple[int,int,int], os_fac: float = 1.75, width: int = 4) -> np.ndarray:
-    ones = np.ones(coords.shape[0], np.complex64)
-    psf = sp.nufft_adjoint(ones, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
-    psf_mag = np.abs(psf); psf_mag /= (psf_mag.max() + 1e-12)
-    return psf_mag
-
-def anisotropy_metrics(vol: np.ndarray) -> tuple[float,float,float]:
-    Z, Y, X = vol.shape
-    zc, yc, xc = Z//2, Y//2, X//2
-    r = min(Z, Y, X)//6
-    sub = vol[zc-r:zc+r+1, yc-r:yc+r+1, xc-r:xc+r+1]
-    def second_moment(a, axis):
-        idx = np.arange(a.shape[axis]) - a.shape[axis]/2.0
-        shape = [1,1,1]; shape[axis] = -1
-        w = idx.reshape(shape)
-        num = np.sum((w**2) * a); den = np.sum(a) + 1e-12
-        return float(num/den)
-    vz = second_moment(sub, 0); vy = second_moment(sub, 1); vx = second_moment(sub, 2)
-    return vz, vy, vx
-
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v4.1")
+    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v4.2")
     ap.add_argument("--series", required=True, help="Path with acqp/method/visu_pars/fid[/traj]")
     ap.add_argument("--out", required=True, help="Output NIfTI filename")
     ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX","NY","NZ"), required=True)
@@ -393,6 +429,13 @@ def main():
     ap.add_argument("--alt-rev", action="store_true", help="Reverse every other spoke's readout (odd spokes)")
     ap.add_argument("--rev-all", action="store_true", help="Reverse all spokes' readouts")
     ap.add_argument("--auto-pi", action="store_true", help="Uniformly scale coords so |k|_p99 = π")
+    ap.add_argument("--center-out", action="store_true", help="Use center→edge radii for fallback GA traj")
+    ap.add_argument("--axes", default="xyz", help="Permutation of k-axes: one of xyz,xzy,yxz,yzx,zxy,zyx")
+    ap.add_argument("--flip-x", action="store_true", help="Flip sign of kx")
+    ap.add_argument("--flip-y", action="store_true", help="Flip sign of ky")
+    ap.add_argument("--flip-z", action="store_true", help="Flip sign of kz")
+    ap.add_argument("--rd-shift", type=float, default=0.0, help="Read-direction shift (in samples)")
+    ap.add_argument("--auto-delay", action="store_true", help="Grid-search rd-shift to minimize PSF anisotropy")
     args = ap.parse_args()
 
     # Device
@@ -433,7 +476,7 @@ def main():
     # Coords
     coords = load_series_traj(args.series, nread, nspokes, img_shape_xyz, fovmm, vox, args.traj_order)
     if coords is None:
-        coords = make_ga_traj_3d(nspokes, nread)
+        coords = make_ga_traj_3d(nspokes, nread, center_out=args.center_out)
 
     # Readout direction fixes
     if args.rev_all:
@@ -459,6 +502,11 @@ def main():
             coords = coords / float(args.fov_scale)
             print(f"[fov] Applying effective FOV scale = {args.fov_scale:.3f} (smaller = more crop)")
 
+    # Axes & flips
+    coords = apply_axes(coords, args.axes, (args.flip_x, args.flip_y, args.flip_z))
+    if args.axes != "xyz" or args.flip_x or args.flip_y or args.flip_z:
+        print(f"[axes] order={args.axes} flips=({args.flip_x},{args.flip_y},{args.flip_z})")
+
     # Auto-π scaling
     p99 = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
     if args.auto_pi and p99 > 0:
@@ -466,10 +514,25 @@ def main():
         coords = coords * s
         print(f"[auto-pi] Scaled coords by {s:.4f} so |k|_p99 ≈ π.")
 
-    # Report Δx from header if available
-    if fovmm is not None:
-        dxi = np.array([fovmm[0]/NX, fovmm[1]/NY, fovmm[2]/NZ])
-        print(f"[header Δx mm] dx=({dxi[0]:.3f}, {dxi[1]:.3f}, {dxi[2]:.3f})  (from FOV/mm ÷ matrix)")
+    # Delay correction
+    if abs(args.rd_shift) > 1e-9:
+        coords = apply_read_shift(coords, nread, nspokes, args.rd_shift)
+        print(f"[delay] Applied read shift of {args.rd_shift:.3f} samples.")
+
+    # Auto delay grid search
+    if args.auto_delay:
+        img_shape_zyx_small = tuple(max(64, s//2) for s in img_shape_zyx)
+        best_s = 0.0; best_cost = 1e9
+        for s in np.linspace(-0.6, 0.6, 25):
+            c = apply_read_shift(coords, nread, nspokes, s)
+            psf = psf_volume(c, img_shape_zyx_small, os_fac=args.os_fac, width=args.width)
+            vz, vy, vx = anisotropy_metrics(psf)
+            vmean = (vx+vy+vz)/3.0
+            cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
+            if cost < best_cost:
+                best_cost, best_s = cost, s
+        coords = apply_read_shift(coords, nread, nspokes, best_s)
+        print(f"[auto-delay] Best read shift ≈ {best_s:.3f} samples (cost={best_cost:.4f}).")
 
     # |k| stats
     norm = np.linalg.norm(coords, axis=1)
