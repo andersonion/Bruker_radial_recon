@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-# Bruker 3D radial recon — v4.2
-# Adds:
-#   --center-out      : use center-out radii for fallback GA trajectory
-#   --axes ORDER      : permute k-axes (e.g., xyz, zyx, xzy, ...)
-#   --flip-x/y/z      : flip sign of a k-axis
-#   --rd-shift s      : constant read-direction shift in *samples*
-#   --auto-delay      : grid search rd-shift to round the PSF (min anisotropy)
-#
-# Keeps:
-#   --traj-order {sample,spoke}, --alt-rev/--rev-all, --auto-pi
-#   Single tripanel PNG, PSF PNG with anisotropy metrics
-#
-# Deps: pip install sigpy nibabel numpy pillow
+# Bruker 3D radial recon — v4.3 (complete)
+# See header for usage examples.
 
 from __future__ import annotations
-import argparse, os, re, sys, math
+
+import argparse, os, re
 from pathlib import Path
 import numpy as np
 import nibabel as nib
@@ -23,7 +13,7 @@ import sigpy.mri as mr
 from PIL import Image, ImageDraw, ImageFont
 
 try:
-    import cupy as cp
+    import cupy as cp  # optional
 except Exception:
     cp = None
 
@@ -45,6 +35,7 @@ def _parse_jcamp(path: Path) -> dict:
     return d
 
 _num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
 def _nums(s: str) -> list[float]:
     if not s: return []
     out = []
@@ -63,26 +54,22 @@ def _get_int(d: dict, key: str, default=0) -> int:
     except Exception:
         return default
 
-def _get_fov_mm(acqp: dict, method: dict) -> np.ndarray | None:
-    # Prefer method PVM_Fov (mm)
+def _get_fov_mm(acqp: dict, method: dict):
     if "PVM_Fov" in method:
         v = np.array(_nums(method["PVM_Fov"]), float)
         if v.size >= 2:
             if v.size == 2: v = np.array([v[0], v[1], v[1]], float)
             return v[:3]
-    # Next: explicit cm then convert
     if "ACQ_fov_cm" in acqp:
         v = np.array(_nums(acqp["ACQ_fov_cm"]), float)
         if v.size >= 2:
             if v.size == 2: v = np.array([v[0], v[1], v[1]], float)
             return v[:3] * 10.0
-    # ACQ_fov_mm says mm
     if "ACQ_fov_mm" in acqp:
         v = np.array(_nums(acqp["ACQ_fov_mm"]), float)
         if v.size >= 2:
             if v.size == 2: v = np.array([v[0], v[1], v[1]], float)
             return v[:3]
-    # Bare ACQ_fov is sometimes in cm on Bruker: detect and convert if it looks like cm
     if "ACQ_fov" in acqp:
         v = np.array(_nums(acqp["ACQ_fov"]), float)
         if v.size >= 2:
@@ -172,7 +159,7 @@ def load_bruker_series(series_dir: str):
                 TE_s=TE_s, TR_s=TR_s, vox=vox, fovmm=fovmm)
     return kdata, meta, dict(acqp=acqp, method=method, visu=visu)
 
-# ---------- Trajectory ----------
+# ---------- Trajectory helpers ----------
 def make_ga_traj_3d(nspokes: int, nread: int, center_out: bool = False) -> np.ndarray:
     i = np.arange(nspokes, dtype=np.float64) + 0.5
     phi = (1 + np.sqrt(5)) / 2
@@ -203,7 +190,8 @@ def _read_txt_array(path: Path) -> np.ndarray:
                 continue
     return np.array(rows, dtype=np.float64) if rows else np.empty((0,))
 
-def _scale_to_radians(k: np.ndarray, img_shape_xyz: tuple[int,int,int], fov_mm_xyz: np.ndarray | None, vox_mm_xyz: np.ndarray | None) -> np.ndarray:
+def _scale_to_radians(k: np.ndarray, img_shape_xyz: tuple[int,int,int],
+                      fov_mm_xyz, vox_mm_xyz):
     if k.size == 0: return k
     Nx, Ny, Nz = img_shape_xyz
     if fov_mm_xyz is not None and len(fov_mm_xyz) >= 3:
@@ -212,17 +200,17 @@ def _scale_to_radians(k: np.ndarray, img_shape_xyz: tuple[int,int,int], fov_mm_x
         dxi = np.array(vox_mm_xyz if vox_mm_xyz is not None and len(vox_mm_xyz) >= 3 else [1,1,1], float)
     k = np.asarray(k, float)
     kabs = np.percentile(np.linalg.norm(k, axis=1), 99.0)
-    if kabs <= 1.2:      # cycles/FOV -> radians
+    if kabs <= 1.2:
         return k * (2*np.pi)
-    elif kabs <= 4.2:    # radians
+    elif kabs <= 4.2:
         return k
-    else:                 # 1/mm or 1/m
+    else:
         scale_unit = 1.0 if kabs < 1000 else (1/1000.0)
         return (k * scale_unit) * (2*np.pi) * dxi
 
 def load_series_traj(series_dir: str, nread: int, nspokes: int,
-                     img_shape_xyz: tuple[int,int,int], fov_mm_xyz: np.ndarray | None, vox_mm_xyz: np.ndarray,
-                     traj_order: str) -> np.ndarray | None:
+                     img_shape_xyz: tuple[int,int,int], fov_mm_xyz, vox_mm_xyz,
+                     traj_order: str):
     p = Path(series_dir) / "traj"
     if not p.exists():
         return None
@@ -230,7 +218,7 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     arr = _read_txt_array(p)
     def maybe_reorder(arrM3: np.ndarray) -> np.ndarray:
         if traj_order == "sample":
-            return arrM3  # already sample-major
+            return arrM3
         try:
             return arrM3.reshape(nspokes, nread, 3).transpose(1,0,2).reshape(M,3)
         except Exception:
@@ -278,7 +266,7 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     return None
 
 # ---------- DCF ----------
-def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width: int = 4) -> np.ndarray | None:
+def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width: int = 4):
     if mode == "none":
         return None
     dcf = None
@@ -297,7 +285,7 @@ def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width:
     return dcf
 
 # ---------- Helpers: axes & delay ----------
-def apply_axes(coords: np.ndarray, order: str, flips: tuple[bool,bool,bool]) -> np.ndarray:
+def apply_axes(coords: np.ndarray, order: str, flips: tuple[bool,bool,bool]):
     assert coords.shape[1] == 3
     m = {'x':0, 'y':1, 'z':2}
     if order not in ("xyz","xzy","yxz","yzx","zxy","zyx"):
@@ -309,25 +297,24 @@ def apply_axes(coords: np.ndarray, order: str, flips: tuple[bool,bool,bool]) -> 
             out[:, i] *= -1.0
     return out
 
-def apply_read_shift(coords: np.ndarray, nread: int, nspokes: int, shift_samples: float) -> np.ndarray:
+def apply_read_shift(coords: np.ndarray, nread: int, nspokes: int, shift_samples: float):
     if abs(shift_samples) < 1e-9:
         return coords
     delta = float(shift_samples) * (2*np.pi / float(nread))
     uvw = coords.reshape(nread, nspokes, 3)
-    # approximate unit direction per spoke
     dirs = uvw[-1,:,:] - uvw[0,:,:]
     norm = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
     dirs = dirs / norm
     uvw = uvw + delta * dirs[None, :, :]
     return uvw.reshape(-1, 3)
 
-def psf_volume(coords: np.ndarray, img_shape_zyx: tuple[int,int,int], os_fac: float = 1.75, width: int = 4) -> np.ndarray:
+def psf_volume(coords: np.ndarray, img_shape_zyx: tuple[int,int,int], os_fac: float = 1.75, width: int = 4):
     ones = np.ones(coords.shape[0], np.complex64)
     psf = sp.nufft_adjoint(ones, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
     psf_mag = np.abs(psf); psf_mag /= (psf_mag.max() + 1e-12)
     return psf_mag
 
-def anisotropy_metrics(vol: np.ndarray) -> tuple[float,float,float]:
+def anisotropy_metrics(vol: np.ndarray):
     Z, Y, X = vol.shape
     zc, yc, xc = Z//2, Y//2, X//2
     r = min(Z, Y, X)//6
@@ -341,8 +328,15 @@ def anisotropy_metrics(vol: np.ndarray) -> tuple[float,float,float]:
     vz = second_moment(sub, 0); vy = second_moment(sub, 1); vx = second_moment(sub, 2)
     return vz, vy, vx
 
+def psf_aniso_cost(coords: np.ndarray, img_shape_zyx_small: tuple[int,int,int], os_fac: float, width: int):
+    psf = psf_volume(coords, img_shape_zyx_small, os_fac=os_fac, width=width)
+    vz, vy, vx = anisotropy_metrics(psf)
+    vmean = (vx+vy+vz)/3.0
+    cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
+    return cost, (vz, vy, vx)
+
 # ---------- Tripanel ----------
-def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")) -> Image.Image:
+def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")):
     Z, Y, X = vol.shape
     ax  = vol[Z//2,:,:]
     cor = vol[:,Y//2,:]
@@ -364,12 +358,18 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
     total_h = margin*2 + label_h + target_h
     canvas = Image.new("L", (total_w, total_h), color=16)
     draw = ImageDraw.Draw(canvas)
-    try: font = ImageFont.truetype("DejaVuSans.ttf", 18)
-    except Exception: font = ImageFont.load_default()
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
+        def _text_w(t): return draw.textlength(t, font=font)
+    except Exception:
+        font = ImageFont.load_default()
+        def _text_w(t): 
+            bbox = draw.textbbox((0,0), t, font=font)
+            return bbox[2]-bbox[0]
     x = margin; y_img = margin + label_h
     for im, lab in zip(rs, labels):
         w, h = im.size
-        tw = draw.textlength(lab, font=font); th = font.size
+        tw = _text_w(lab); th = font.size
         tx = x + (w - int(tw))//2; ty = margin + (label_h - th)//2
         draw.text((tx+1, ty+1), lab, fill=0, font=font)
         draw.text((tx,   ty),   lab, fill=240, font=font)
@@ -381,7 +381,7 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
 def recon_adj_sos(kdata: np.ndarray, img_shape_zyx: tuple[int,int,int],
                   coords: np.ndarray, dcf_mode: str = "pipe",
                   os_fac: float = 1.75, width: int = 4,
-                  gpu: int = -1) -> np.ndarray:
+                  gpu: int = -1):
     nread, nspokes, ncoils = kdata.shape
     assert coords.shape == (nread * nspokes, 3)
     if gpu < 0 or cp is None:
@@ -412,7 +412,7 @@ def recon_adj_sos(kdata: np.ndarray, img_shape_zyx: tuple[int,int,int],
 
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v4.2")
+    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v4.3")
     ap.add_argument("--series", required=True, help="Path with acqp/method/visu_pars/fid[/traj]")
     ap.add_argument("--out", required=True, help="Output NIfTI filename")
     ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX","NY","NZ"), required=True)
@@ -436,6 +436,16 @@ def main():
     ap.add_argument("--flip-z", action="store_true", help="Flip sign of kz")
     ap.add_argument("--rd-shift", type=float, default=0.0, help="Read-direction shift (in samples)")
     ap.add_argument("--auto-delay", action="store_true", help="Grid-search rd-shift to minimize PSF anisotropy")
+    ap.add_argument("--auto-delay-range", nargs=2, type=float, metavar=("MIN","MAX"), default=(-0.6, 0.6),
+                    help="Range (samples) for auto-delay search (default ±0.6)")
+    ap.add_argument("--auto-delay-steps", type=int, default=25, help="Number of steps for auto-delay (default 25)")
+    ap.add_argument("--scale-x", type=float, default=1.0, help="Per-axis k-scale for x")
+    ap.add_argument("--scale-y", type=float, default=1.0, help="Per-axis k-scale for y")
+    ap.add_argument("--scale-z", type=float, default=1.0, help="Per-axis k-scale for z")
+    ap.add_argument("--auto-scale", action="store_true", help="Fit per-axis scales to minimize PSF anisotropy")
+    ap.add_argument("--auto-scale-range", nargs=2, type=float, metavar=("MIN","MAX"), default=(0.7, 1.3),
+                    help="Range for per-axis scale search (default 0.7..1.3)")
+    ap.add_argument("--auto-scale-steps", type=int, default=5, help="Grid steps per axis (default 5)")
     args = ap.parse_args()
 
     # Device
@@ -522,17 +532,48 @@ def main():
     # Auto delay grid search
     if args.auto_delay:
         img_shape_zyx_small = tuple(max(64, s//2) for s in img_shape_zyx)
-        best_s = 0.0; best_cost = 1e9
-        for s in np.linspace(-0.6, 0.6, 25):
+        lo, hi = args.auto_delay_range
+        steps = max(3, int(args.auto_delay_steps))
+        best_s = 0.0; best_cost = 1e9; best_v = (0,0,0)
+        for s in np.linspace(lo, hi, steps):
             c = apply_read_shift(coords, nread, nspokes, s)
-            psf = psf_volume(c, img_shape_zyx_small, os_fac=args.os_fac, width=args.width)
-            vz, vy, vx = anisotropy_metrics(psf)
-            vmean = (vx+vy+vz)/3.0
-            cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
+            cost, v = psf_aniso_cost(c, img_shape_zyx_small, os_fac=args.os_fac, width=args.width)
             if cost < best_cost:
-                best_cost, best_s = cost, s
+                best_cost, best_s, best_v = cost, s, v
         coords = apply_read_shift(coords, nread, nspokes, best_s)
-        print(f"[auto-delay] Best read shift ≈ {best_s:.3f} samples (cost={best_cost:.4f}).")
+        print(f"[auto-delay] Best read shift ≈ {best_s:.3f} samples (cost={best_cost:.4f}).  PSF vars(Z,Y,X)≈{best_v}")
+
+    # Per-axis scaling (manual)
+    if any(abs(s-1.0) > 1e-9 for s in (args.scale_x, args.scale_y, args.scale_z)):
+        scales = np.array([args.scale_x, args.scale_y, args.scale_z], float)
+        coords = coords * scales[None, :]
+        print(f"[scale] Applied manual per-axis scales (x,y,z) = {tuple(scales)}")
+
+    # Auto per-axis scaling
+    if args.auto_scale:
+        img_shape_zyx_small = tuple(max(64, s//2) for s in img_shape_zyx)
+        lo, hi = args.auto_scale_range
+        steps = max(3, int(args.auto_scale_steps))
+        def search_axis(scales, axis):
+            candidates = np.linspace(lo, hi, steps)
+            best = (1e9, scales[axis])
+            for val in candidates:
+                test = scales.copy(); test[axis] = val
+                c = coords * test[None, :]
+                cost, _ = psf_aniso_cost(c, img_shape_zyx_small, os_fac=args.os_fac, width=args.width)
+                if cost < best[0]:
+                    best = (cost, val)
+            scales[axis] = best[1]
+            return scales, best[0]
+        scales = np.array([1.0, 1.0, 1.0], float)
+        for _ in range(2):
+            for ax in (0,1,2):
+                scales, _ = search_axis(scales, ax)
+            span = (hi - lo) * 0.5
+            lo, hi = (max(0.3, scales.min()-span/4), scales.max()+span/4)
+        coords = coords * scales[None, :]
+        print(f"[auto-scale] Best per-axis scales (x,y,z) ≈ ({scales[0]:.3f}, {scales[1]:.3f}, {scales[2]:.3f})")
+        print(f"            Re-run tip: --scale-x {scales[0]:.3f} --scale-y {scales[1]:.3f} --scale-z {scales[2]:.3f}")
 
     # |k| stats
     norm = np.linalg.norm(coords, axis=1)
