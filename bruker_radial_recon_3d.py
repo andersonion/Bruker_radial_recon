@@ -335,6 +335,32 @@ def psf_aniso_cost(coords: np.ndarray, img_shape_zyx_small: tuple[int,int,int], 
     cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
     return cost, (vz, vy, vx)
 
+def radial_apod_window(nread: int, kind: str, *, 
+                       tukey_alpha=0.3, kaiser_beta=6.0, gauss_sigma=0.18):
+    """Return length-nread 1D window, centered, for radial readout."""
+    r = np.linspace(-1, 1, nread, endpoint=False)  # -1..1
+    if kind == "hann":
+        w = 0.5 * (1 + np.cos(np.pi * r))               # 0 at edges
+    elif kind == "tukey":
+        a = float(tukey_alpha)
+        at = np.abs(r)
+        w = np.ones_like(r)
+        m = (at > (1-a)) & (a > 0)
+        w[m] = 0.5 * (1 + np.cos(np.pi/a * (at[m] - (1-a))))
+        w[at >= 1] = 0.0
+    elif kind == "kaiser":
+        from numpy import i0
+        b = float(kaiser_beta)
+        w = i0(b * np.sqrt(1 - r**2)) / i0(b)
+    elif kind == "gauss":
+        s = float(gauss_sigma)                           # in Nyquist units
+        w = np.exp(-0.5 * (r/s)**2)
+    else:  # "none"
+        w = np.ones_like(r)
+    # normalize area so overall brightness stays comparable
+    return (w / (w.mean() + 1e-12)).astype(np.float32)
+
+
 # ---------- Tripanel ----------
 def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")):
     Z, Y, X = vol.shape
@@ -383,6 +409,12 @@ def recon_adj_sos(kdata: np.ndarray, img_shape_zyx: tuple[int,int,int],
                   os_fac: float = 1.75, width: int = 4,
                   gpu: int = -1):
     nread, nspokes, ncoils = kdata.shape
+    w_read = radial_apod_window(nread, apod_kind, 
+                            tukey_alpha=tukey_alpha, 
+                            kaiser_beta=kaiser_beta, 
+                            gauss_sigma=gauss_sigma)
+    w_flat = np.repeat(w_read[:, None], nspokes, axis=1).reshape(-1)
+
     assert coords.shape == (nread * nspokes, 3)
     if gpu < 0 or cp is None:
         dcf = compute_dcf(coords, mode=dcf_mode, os=os_fac, width=width)
@@ -391,6 +423,7 @@ def recon_adj_sos(kdata: np.ndarray, img_shape_zyx: tuple[int,int,int],
             y = kdata[:, :, c].reshape(-1)
             if dcf is not None:
                 y = y * dcf
+            y = y * w_flat
             x = sp.nufft_adjoint(y, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
             coils.append(x)
         coils = np.stack(coils, axis=0)
@@ -446,6 +479,12 @@ def main():
     ap.add_argument("--auto-scale-range", nargs=2, type=float, metavar=("MIN","MAX"), default=(0.7, 1.3),
                     help="Range for per-axis scale search (default 0.7..1.3)")
     ap.add_argument("--auto-scale-steps", type=int, default=5, help="Grid steps per axis (default 5)")
+    ap.add_argument("--apod", choices=["none","hann","tukey","kaiser","gauss"], default="tukey",
+                help="Radial apodization window (default: tukey)")
+    ap.add_argument("--tukey-alpha", type=float, default=0.30, help="Tukey alpha (0..1)")
+    ap.add_argument("--kaiser-beta", type=float, default=6.0, help="Kaiser beta") 
+    ap.add_argument("--gauss-sigma", type=float, default=0.18, help="Gaussian sigma in Nyquist units")
+
     args = ap.parse_args()
 
     # Device
