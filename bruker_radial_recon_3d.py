@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# Bruker 3D radial recon — v4.3 (complete)
-# See header for usage examples.
+# Bruker 3D radial recon — v4.4
+# (Apodization fixed; complete single-file script)
 
 from __future__ import annotations
-
 import argparse, os, re
 from pathlib import Path
 import numpy as np
@@ -13,7 +12,7 @@ import sigpy.mri as mr
 from PIL import Image, ImageDraw, ImageFont
 
 try:
-    import cupy as cp  # optional
+    import cupy as cp
 except Exception:
     cp = None
 
@@ -35,7 +34,6 @@ def _parse_jcamp(path: Path) -> dict:
     return d
 
 _num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
-
 def _nums(s: str) -> list[float]:
     if not s: return []
     out = []
@@ -79,7 +77,7 @@ def _get_fov_mm(acqp: dict, method: dict):
             return v[:3]
     return None
 
-# ---------- Bruker loader ----------
+# ---------- Loader ----------
 def load_bruker_series(series_dir: str):
     series = Path(series_dir)
     acqp   = _parse_jcamp(series / "acqp")
@@ -169,9 +167,9 @@ def make_ga_traj_3d(nspokes: int, nread: int, center_out: bool = False) -> np.nd
     dirs = np.stack([r*np.cos(theta), r*np.sin(theta), z], axis=1)  # (nspokes,3)
     kmax = np.pi
     if center_out:
-        t = np.linspace(0.0, 1.0, nread, endpoint=False, dtype=np.float64)  # center→edge
+        t = np.linspace(0.0, 1.0, nread, endpoint=False, dtype=np.float64)
     else:
-        t = np.linspace(-1.0, 1.0, nread, endpoint=False, dtype=np.float64) # symmetric
+        t = np.linspace(-1.0, 1.0, nread, endpoint=False, dtype=np.float64)
     radii = (kmax * t)[:, None, None]
     ktraj = (radii * dirs[None, :, :]).reshape(-1, 3)
     return ktraj.astype(np.float32)
@@ -217,9 +215,8 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     M = nread * nspokes
     arr = _read_txt_array(p)
     def maybe_reorder(arrM3: np.ndarray) -> np.ndarray:
-        if traj_order == "sample":
-            return arrM3
-        try:
+        if traj_order == "sample": return arrM3
+        try:  # "spoke" → reshape(nspokes,nread,3) → transpose to sample-major
             return arrM3.reshape(nspokes, nread, 3).transpose(1,0,2).reshape(M,3)
         except Exception:
             return arrM3
@@ -284,7 +281,7 @@ def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width:
     dcf *= (dcf.size / (dcf.sum() + 1e-8))
     return dcf
 
-# ---------- Helpers: axes & delay ----------
+# ---------- Helpers ----------
 def apply_axes(coords: np.ndarray, order: str, flips: tuple[bool,bool,bool]):
     assert coords.shape[1] == 3
     m = {'x':0, 'y':1, 'z':2}
@@ -335,33 +332,31 @@ def psf_aniso_cost(coords: np.ndarray, img_shape_zyx_small: tuple[int,int,int], 
     cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
     return cost, (vz, vy, vx)
 
-def radial_apod_window(nread: int, kind: str, *, 
-                       tukey_alpha=0.3, kaiser_beta=6.0, gauss_sigma=0.18):
-    """Return length-nread 1D window, centered, for radial readout."""
-    r = np.linspace(-1, 1, nread, endpoint=False)  # -1..1
+def radial_apod_window(nread: int, kind: str,
+                       tukey_alpha=0.30, kaiser_beta=6.0, gauss_sigma=0.18):
+    r = np.linspace(-1, 1, nread, endpoint=False)
     if kind == "hann":
-        w = 0.5 * (1 + np.cos(np.pi * r))               # 0 at edges
+        w = 0.5 * (1 + np.cos(np.pi * r))
     elif kind == "tukey":
         a = float(tukey_alpha)
-        at = np.abs(r)
-        w = np.ones_like(r)
-        m = (at > (1-a)) & (a > 0)
-        w[m] = 0.5 * (1 + np.cos(np.pi/a * (at[m] - (1-a))))
-        w[at >= 1] = 0.0
+        at = np.abs(r); w = np.ones_like(r)
+        if a <= 0: pass
+        elif a >= 1: w = 0.5 * (1 + np.cos(np.pi * r))
+        else:
+            m = (at > (1-a)) & (a > 0)
+            w[m] = 0.5 * (1 + np.cos(np.pi/a * (at[m] - (1-a))))
+            w[at >= 1] = 0.0
     elif kind == "kaiser":
         from numpy import i0
         b = float(kaiser_beta)
         w = i0(b * np.sqrt(1 - r**2)) / i0(b)
     elif kind == "gauss":
-        s = float(gauss_sigma)                           # in Nyquist units
+        s = float(gauss_sigma)
         w = np.exp(-0.5 * (r/s)**2)
-    else:  # "none"
+    else:
         w = np.ones_like(r)
-    # normalize area so overall brightness stays comparable
     return (w / (w.mean() + 1e-12)).astype(np.float32)
 
-
-# ---------- Tripanel ----------
 def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")):
     Z, Y, X = vol.shape
     ax  = vol[Z//2,:,:]
@@ -389,7 +384,7 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
         def _text_w(t): return draw.textlength(t, font=font)
     except Exception:
         font = ImageFont.load_default()
-        def _text_w(t): 
+        def _text_w(t):
             bbox = draw.textbbox((0,0), t, font=font)
             return bbox[2]-bbox[0]
     x = margin; y_img = margin + label_h
@@ -403,88 +398,79 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
         x += w + gap
     return canvas
 
-# ---------- Recon ----------
 def recon_adj_sos(kdata: np.ndarray, img_shape_zyx: tuple[int,int,int],
                   coords: np.ndarray, dcf_mode: str = "pipe",
                   os_fac: float = 1.75, width: int = 4,
-                  gpu: int = -1):
+                  gpu: int = -1, extra_w_flat: np.ndarray | None = None):
     nread, nspokes, ncoils = kdata.shape
-    w_read = radial_apod_window(nread, apod_kind, 
-                            tukey_alpha=tukey_alpha, 
-                            kaiser_beta=kaiser_beta, 
-                            gauss_sigma=gauss_sigma)
-    w_flat = np.repeat(w_read[:, None], nspokes, axis=1).reshape(-1)
-
     assert coords.shape == (nread * nspokes, 3)
+    if extra_w_flat is not None:
+        assert extra_w_flat.shape[0] == nread * nspokes
+
     if gpu < 0 or cp is None:
         dcf = compute_dcf(coords, mode=dcf_mode, os=os_fac, width=width)
         coils = []
         for c in range(ncoils):
             y = kdata[:, :, c].reshape(-1)
-            if dcf is not None:
-                y = y * dcf
-            y = y * w_flat
+            if dcf is not None: y = y * dcf
+            if extra_w_flat is not None: y = y * extra_w_flat
             x = sp.nufft_adjoint(y, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
             coils.append(x)
         coils = np.stack(coils, axis=0)
         return np.sqrt((np.abs(coils) ** 2).sum(axis=0))
+
     with sp.Device(gpu):
         coords_g = cp.asarray(coords, dtype=cp.float32)
         dcf = compute_dcf(coords, mode=dcf_mode, os=os_fac, width=width)
         dcf_g = cp.asarray(dcf, dtype=cp.float32) if dcf is not None else None
+        w_g   = cp.asarray(extra_w_flat, dtype=cp.float32) if extra_w_flat is not None else None
         coils_g = []
         for c in range(ncoils):
             y_g = cp.asarray(kdata[:, :, c].reshape(-1))
-            if dcf_g is not None:
-                y_g = y_g * dcf_g
+            if dcf_g is not None: y_g = y_g * dcf_g
+            if w_g is not None:   y_g = y_g * w_g
             x_g = sp.nufft_adjoint(y_g, coords_g, oshape=img_shape_zyx, oversamp=os_fac, width=width)
             coils_g.append(x_g)
         coils_g = cp.stack(coils_g, axis=0)
         sos_g = cp.sqrt((cp.abs(coils_g) ** 2).sum(axis=0))
         return cp.asnumpy(sos_g)
 
-# ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v4.3")
-    ap.add_argument("--series", required=True, help="Path with acqp/method/visu_pars/fid[/traj]")
-    ap.add_argument("--out", required=True, help="Output NIfTI filename")
+    ap = argparse.ArgumentParser(description="Bruker 3D radial recon — v4.4")
+    ap.add_argument("--series", required=True)
+    ap.add_argument("--out", required=True)
     ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX","NY","NZ"), required=True)
-    ap.add_argument("--spoke-step", dest="spoke_step", type=int, default=1, help="Take every Nth spoke for speed")
-    ap.add_argument("--dcf", choices=["none","pipe"], default="pipe", help="Density compensation (pipe=Pipe–Menon)")
-    ap.add_argument("--os", dest="os_fac", type=float, default=1.75, help="NUFFT oversampling (default 1.75)")
-    ap.add_argument("--width", type=int, default=4, help="NUFFT kernel width (default 4)")
-    ap.add_argument("--png", action="store_true", help="Write a single tripanel PNG")
-    ap.add_argument("--psf", action="store_true", help="Also save PSF tripanel")
-    ap.add_argument("--gpu", type=int, default=-1, help="GPU id to use (e.g., 0). -1 = CPU")
-    ap.add_argument("--fov-scale", type=float, default=1.0, help="Scale the effective FOV (e.g., 0.85 to crop by 15%)")
-    ap.add_argument("--traj-order", choices=["sample","spoke"], default="sample",
-                    help="If 'traj' is per-sample Mx3, specify its layout. 'spoke' = spoke-major on disk.")
-    ap.add_argument("--alt-rev", action="store_true", help="Reverse every other spoke's readout (odd spokes)")
-    ap.add_argument("--rev-all", action="store_true", help="Reverse all spokes' readouts")
-    ap.add_argument("--auto-pi", action="store_true", help="Uniformly scale coords so |k|_p99 = π")
-    ap.add_argument("--center-out", action="store_true", help="Use center→edge radii for fallback GA traj")
-    ap.add_argument("--axes", default="xyz", help="Permutation of k-axes: one of xyz,xzy,yxz,yzx,zxy,zyx")
-    ap.add_argument("--flip-x", action="store_true", help="Flip sign of kx")
-    ap.add_argument("--flip-y", action="store_true", help="Flip sign of ky")
-    ap.add_argument("--flip-z", action="store_true", help="Flip sign of kz")
-    ap.add_argument("--rd-shift", type=float, default=0.0, help="Read-direction shift (in samples)")
-    ap.add_argument("--auto-delay", action="store_true", help="Grid-search rd-shift to minimize PSF anisotropy")
-    ap.add_argument("--auto-delay-range", nargs=2, type=float, metavar=("MIN","MAX"), default=(-0.6, 0.6),
-                    help="Range (samples) for auto-delay search (default ±0.6)")
-    ap.add_argument("--auto-delay-steps", type=int, default=25, help="Number of steps for auto-delay (default 25)")
-    ap.add_argument("--scale-x", type=float, default=1.0, help="Per-axis k-scale for x")
-    ap.add_argument("--scale-y", type=float, default=1.0, help="Per-axis k-scale for y")
-    ap.add_argument("--scale-z", type=float, default=1.0, help="Per-axis k-scale for z")
-    ap.add_argument("--auto-scale", action="store_true", help="Fit per-axis scales to minimize PSF anisotropy")
-    ap.add_argument("--auto-scale-range", nargs=2, type=float, metavar=("MIN","MAX"), default=(0.7, 1.3),
-                    help="Range for per-axis scale search (default 0.7..1.3)")
-    ap.add_argument("--auto-scale-steps", type=int, default=5, help="Grid steps per axis (default 5)")
-    ap.add_argument("--apod", choices=["none","hann","tukey","kaiser","gauss"], default="tukey",
-                help="Radial apodization window (default: tukey)")
-    ap.add_argument("--tukey-alpha", type=float, default=0.30, help="Tukey alpha (0..1)")
-    ap.add_argument("--kaiser-beta", type=float, default=6.0, help="Kaiser beta") 
-    ap.add_argument("--gauss-sigma", type=float, default=0.18, help="Gaussian sigma in Nyquist units")
-
+    ap.add_argument("--spoke-step", dest="spoke_step", type=int, default=1)
+    ap.add_argument("--dcf", choices=["none","pipe"], default="pipe")
+    ap.add_argument("--os", dest="os_fac", type=float, default=1.75)
+    ap.add_argument("--width", type=int, default=4)
+    ap.add_argument("--png", action="store_true")
+    ap.add_argument("--psf", action="store_true")
+    ap.add_argument("--gpu", type=int, default=-1)
+    ap.add_argument("--fov-scale", type=float, default=1.0)
+    ap.add_argument("--traj-order", choices=["sample","spoke"], default="sample")
+    ap.add_argument("--alt-rev", action="store_true")
+    ap.add_argument("--rev-all", action="store_true")
+    ap.add_argument("--auto-pi", action="store_true")
+    ap.add_argument("--center-out", action="store_true")
+    ap.add_argument("--axes", default="xyz")
+    ap.add_argument("--flip-x", action="store_true")
+    ap.add_argument("--flip-y", action="store_true")
+    ap.add_argument("--flip-z", action="store_true")
+    ap.add_argument("--rd-shift", type=float, default=0.0)
+    ap.add_argument("--auto-delay", action="store_true")
+    ap.add_argument("--auto-delay-range", nargs=2, type=float, metavar=("MIN","MAX"), default=(-0.6, 0.6))
+    ap.add_argument("--auto-delay-steps", type=int, default=25)
+    ap.add_argument("--scale-x", type=float, default=1.0)
+    ap.add_argument("--scale-y", type=float, default=1.0)
+    ap.add_argument("--scale-z", type=float, default=1.0)
+    ap.add_argument("--auto-scale", action="store_true")
+    ap.add_argument("--auto-scale-range", nargs=2, type=float, metavar=("MIN","MAX"), default=(0.7, 1.3))
+    ap.add_argument("--auto-scale-steps", type=int, default=5)
+    ap.add_argument("--apod", choices=["none","hann","tukey","kaiser","gauss"], default="none")
+    ap.add_argument("--tukey-alpha", type=float, default=0.30)
+    ap.add_argument("--kaiser-beta", type=float, default=6.0)
+    ap.add_argument("--gauss-sigma", type=float, default=0.18)
     args = ap.parse_args()
 
     # Device
@@ -508,7 +494,7 @@ def main():
             print("[warn] --gpu set but CuPy/CUDA not available — falling back to CPU.")
         print("Using CPU.")
 
-    # Load series
+    # Load data
     kdata, meta, hdr = load_bruker_series(args.series)
     nread, nspokes = meta["nread"], meta["nspokes"]
     vox = meta.get("vox", np.array([1,1,1], float))
@@ -517,17 +503,15 @@ def main():
     if fovmm is not None:
         print(f"Header FOV (mm): {fovmm}")
 
-    # Shapes
     NX, NY, NZ = [int(x) for x in args.matrix]
     img_shape_xyz = (NX, NY, NZ)
     img_shape_zyx = (NZ, NY, NX)
 
-    # Coords
     coords = load_series_traj(args.series, nread, nspokes, img_shape_xyz, fovmm, vox, args.traj_order)
     if coords is None:
         coords = make_ga_traj_3d(nspokes, nread, center_out=args.center_out)
 
-    # Readout direction fixes
+    # Readout flips
     if args.rev_all:
         kdata = kdata[::-1, :, :]
         print("[readout] Reversed all spokes.")
@@ -535,7 +519,6 @@ def main():
         kdata[:, 1::2, :] = kdata[::-1, 1::2, :]
         print("[readout] Reversed every other (odd) spoke.")
 
-    # Spoke decimation
     if args.spoke_step > 1:
         take = slice(0, nspokes, max(1, args.spoke_step))
         kdata   = kdata[:, take, :]
@@ -543,32 +526,27 @@ def main():
         nspokes = kdata.shape[1]
         print(f"Decimated spokes by {args.spoke_step}: nspokes={nspokes}")
 
-    # FOV crop
     if args.fov_scale != 1.0:
-        if args.fov_scale <= 0:
-            print("[warn] --fov-scale must be >0. Ignoring.")
-        else:
+        if args.fov_scale > 0:
             coords = coords / float(args.fov_scale)
             print(f"[fov] Applying effective FOV scale = {args.fov_scale:.3f} (smaller = more crop)")
+        else:
+            print("[warn] --fov-scale must be >0. Ignoring.")
 
-    # Axes & flips
     coords = apply_axes(coords, args.axes, (args.flip_x, args.flip_y, args.flip_z))
     if args.axes != "xyz" or args.flip_x or args.flip_y or args.flip_z:
         print(f"[axes] order={args.axes} flips=({args.flip_x},{args.flip_y},{args.flip_z})")
 
-    # Auto-π scaling
     p99 = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
     if args.auto_pi and p99 > 0:
         s = float(np.pi / p99)
         coords = coords * s
         print(f"[auto-pi] Scaled coords by {s:.4f} so |k|_p99 ≈ π.")
 
-    # Delay correction
     if abs(args.rd_shift) > 1e-9:
         coords = apply_read_shift(coords, nread, nspokes, args.rd_shift)
         print(f"[delay] Applied read shift of {args.rd_shift:.3f} samples.")
 
-    # Auto delay grid search
     if args.auto_delay:
         img_shape_zyx_small = tuple(max(64, s//2) for s in img_shape_zyx)
         lo, hi = args.auto_delay_range
@@ -582,13 +560,11 @@ def main():
         coords = apply_read_shift(coords, nread, nspokes, best_s)
         print(f"[auto-delay] Best read shift ≈ {best_s:.3f} samples (cost={best_cost:.4f}).  PSF vars(Z,Y,X)≈{best_v}")
 
-    # Per-axis scaling (manual)
     if any(abs(s-1.0) > 1e-9 for s in (args.scale_x, args.scale_y, args.scale_z)):
         scales = np.array([args.scale_x, args.scale_y, args.scale_z], float)
         coords = coords * scales[None, :]
         print(f"[scale] Applied manual per-axis scales (x,y,z) = {tuple(scales)}")
 
-    # Auto per-axis scaling
     if args.auto_scale:
         img_shape_zyx_small = tuple(max(64, s//2) for s in img_shape_zyx)
         lo, hi = args.auto_scale_range
@@ -602,8 +578,7 @@ def main():
                 cost, _ = psf_aniso_cost(c, img_shape_zyx_small, os_fac=args.os_fac, width=args.width)
                 if cost < best[0]:
                     best = (cost, val)
-            scales[axis] = best[1]
-            return scales, best[0]
+            scales[axis] = best[1]; return scales, best[0]
         scales = np.array([1.0, 1.0, 1.0], float)
         for _ in range(2):
             for ax in (0,1,2):
@@ -614,27 +589,36 @@ def main():
         print(f"[auto-scale] Best per-axis scales (x,y,z) ≈ ({scales[0]:.3f}, {scales[1]:.3f}, {scales[2]:.3f})")
         print(f"            Re-run tip: --scale-x {scales[0]:.3f} --scale-y {scales[1]:.3f} --scale-z {scales[2]:.3f}")
 
-    # |k| stats
     norm = np.linalg.norm(coords, axis=1)
     p = np.percentile(norm, [0, 50, 95, 99, 100])
     print(f"|k| percentiles (radians): {p} (expect max ≈ π={np.pi:.3f})")
 
-    # Recon
-    img = recon_adj_sos(kdata, img_shape_zyx, coords, dcf_mode=args.dcf, os_fac=args.os_fac, width=args.width, gpu=args.gpu)
+    # Apod weights
+    w_flat = None
+    if args.apod != "none":
+        w_read = radial_apod_window(nread, args.apod,
+                                    tukey_alpha=args.tukey_alpha,
+                                    kaiser_beta=args.kaiser_beta,
+                                    gauss_sigma=args.gauss_sigma)
+        w_flat = np.repeat(w_read[:, None], nspokes, axis=1).reshape(-1)
+        print(f"[apod] kind={args.apod} params: tukey_alpha={args.tukey_alpha} "
+              f"kaiser_beta={args.kaiser_beta} gauss_sigma={args.gauss_sigma} "
+              f"(mean={float(w_flat.mean()):.3f})")
 
-    # Save NIfTI
+    img = recon_adj_sos(kdata, img_shape_zyx, coords,
+                        dcf_mode=args.dcf, os_fac=args.os_fac, width=args.width,
+                        gpu=args.gpu, extra_w_flat=w_flat)
+
     affine = np.diag([vox[0], vox[1], vox[2], 1.0])
     nib.save(nib.Nifti1Image(np.asarray(img, np.float32), affine), args.out)
     print(f"Wrote {args.out}")
 
-    # Tripanel
     if args.png:
         trip = _tripanel_from_volume(img, labels=("Axial","Coronal","Sagittal"))
         trip_path = str(Path(args.out).with_suffix("")) + "_tripanel.png"
         trip.save(trip_path)
         print(f"Saved tripanel PNG → {trip_path}")
 
-    # PSF
     if args.psf:
         psf_mag = psf_volume(coords, img_shape_zyx, os_fac=args.os_fac, width=args.width)
         vz, vy, vx = anisotropy_metrics(psf_mag)
@@ -643,7 +627,8 @@ def main():
         trip_psf.save(psf_path)
         print(f"Saved PSF PNG → {psf_path}")
         vmean = (vx+vy+vz)/3.0
-        print(f"[psf] second-moment variances (Z,Y,X) = ({vz:.4f}, {vy:.4f}, {vx:.4f}); anisotropy ratios vs mean = ({vz/vmean:.3f}, {vy/vmean:.3f}, {vx/vmean:.3f})")
+        print(f"[psf] second-moment variances (Z,Y,X) = ({vz:.4f}, {vy:.4f}, {vx:.4f}); "
+              f"anisotropy ratios vs mean = ({vz/vmean:.3f}, {vy/vmean:.3f}, {vx/vmean:.3f})")
 
 if __name__ == "__main__":
     main()
