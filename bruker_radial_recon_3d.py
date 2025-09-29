@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# Bruker 3D radial recon — UPDATED v4
+# Bruker 3D radial recon — UPDATED v4 (clean)
 # Adds: --traj-order {sample,spoke}, --alt-rev, --rev-all, --auto-pi
-# Keeps: FOV scaling, PSF metrics, single tripanel
+# Also: single tripanel PNG + PSF PNG with anisotropy metrics
 # Deps: pip install sigpy nibabel numpy pillow
 
 from __future__ import annotations
-import argparse, os, re, sys
+import argparse, os, re
 from pathlib import Path
 import numpy as np
 import nibabel as nib
@@ -35,7 +35,7 @@ def _parse_jcamp(path: Path) -> dict:
                 d[key] += " " + s
     return d
 
-_num_re = re.compile(r"[-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?")
+_num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 def _nums(s: str) -> list[float]:
     if not s: return []
     out = []
@@ -125,7 +125,7 @@ def load_bruker_series(series_dir: str):
     if nread is None:
         raise RuntimeError("Failed to infer nread.")
 
-    # Optional full read reversal knob
+    # Optional full read reversal knob (env)
     if os.environ.get("RADIAL_FLIP_READ","0") == "1":
         data = data.reshape(-1, nread)[:, ::-1].reshape(-1)
 
@@ -210,7 +210,7 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     def maybe_reorder(arrM3: np.ndarray) -> np.ndarray:
         if traj_order == "sample":
             return arrM3  # already sample-major
-        # traj_order == "spoke": convert spoke-major (spoke contiguous) -> sample-major
+        # traj_order == "spoke": convert spoke-major -> sample-major
         try:
             return arrM3.reshape(nspokes, nread, 3).transpose(1,0,2).reshape(M,3)
         except Exception:
@@ -276,8 +276,7 @@ def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width:
     dcf *= (dcf.size / (dcf.sum() + 1e-8))
     return dcf
 
-# ---------- Tripanel ----------
-
+# ---------- Tripanel (fixed) ----------
 def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")) -> Image.Image:
     Z, Y, X = vol.shape
     ax  = vol[Z//2,:,:]
@@ -289,7 +288,7 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
         a = np.clip((a - vmin) / (vmax - vmin + 1e-12), 0, 1)
         return (a * 255).astype(np.uint8)
 
-    imgs = [Image.fromarray(to_u8(x)) for x in (ax, cor, sag)]  # no deprecated 'mode' arg
+    imgs = [Image.fromarray(to_u8(x)) for x in (ax, cor, sag)]
     target_h = max(im.size[1] for im in imgs)
     rs = []
     for im in imgs:
@@ -314,7 +313,7 @@ def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")
         draw.text((tx+1, ty+1), lab, fill=0, font=font)
         draw.text((tx,   ty),   lab, fill=240, font=font)
         canvas.paste(im, (x, y_img))
-        x += w + gap  # <— the missing increment that caused all three to overlap
+        x += w + gap
     return canvas
 
 # ---------- Recon ----------
@@ -389,7 +388,7 @@ def main():
                     help="If 'traj' is per-sample Mx3, specify its layout. 'spoke' = spoke-major on disk.")
     ap.add_argument("--alt-rev", action="store_true", help="Reverse every other spoke's readout (odd spokes)")
     ap.add_argument("--rev-all", action="store_true", help="Reverse all spokes' readouts")
-    ap.add_argument("--auto-pi", action="store_true", help="Uniformly scale coords so |k|_p99 = π (guards against over/under-scaling)")
+    ap.add_argument("--auto-pi", action="store_true", help="Uniformly scale coords so |k|_p99 = π")
     args = ap.parse_args()
 
     # Device
