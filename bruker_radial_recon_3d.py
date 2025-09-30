@@ -501,12 +501,12 @@ def main():
 
 
 	# Optional clip (broadcast-safe)
-	if args.clip_pi:
-		r = np.linalg.norm(coords, axis=1, keepdims=True)       # (M,1)
-		s = np.minimum(1.0, np.pi / (r + 1e-12))                # (M,1) scale ≤ 1
-		nclip = int((r > np.pi).sum())
-		coords *= s                                             # (M,3) ← (M,1) broadcast
-		print(f"[pre] Clipped |k| to ≤ π for {nclip}/{coords.shape[0]} samples.")
+    if args.clip_pi:
+    	r = np.linalg.norm(coords, axis=1, keepdims=True)       # (M,1)
+    	s = np.minimum(1.0, np.pi / (r + 1e-12))                # (M,1) scale ≤ 1
+    	nclip = int((r > np.pi).sum())
+    	coords *= s                                             # (M,3) ← (M,1) broadcast
+    	print(f"[pre] Clipped |k| to ≤ π for {nclip}/{coords.shape[0]} samples.")
 
 
     # ----- PROD mode: fast tuner then final -----
