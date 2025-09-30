@@ -304,12 +304,26 @@ def apply_read_shift(coords: np.ndarray, nread: int, nspokes: int, shift_samples
     dirs = dirs / norm
     uvw = uvw + delta * dirs[None, :, :]
     return uvw.reshape(-1, 3)
-
+'''
 def psf_volume(coords: np.ndarray, img_shape_zyx: tuple[int,int,int], os_fac: float = 1.75, width: int = 4):
     ones = np.ones(coords.shape[0], np.complex64)
     psf = sp.nufft_adjoint(ones, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
     psf_mag = np.abs(psf); psf_mag /= (psf_mag.max() + 1e-12)
     return psf_mag
+'''
+def psf_volume(coords, img_shape_zyx, os_fac=1.75, width=4, gpu=-1):
+    if gpu >= 0 and cp is not None:
+        with sp.Device(gpu):
+            ones = cp.ones(coords.shape[0], dtype=cp.complex64)
+            coords_g = cp.asarray(coords, dtype=cp.float32)
+            psf = sp.nufft_adjoint(ones, coords_g, oshape=img_shape_zyx,
+                                   oversamp=os_fac, width=width)
+            psf = cp.abs(psf); psf /= psf.max() + 1e-12
+            return cp.asnumpy(psf)
+    ones = np.ones(coords.shape[0], np.complex64)
+    psf = sp.nufft_adjoint(ones, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
+    psf = np.abs(psf); psf /= psf.max() + 1e-12
+    return psf
 
 def anisotropy_metrics(vol: np.ndarray):
     Z, Y, X = vol.shape
@@ -326,7 +340,7 @@ def anisotropy_metrics(vol: np.ndarray):
     return vz, vy, vx
 
 def psf_aniso_cost(coords: np.ndarray, img_shape_zyx_small: tuple[int,int,int], os_fac: float, width: int):
-    psf = psf_volume(coords, img_shape_zyx_small, os_fac=os_fac, width=width)
+    psf = psf_volume(coords, img_shape_zyx_small, os_fac=os_fac, width=width, gpu=args.gpu)
     vz, vy, vx = anisotropy_metrics(psf)
     vmean = (vx+vy+vz)/3.0
     cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
@@ -620,7 +634,7 @@ def main():
         print(f"Saved tripanel PNG → {trip_path}")
 
     if args.psf:
-        psf_mag = psf_volume(coords, img_shape_zyx, os_fac=args.os_fac, width=args.width)
+        psf_mag = psf_volume(coords, img_shape_zyx, os_fac=args.os_fac, width=args.width, gpu=args.gpu)
         vz, vy, vx = anisotropy_metrics(psf_mag)
         trip_psf = _tripanel_from_volume(psf_mag, labels=("PSF Axial","PSF Coronal","PSF Sagittal"))
         psf_path = str(Path(args.out).with_suffix("")) + "_psf.png"
