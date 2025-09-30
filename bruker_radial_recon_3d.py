@@ -500,13 +500,13 @@ def main():
         print(f"[auto-pi] Scaled coords by {s:.4f} so |k|_p99 ≈ π.")
 
 
-    # Optional clip (broadcast-safe)
-    if args.clip_pi:
-        r = np.linalg.norm(coords, axis=1, keepdims=True)       # (M,1)
-        s = np.minimum(1.0, np.pi / (r + 1e-12))                # (M,1) scale ≤ 1
-        nclip = int((r > np.pi).sum())
-        coords *= s                                             # (M,3) ← (M,1) broadcast
-        print(f"[pre] Clipped |k| to ≤ π for {nclip}/{coords.shape[0]} samples.")
+	# Optional clip (broadcast-safe)
+	if args.clip_pi:
+		r = np.linalg.norm(coords, axis=1, keepdims=True)       # (M,1)
+		s = np.minimum(1.0, np.pi / (r + 1e-12))                # (M,1) scale ≤ 1
+		nclip = int((r > np.pi).sum())
+		coords *= s                                             # (M,3) ← (M,1) broadcast
+		print(f"[pre] Clipped |k| to ≤ π for {nclip}/{coords.shape[0]} samples.")
 
 
     # ----- PROD mode: fast tuner then final -----
@@ -537,7 +537,7 @@ def main():
                     cost,_ = psf_aniso_cost(c, small, os_fac=1.6, width=4, gpu=gpu_psf)
                     if cost < best_cost: best_cost, best_v = cost, v
                 scales[ax] = best_v
-        coords = coords * scales[None,:]
+        
         print(f"[prod] auto-scale ≈ (x,y,z)=({scales[0]:.3f},{scales[1]:.3f},{scales[2]:.3f})")
 
         # Final recon uses full settings; also export a JSON sidecar
@@ -552,6 +552,14 @@ def main():
         s = np.array([args.scale_x,args.scale_y,args.scale_z], float)
         coords = coords * s[None,:]
         print(f"[scale] Applied per-axis scales (x,y,z) = {tuple(s)}")
+    
+    # Final re-normalization so p99(|k|) ≈ π after all edits
+    p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
+    if args.auto_pi and p99_final > 0:
+        s = float(np.pi / p99_final)
+        coords *= s
+        print(f"[auto-pi-2] Re-normalized after scale/delay: factor {s:.4f}")
+
 
     # Diagnostics
     norm = np.linalg.norm(coords, axis=1)
