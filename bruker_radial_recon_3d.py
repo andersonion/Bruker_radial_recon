@@ -499,6 +499,7 @@ def main():
         coords = coords * s
         print(f"[auto-pi] Scaled coords by {s:.4f} so |k|_p99 ≈ π.")
 
+
     # Optional clip
     if args.clip_pi:
         r = np.linalg.norm(coords, axis=1, keepdims=True)
