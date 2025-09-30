@@ -339,8 +339,8 @@ def anisotropy_metrics(vol: np.ndarray):
     vz = second_moment(sub, 0); vy = second_moment(sub, 1); vx = second_moment(sub, 2)
     return vz, vy, vx
 
-def psf_aniso_cost(coords: np.ndarray, img_shape_zyx_small: tuple[int,int,int], os_fac: float, width: int):
-    psf = psf_volume(coords, img_shape_zyx_small, os_fac=os_fac, width=width, gpu=args.gpu)
+def psf_aniso_cost(coords: np.ndarray, img_shape_zyx_small: tuple[int,int,int], os_fac: float, width: int, gpu=-1):
+    psf = psf_volume(coords, img_shape_zyx_small, os_fac=os_fac, width=width, gpu=gpu)
     vz, vy, vx = anisotropy_metrics(psf)
     vmean = (vx+vy+vz)/3.0
     cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
@@ -589,7 +589,7 @@ def main():
             for val in candidates:
                 test = scales.copy(); test[axis] = val
                 c = coords * test[None, :]
-                cost, _ = psf_aniso_cost(c, img_shape_zyx_small, os_fac=args.os_fac, width=args.width)
+                cost, _ = psf_aniso_cost(c, img_shape_zyx_small, os_fac=args.os_fac, width=args.width, gpu=args.gpu)
                 if cost < best[0]:
                     best = (cost, val)
             scales[axis] = best[1]; return scales, best[0]
