@@ -238,6 +238,16 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     print("[warn] Could not parse 'traj'; using golden-angle fallback.")
     return None
 
+
+def equalize_k_sphere(coords: np.ndarray) -> np.ndarray:
+    # Make the sampling sphere isotropic: match per-axis RMS
+    std = coords.std(axis=0)                 # [σx, σy, σz]
+    std[std == 0] = 1.0
+    gain = std.mean() / std                  # scale so σx=σy=σz
+    print(f"[eq-sphere] gains (x,y,z) = ({gain[0]:.3f},{gain[1]:.3f},{gain[2]:.3f})")
+    return coords * gain[None, :]
+
+
 # ---------------- NUFFT helpers ----------------
 def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width: int = 4):
     if mode == "none":
@@ -552,6 +562,8 @@ def main():
         s = np.array([args.scale_x,args.scale_y,args.scale_z], float)
         coords = coords * s[None,:]
         print(f"[scale] Applied per-axis scales (x,y,z) = {tuple(s)}")
+    
+    coords = equalize_k_sphere(coords)
     
     # Final re-normalization so p99(|k|) ≈ π after all edits
     p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
