@@ -332,35 +332,84 @@ def radial_apod_window(nread: int, kind: str, tukey_alpha=0.30, kaiser_beta=6.0,
         w = np.ones_like(r)
     return (w / (w.mean() + 1e-12)).astype(np.float32)
 
-def recon_adj_sos(kdata: np.ndarray, img_shape_zyx, coords, dcf_mode="pipe",
-                  os_fac=1.75, width=4, gpu=-1, extra_w_flat=None):
+def recon_adj_percoil(kdata, img_shape, coords, dcf_mode="pipe", gpu=-1):
+    """Adjoint NUFFT per coil. Returns (ncoils, Z, Y, X) complex64."""
     nread, nspokes, ncoils = kdata.shape
+    assert coords.shape == (nread * nspokes, 3)
+    coils = []
     if gpu < 0 or cp is None:
-        dcf = compute_dcf(coords, mode=dcf_mode, os=os_fac, width=width)
-        coils = []
+        dcf = compute_dcf(coords, mode=dcf_mode)
         for c in range(ncoils):
             y = kdata[:, :, c].reshape(-1)
-            if dcf is not None: y *= dcf
-            if extra_w_flat is not None: y *= extra_w_flat
-            x = sp.nufft_adjoint(y, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
-            coils.append(x)
-        coils = np.stack(coils, axis=0)
-        return np.sqrt((np.abs(coils) ** 2).sum(axis=0))
-    with sp.Device(gpu):
-        coords_g = cp.asarray(coords, dtype=cp.float32)
-        dcf = compute_dcf(coords, mode=dcf_mode, os=os_fac, width=width)
-        dcf_g = cp.asarray(dcf, dtype=cp.float32) if dcf is not None else None
-        w_g = cp.asarray(extra_w_flat, dtype=cp.float32) if extra_w_flat is not None else None
-        coils_g = []
-        for c in range(ncoils):
-            y_g = cp.asarray(kdata[:, :, c].reshape(-1))
-            if dcf_g is not None: y_g *= dcf_g
-            if w_g   is not None: y_g *= w_g
-            x_g = sp.nufft_adjoint(y_g, coords_g, oshape=img_shape_zyx, oversamp=os_fac, width=width)
-            coils_g.append(x_g)
-        coils_g = cp.stack(coils_g, axis=0)
-        sos_g = cp.sqrt((cp.abs(coils_g) ** 2).sum(axis=0))
-        return cp.asnumpy(sos_g)
+            if dcf is not None:
+                y = y * dcf
+            x = sp.nufft_adjoint(y, coords, oshape=img_shape)
+            coils.append(x.astype(np.complex64, copy=False))
+        return np.stack(coils, axis=0)
+    else:
+        with sp.Device(gpu):
+            coords_g = cp.asarray(coords, dtype=cp.float32)
+            dcf = compute_dcf(coords, mode=dcf_mode)
+            dcf_g = cp.asarray(dcf, dtype=cp.float32) if dcf is not None else None
+            coils_g = []
+            for c in range(ncoils):
+                y_g = cp.asarray(kdata[:, :, c].reshape(-1))
+                if dcf_g is not None:
+                    y_g = y_g * dcf_g
+                x_g = sp.nufft_adjoint(y_g, coords_g, oshape=img_shape)
+                coils_g.append(x_g)
+            coils_g = cp.stack(coils_g, axis=0)
+            return cp.asnumpy(coils_g).astype(np.complex64, copy=False)
+
+def combine_coils(coil_imgs, method="sos", lp_frac=0.12, bias_correct=False):
+    if method == "sos":
+        mag = np.sqrt((np.abs(coil_imgs) ** 2).sum(axis=0))
+        out = mag
+    else:
+        S = estimate_sens_maps(coil_imgs, frac=lp_frac)
+        img_c = adaptive_combine(coil_imgs, S)          # complex
+        out = np.abs(img_c)
+    if bias_correct:
+        bias = np.abs(fft_lowpass3d(out.astype(np.complex64), frac=0.05))
+        bias = bias / (bias.mean() + 1e-8)
+        out = out / (bias + 1e-8)
+    return out.astype(np.float32, copy=False)
+
+def fft_lowpass3d(img, frac=0.12):
+    """Low-pass a 3D complex image by masking in k-space (spherical)."""
+    z, y, x = img.shape
+    kz = np.fft.fftfreq(z); ky = np.fft.fftfreq(y); kx = np.fft.fftfreq(x)
+    KZ, KY, KX = np.meshgrid(kz, ky, kx, indexing="ij")
+    kr = np.sqrt(KZ**2 + KY**2 + KX**2)
+    mask = (kr <= frac).astype(np.float32)
+    F = np.fft.fftn(img)
+    return np.fft.ifftn(F * mask)
+
+def estimate_sens_maps(coil_imgs, frac=0.12, eps=1e-8):
+    """
+    coil_imgs: (ncoils, Z, Y, X) complex, adjoint NUFFT per coil.
+    Returns sens maps (ncoils, Z, Y, X) with sum |S|^2 ≈ 1.
+    """
+    ncoils = coil_imgs.shape[0]
+    # Low-pass each coil image to get smooth sensitivities
+    S = np.empty_like(coil_imgs, dtype=np.complex64)
+    for c in range(ncoils):
+        S[c] = fft_lowpass3d(coil_imgs[c], frac=frac)
+    denom = np.sqrt((np.abs(S) ** 2).sum(axis=0)) + eps  # SoS magnitude
+    S /= denom  # normalize so SoS of maps ≈ 1
+    return S
+
+def adaptive_combine(coil_imgs, sens_maps, eps=1e-8):
+    """
+    Complex-optimal (Walsh) combine: sum conj(S)*I / sum |S|^2.
+    coil_imgs: (ncoils, Z, Y, X) complex
+    sens_maps: (ncoils, Z, Y, X) complex
+    """
+    num = (np.conj(sens_maps) * coil_imgs).sum(axis=0)
+    den = (np.abs(sens_maps) ** 2).sum(axis=0) + eps
+    return num / den  # complex image
+
+
 
 # ---------------- PNG helpers ----------------
 def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")):
@@ -437,6 +486,13 @@ def main():
     ap.add_argument("--demean-spoke", action="store_true")
     ap.add_argument("--clip-pi", action="store_true")
     ap.add_argument("--prod", action="store_true", help="coarse 64³ auto-cal, then final recon")
+    ap.add_argument("--combine", choices=["sos", "adaptive"], default="sos",
+                help="Coil combination: 'sos' or WALSH-style 'adaptive' (recommended).")
+    ap.add_argument("--lp-frac", type=float, default=0.12,
+                help="Low-pass fraction of Nyquist for sens-map estimate (0.08–0.18 typical).")
+    ap.add_argument("--bias-correct", action="store_true",
+                help="Divide final magnitude by a very low-pass bias field (flatten shading).")
+
     args = ap.parse_args()
 
     # Device banner
