@@ -619,32 +619,23 @@ def main():
         coords = coords * s[None,:]
         print(f"[scale] Applied per-axis scales (x,y,z) = {tuple(s)}")
     
-    coords = equalize_k_sphere(coords)
-    
-    # Final re-normalization so p99(|k|) ≈ π after all edits
-    p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
+    # 2) OPTIONAL: sphere equalize (then π renorm) — AFTER delay/scale, BEFORE recon
+    coords = equalize_k_sphere(coords)   # makes k-space sampling isotropic
+
+    p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)    
     if args.auto_pi and p99_final > 0:
-        s = float(np.pi / p99_final)
-        coords *= s
-        print(f"[auto-pi-2] Re-normalized after scale/delay: factor {s:.4f}")
+         s = float(np.pi / p99_final)
+         coords *= s
+         print(f"[auto-pi-2] Re-normalized after scale/delay: factor {s:.4f}")
 
+    # 3) NUFFT adjoint per-coil
+    coil_imgs = recon_adj_percoil(kdata, tuple(args.matrix), coords,
+                              dcf_mode=args.dcf, gpu=args.gpu)
 
-    # Diagnostics
-    norm = np.linalg.norm(coords, axis=1)
-    p = np.percentile(norm, [0,50,95,99,100])
-    print(f"|k| percentiles (radians): {p}  (expect max ≈ π={np.pi:.3f})")
+    # 4) Coil combine
+    img = combine_coils(coil_imgs, method=args.combine, lp_frac=args.lp_frac,
+                    bias_correct=args.bias_correct)
 
-    # Apod weights
-    w_flat = None
-    if args.apod != "none":
-        w_read = radial_apod_window(nread, args.apod, args.tukey_alpha, args.kaiser_beta, args.gauss_sigma)
-        w_flat = np.repeat(w_read[:, None], nspokes, axis=1).reshape(-1)
-        print(f"[apod] {args.apod} (mean={float(w_flat.mean()):.3f})")
-
-    # Recon
-    img = recon_adj_sos(kdata, img_shape_zyx, coords,
-                        dcf_mode=args.dcf, os_fac=args.os_fac, width=args.width,
-                        gpu=args.gpu, extra_w_flat=w_flat)
 
     affine = np.diag([vox[0], vox[1], vox[2], 1.0])
     nib.save(nib.Nifti1Image(np.asarray(img, np.float32), affine), args.out)
