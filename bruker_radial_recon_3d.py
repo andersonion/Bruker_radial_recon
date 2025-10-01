@@ -239,63 +239,42 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     return None
 
 
-def equalize_k_sphere(coords, strength=1.0, pct=95.0, eps=1e-8, max_gain=3.0, verbose=True):
+def equalize_k_sphere(coords, pct=95.0, strength=1.0):
     """
-    Make the per-axis spread of k-space samples more spherical by equalizing
-    the axis-wise percentiles. Works in-place on `coords` and also returns it.
+    Make the k-space cloud more spherical by 'whitening' its covariance.
 
-    Args
-    ----
-    coords : (M,3) array-like
-        NUFFT coordinates in radians (kx, ky, kz).
-    strength : float in [0, 1]
-        0 = no change, 1 = full equalization to the target (geometric mean).
-    pct : float
-        Percentile of |kx|, |ky|, |kz| used to estimate axis extent (default 95).
-    eps : float
-        Small number to avoid divide-by-zero.
-    max_gain : float
-        Clamp the applied gain per axis to [1/max_gain, max_gain] for safety.
-    verbose : bool
-        If True, prints applied gains.
+    - pct:    Ignore the largest |k| outliers above this percentile when
+              estimating the covariance (robustness).
+    - strength in [0, 1]: 0 = no change, 1 = full whitening; values like
+              0.3–0.6 are usually safe for production.
 
-    Returns
-    -------
-    coords : (M,3) ndarray
-        Same array after equalization (scaled in-place).
+    Returns coords' with the same shape/dtype as input.
     """
-    import numpy as np
+    k = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
 
-    c = np.asarray(coords)
-    if c.ndim != 2 or c.shape[1] < 3:
-        raise ValueError(f"coords must be (M,3); got {c.shape}")
+    # Robust subset for statistics
+    r = np.linalg.norm(k, axis=1)
+    cutoff = np.percentile(r, pct)
+    mask = r <= cutoff
+    if mask.sum() < 64:    # guard for very small subsets
+        mask[:] = True
 
-    # Percentile of absolute axis components as a robust extent estimate
-    kx, ky, kz = np.abs(c[:, 0]), np.abs(c[:, 1]), np.abs(c[:, 2])
-    px = float(np.percentile(kx, pct))
-    py = float(np.percentile(ky, pct))
-    pz = float(np.percentile(kz, pct))
+    # Whiten: A = Σ^{-1/2}
+    C = np.cov(k[mask].T)
+    w, V = np.linalg.eigh(C)
+    w = np.maximum(w, 1e-12)                      # numerical safety
+    A = V @ np.diag(1.0 / np.sqrt(w)) @ V.T       # Σ^{-1/2}
 
-    # Target = geometric mean of axis extents
-    target = (px * py * pz) ** (1.0 / 3.0) + eps
+    k_eq = (k @ A.T)
 
-    raw = np.array([target / (px + eps), target / (py + eps), target / (pz + eps)], dtype=float)
-    # Blend toward unity with "strength" (1.0 = full, 0.0 = none)
-    gains = 1.0 + strength * (raw - 1.0)
+    if 0.0 < strength < 1.0:
+        k_out = k + strength * (k_eq - k)
+    elif strength >= 1.0:
+        k_out = k_eq
+    else:
+        k_out = k
 
-    # Safety clamp
-    gains = np.clip(gains, 1.0 / max_gain, max_gain)
-
-    # Apply in-place
-    c[:, 0] *= gains[0]
-    c[:, 1] *= gains[1]
-    c[:, 2] *= gains[2]
-
-    if verbose:
-        print(f"[eq-sphere] gains (x,y,z) = ({gains[0]:.3f},{gains[1]:.3f},{gains[2]:.3f}) "
-              f"(raw={raw[0]:.3f},{raw[1]:.3f},{raw[2]:.3f}), pct={pct}, strength={strength}")
-
-    return coords
+    return k_out.astype(coords.dtype, copy=False).reshape(coords.shape)
 
 # ---------------- NUFFT helpers ----------------
 def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width: int = 4):
@@ -709,25 +688,30 @@ def main():
         coords[:, 2] *= sz
         print(f"[scale] Applied per-axis scales (x,y,z) = ({sx:.3f}, {sy:.3f}, {sz:.3f})")
 
-    # 3) Gentle |k| clip to π (broadcast-safe)
+    # --- Sphere equalize (covariance whitening) then final π re-norm ---
+    if getattr(args, "eq_sphere_strength", 0.0) and args.eq_sphere_strength > 0.0:
+        pct = float(getattr(args, "eq_sphere_pct", 95.0))
+        coords = equalize_k_sphere(coords, pct=pct, strength=float(args.eq_sphere_strength))
+        print(f"[eq-sphere] covariance whitening: pct={pct:.1f}, strength={args.eq_sphere_strength:.2f}")
+
+    # Final auto-π after all transforms (delay/scale/eq-sphere)
+    if args.auto_pi:
+        p99_final = float(np.percentile(np.linalg.norm(coords.reshape(-1, 3), axis=1), 99.0))
+        if p99_final > 0:
+            s = float(np.pi / p99_final)
+            coords *= s
+            print(f"[auto-pi-2] Re-normalized after scale/delay/equalize: factor {s:.4f}")
+
+    # Gentle |k| clip to π at the very end (broadcast-safe)
     if args.clip_pi:
-        r = np.linalg.norm(coords, axis=1)            # (M,)
+        r = np.linalg.norm(coords.reshape(-1, 3), axis=1)
         mask = r > np.pi
         if np.any(mask):
+            coords = coords.reshape(-1, 3)
             coords[mask] *= (np.pi / r[mask])[:, None]
-            print(f"[pre] Clipped |k| to ≤ π for {int(mask.sum())}/{coords.shape[0]} samples.")
+            coords = coords.reshape(-1, 3)
+            print(f"[pre] Clipped |k| to ≤ π for {int(mask.sum())}/{r.size} samples.")
 
-    
-    # 2) OPTIONAL: sphere equalize (then π renorm) — AFTER delay/scale, BEFORE recon
-
-    coords = equalize_k_sphere(coords, strength=float(args.eq_sphere_strength))
-
-    # Final π re-normalization so p99(|k|) ≈ π after all edits
-    p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
-    if args.auto_pi and p99_final > 0:
-        s = float(np.pi / p99_final)
-        coords *= s
-        print(f"[auto-pi-2] Re-normalized after scale/delay: factor {s:.4f}")
 
     # NUFFT adjoint per-coil
     coil_imgs = recon_adj_percoil(
