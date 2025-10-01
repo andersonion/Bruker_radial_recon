@@ -549,6 +549,10 @@ def main():
                 help="Disable per-axis scale search (trust traj units).")
     ap.add_argument("--scale-cap", type=float, default=0.05,
                 help="Max |scale-1| allowed per axis when auto-scaling (default ±5%).")
+    ap.add_argument("--eq-sphere-strength", type=float, default=0.0,
+                    help="Covariance-whitening strength in [0,1]. 0=off; try 0.3–0.6.")
+    ap.add_argument("--eq-sphere-pct", type=float, default=95.0,
+                    help="Percentile cutoff (e.g., 92–96) for robust covariance estimation.")
 
     args = ap.parse_args()
 
