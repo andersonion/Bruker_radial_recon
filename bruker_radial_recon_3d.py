@@ -611,55 +611,90 @@ def main():
         nspokes = kdata.shape[1]
         print(f"Decimated spokes by {args.spoke_step}: nspokes={nspokes}")
 
-    # FOV scale
-    if args.fov_scale != 1.0 and args.fov_scale > 0:
-        coords = coords / float(args.fov_scale)
-        print(f"[fov] Applying effective FOV scale = {args.fov_scale:.3f} (smaller = more crop)")
 
-
-    # ----- PROD mode: fast tuner then final -----
+    # ----- PROD mode: fast tuner then final (safe) -----
     if args.prod:
-        small = tuple(max(64, s//2) for s in img_shape_zyx)
+        small = tuple(max(64, s // 2) for s in img_shape_zyx)
         gpu_psf = args.gpu if args.gpu_psf else -1
 
-        # Auto-delay coarse
-        lo_d, hi_d = args.auto_delay_range; steps_d = max(5, args.auto_delay_steps)
+        base = coords.copy()  # coords after any manual rd_shift/scale you've already applied
+
+        # Helper: finish a trial coord set exactly like the final pipeline will
+        def _finish(trial):
+            # optional whitening
+            if getattr(args, "eq_sphere_strength", 0.0) > 0.0:
+                trial, _ = equalize_k_sphere(
+                    trial,
+                    pct=float(getattr(args, "eq_sphere_pct", 95.0)),
+                    strength=float(getattr(args, "eq_sphere_strength", 0.0)),
+                )
+            # auto-pi (temporary, for fair cost)
+            if args.auto_pi:
+                p99 = float(np.percentile(np.linalg.norm(trial, axis=1), 99.0))
+                if p99 > 0:
+                    trial = trial * (np.pi / p99)
+            # FOV scale (so tuning “feels” the real crop)
+            if args.fov_scale != 1.0 and args.fov_scale > 0:
+                trial = trial / float(args.fov_scale)
+            # clip
+            if args.clip_pi:
+                r = np.linalg.norm(trial, axis=1)
+                mask = r > np.pi
+                if np.any(mask):
+                    trial[mask] *= (np.pi / r[mask])[:, None]
+            return trial
+
+        # 1) Auto-delay (coarse)
+        lo_d, hi_d = args.auto_delay_range
+        steps_d = max(5, args.auto_delay_steps)
         best_d, best_cost = 0.0, 1e9
         for sft in np.linspace(lo_d, hi_d, steps_d):
-            c = apply_read_shift(coords, nread, nspokes, sft)
-            cost,_ = psf_aniso_cost(c, small, os_fac=1.6, width=4, gpu=gpu_psf)
+            trial = apply_read_shift(base, nread, nspokes, sft)
+            trial = _finish(trial)
+            cost, _ = psf_aniso_cost(trial, small, os_fac=1.6, width=4, gpu=gpu_psf)
             if cost < best_cost:
                 best_cost, best_d = cost, sft
-        coords = apply_read_shift(coords, nread, nspokes, best_d)
+        coords = apply_read_shift(base, nread, nspokes, best_d)
         print(f"[prod] auto-delay ≈ {best_d:.3f} (cost={best_cost:.4f})")
 
-        # Auto-scale coarse (coordinate-wise)
-        lo_s, hi_s = args.auto_scale_range; steps_s = max(3, args.auto_scale_steps)
-        scales = np.array([1.0,1.0,1.0], float)
-        for _ in range(2):  # two passes
-            for ax in (0,1,2):
-                best_v, best_cost = scales[ax], 1e9
+        # 2) Auto-scale (per-axis, two passes around the chosen delay)
+        lo_s, hi_s = args.auto_scale_range
+        steps_s = max(3, args.auto_scale_steps)
+        scales = np.array([1.0, 1.0, 1.0], float)
+        for _ in range(2):
+            for ax in (0, 1, 2):
+                best_v, best_cost = 1.0, 1e9
                 for v in np.linspace(lo_s, hi_s, steps_s):
-                    test = scales.copy(); test[ax] = v
-                    c = coords * test[None,:]
-                    cost,_ = psf_aniso_cost(c, small, os_fac=1.6, width=4, gpu=gpu_psf)
-                    if cost < best_cost: best_cost, best_v = cost, v
-                scales[ax] = best_v
-        
+                    test = coords.copy()
+                    test[:, ax] *= v
+                    test = _finish(test)
+                    cost, _ = psf_aniso_cost(test, small, os_fac=1.6, width=4, gpu=gpu_psf)
+                    if cost < best_cost:
+                        best_cost, best_v = cost, v
+                scales[ax] *= best_v
+                coords[:, ax] *= best_v
+
         print(f"[prod] auto-scale ≈ (x,y,z)=({scales[0]:.3f},{scales[1]:.3f},{scales[2]:.3f})")
 
-        # Final recon uses full settings; also export a JSON sidecar
-        args.rd_shift = float(best_d)
-        args.scale_x, args.scale_y, args.scale_z = float(scales[0]), float(scales[1]), float(scales[2])
-    # ----- Manual delay / manual per-axis scale (safe version) -----
+        # Persist choices so your JSON sidecar reflects them
+        args.rd_shift = float(args.rd_shift + best_d)
+        args.scale_x = float(args.scale_x * scales[0])
+        args.scale_y = float(args.scale_y * scales[1])
+        args.scale_z = float(args.scale_z * scales[2])
 
-    # 1) Readout delay (unchanged)
+    # ---------- TRAJECTORY SANITIZER (single-pass) ----------
+    # coords shape: (M, 3), order: (kx, ky, kz)
+
+    # A) spoke/sample reordering already done earlier
+
+    # B) odd/even or all spoke reversal already done earlier
+
+    # C) manual readout delay (optional)
     if abs(args.rd_shift) > 1e-12:
         coords = apply_read_shift(coords, nread, nspokes, args.rd_shift)
         print(f"[delay] Applied read shift of {args.rd_shift:.3f} samples.")
 
-    # 2) Manual scale (with optional cap; by default we respect your explicit values)
-    #    If you want a cap, run with:  --scale-cap 0.05  --cap-manual-scale
+    # D) manual per-axis scale (optional, broadcast-safe, no caps unless requested)
     sx, sy, sz = float(args.scale_x), float(args.scale_y), float(args.scale_z)
     if any(abs(s - 1.0) > 1e-12 for s in (sx, sy, sz)):
         if getattr(args, "cap_manual_scale", False):
@@ -673,29 +708,40 @@ def main():
         coords[:, 2] *= sz
         print(f"[scale] Applied per-axis scales (x,y,z) = ({sx:.3f}, {sy:.3f}, {sz:.3f})")
 
-    # --- Sphere equalize (covariance whitening) then final π re-norm ---
-    if getattr(args, "eq_sphere_strength", 0.0) and args.eq_sphere_strength > 0.0:
-        pct = float(getattr(args, "eq_sphere_pct", 95.0))
-        coords = equalize_k_sphere(coords, pct=pct, strength=float(args.eq_sphere_strength))
-        print(f"[eq-sphere] covariance whitening: pct={pct:.1f}, strength={args.eq_sphere_strength:.2f}")
+    # E) OPTIONAL: sphere equalization (covariance whitening)
+    if getattr(args, "eq_sphere_strength", 0.0) > 0.0:
+        coords, gains = equalize_k_sphere(
+            coords,
+            pct=float(getattr(args, "eq_sphere_pct", 95.0)),
+            strength=float(args.eq_sphere_strength),
+        )
+        print(f"[eq-sphere] covariance whitening: pct={float(getattr(args,'eq_sphere_pct',95.0)):.1f}, strength={float(args.eq_sphere_strength):.2f}")
 
-    # Final auto-π after all transforms (delay/scale/eq-sphere)
+    # F) Single π normalization (once!)
     if args.auto_pi:
-        p99_final = float(np.percentile(np.linalg.norm(coords.reshape(-1, 3), axis=1), 99.0))
-        if p99_final > 0:
-            s = float(np.pi / p99_final)
+        r_p99 = float(np.percentile(np.linalg.norm(coords, axis=1), 99.0))
+        if r_p99 > 0:
+            s = float(np.pi / r_p99)
             coords *= s
-            print(f"[auto-pi-2] Re-normalized after scale/delay/equalize: factor {s:.4f}")
+            print(f"[auto-pi] Scaled coords by {s:.4f} so |k|_p99 ≈ π.")
 
-    # Gentle |k| clip to π at the very end (broadcast-safe)
+    # F2) Effective FOV change (must be AFTER auto-pi or it gets undone)
+    if args.fov_scale != 1.0 and args.fov_scale > 0:
+        coords = coords / float(args.fov_scale)
+        print(f"[fov] Applying effective FOV scale = {args.fov_scale:.3f} (smaller = more crop)")
+
+    # G) Gentle safety clip AFTER π and FOV scaling
     if args.clip_pi:
-        r = np.linalg.norm(coords.reshape(-1, 3), axis=1)
+        r = np.linalg.norm(coords, axis=1)
         mask = r > np.pi
         if np.any(mask):
-            coords = coords.reshape(-1, 3)
             coords[mask] *= (np.pi / r[mask])[:, None]
-            coords = coords.reshape(-1, 3)
-            print(f"[pre] Clipped |k| to ≤ π for {int(mask.sum())}/{r.size} samples.")
+            print(f"[clip] Clipped |k| to ≤ π for {int(mask.sum())}/{coords.shape[0]} samples.")
+
+    r = np.linalg.norm(coords, axis=1)
+    kstd = np.std(coords, axis=0)
+    print(f"[diag] |k| p[1,50,99] = {np.percentile(r,[1,50,99])}  std(kx,ky,kz)={tuple(kstd)}")
+    # ---------------------------------------------------------
 
 
     # NUFFT adjoint per-coil
