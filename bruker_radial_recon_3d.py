@@ -239,14 +239,23 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     return None
 
 
-def equalize_k_sphere(coords: np.ndarray) -> np.ndarray:
-    # Make the sampling sphere isotropic: match per-axis RMS
-    std = coords.std(axis=0)                 # [σx, σy, σz]
+def equalize_k_sphere(coords: np.ndarray, strength: float = 0.0,
+                      clip: tuple[float, float] = (0.90, 1.10)) -> np.ndarray:
+    """
+    Blend coords toward an isotropic sampling sphere.
+    strength=0 -> identity; strength=1 -> full equalization.
+    Gains are clipped to avoid geometric distortion.
+    """
+    if strength <= 0:
+        return coords
+    std = coords.std(axis=0)              # [σx, σy, σz]
     std[std == 0] = 1.0
-    gain = std.mean() / std                  # scale so σx=σy=σz
-    print(f"[eq-sphere] gains (x,y,z) = ({gain[0]:.3f},{gain[1]:.3f},{gain[2]:.3f})")
+    raw_gain = (std.mean() / std)         # full equalization
+    gain = 1.0 + strength * (raw_gain - 1.0)  # blend toward 1
+    gain = np.clip(gain, clip[0], clip[1])    # safety bounds
+    print(f"[eq-sphere] raw=({raw_gain[0]:.3f},{raw_gain[1]:.3f},{raw_gain[2]:.3f}) "
+          f"applied=({gain[0]:.3f},{gain[1]:.3f},{gain[2]:.3f})")
     return coords * gain[None, :]
-
 
 # ---------------- NUFFT helpers ----------------
 def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width: int = 4):
@@ -492,6 +501,9 @@ def main():
                 help="Low-pass fraction of Nyquist for sens-map estimate (0.08–0.18 typical).")
     ap.add_argument("--bias-correct", action="store_true",
                 help="Divide final magnitude by a very low-pass bias field (flatten shading).")
+    ap.add_argument(
+        "--eq-sphere-strength", type=float, default=0.0,
+        help="0..1 blend toward isotropic k-sphere; 0 disables (safe).")
 
     args = ap.parse_args()
 
@@ -620,22 +632,27 @@ def main():
         print(f"[scale] Applied per-axis scales (x,y,z) = {tuple(s)}")
     
     # 2) OPTIONAL: sphere equalize (then π renorm) — AFTER delay/scale, BEFORE recon
-    coords = equalize_k_sphere(coords)   # makes k-space sampling isotropic
 
-    p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)    
+    coords = equalize_k_sphere(coords, strength=getattr(args, "eq_sphere_strength", 0.0))
+
+    # Final π re-normalization so p99(|k|) ≈ π after all edits
+    p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
     if args.auto_pi and p99_final > 0:
-         s = float(np.pi / p99_final)
-         coords *= s
-         print(f"[auto-pi-2] Re-normalized after scale/delay: factor {s:.4f}")
+        s = float(np.pi / p99_final)
+        coords *= s
+        print(f"[auto-pi-2] Re-normalized after scale/delay: factor {s:.4f}")
 
-    # 3) NUFFT adjoint per-coil
-    coil_imgs = recon_adj_percoil(kdata, tuple(args.matrix), coords,
-                              dcf_mode=args.dcf, gpu=args.gpu)
+    # NUFFT adjoint per-coil
+    coil_imgs = recon_adj_percoil(
+        kdata, tuple(args.matrix), coords,
+        dcf_mode=args.dcf, gpu=args.gpu
+    )
 
-    # 4) Coil combine
-    img = combine_coils(coil_imgs, method=args.combine, lp_frac=args.lp_frac,
-                    bias_correct=args.bias_correct)
-
+    # Coil combine (SoS or adaptive)
+    img = combine_coils(
+        coil_imgs, method=args.combine,
+        lp_frac=args.lp_frac, bias_correct=args.bias_correct
+    )
 
     affine = np.diag([vox[0], vox[1], vox[2], 1.0])
     nib.save(nib.Nifti1Image(np.asarray(img, np.float32), affine), args.out)
