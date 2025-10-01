@@ -542,9 +542,6 @@ def main():
                 help="Low-pass fraction of Nyquist for sens-map estimate (0.08–0.18 typical).")
     ap.add_argument("--bias-correct", action="store_true",
                 help="Divide final magnitude by a very low-pass bias field (flatten shading).")
-    ap.add_argument(
-        "--eq-sphere-strength", type=float, default=0.0,
-        help="0..1 blend toward isotropic k-sphere; 0 disables (safe).")
     ap.add_argument("--no-auto-scale", action="store_true",
                 help="Disable per-axis scale search (trust traj units).")
     ap.add_argument("--scale-cap", type=float, default=0.05,
