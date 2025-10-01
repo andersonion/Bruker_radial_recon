@@ -616,54 +616,6 @@ def main():
         coords = coords / float(args.fov_scale)
         print(f"[fov] Applying effective FOV scale = {args.fov_scale:.3f} (smaller = more crop)")
 
-      # ----- Manual delay / manual per-axis scale (safe version) -----
-
-    # 1) Readout delay (unchanged)
-    if abs(args.rd_shift) > 1e-12:
-        coords = apply_read_shift(coords, nread, nspokes, args.rd_shift)
-        print(f"[delay] Applied read shift of {args.rd_shift:.3f} samples.")
-
-    # 2) Manual scale (with optional cap; by default we respect your explicit values)
-    #    If you want a cap, run with:  --scale-cap 0.05  --cap-manual-scale
-    sx, sy, sz = float(args.scale_x), float(args.scale_y), float(args.scale_z)
-    if any(abs(s - 1.0) > 1e-12 for s in (sx, sy, sz)):
-        if getattr(args, "cap_manual_scale", False):
-            cap = float(getattr(args, "scale_cap", 0.05))
-            sx = float(np.clip(sx, 1.0 - cap, 1.0 + cap))
-            sy = float(np.clip(sy, 1.0 - cap, 1.0 + cap))
-            sz = float(np.clip(sz, 1.0 - cap, 1.0 + cap))
-        coords = coords.reshape(-1, 3)
-        coords[:, 0] *= sx
-        coords[:, 1] *= sy
-        coords[:, 2] *= sz
-        print(f"[scale] Applied per-axis scales (x,y,z) = ({sx:.3f}, {sy:.3f}, {sz:.3f})")
-
-    # 3) Gentle |k| clip to π (pre-clip, optional)
-    if args.clip_pi:
-        r = np.linalg.norm(coords, axis=1)            # (M,)
-        mask = r > np.pi
-        if np.any(mask):
-            coords[mask] *= (np.pi / r[mask])[:, None]
-            print(f"[pre] Clipped |k| to ≤ π for {int(mask.sum())}/{coords.shape[0]} samples.")
-
-    # 4) Equalize k-sphere (covariance whitening in a robust core), then π renorm
-    if float(getattr(args, "eq_sphere_strength", 0.0)) > 0.0:
-        coords = equalize_k_sphere(
-            coords,
-            pct=float(getattr(args, "eq_sphere_pct", 90.0)),
-            strength=float(args.eq_sphere_strength),
-        )
-        print(f"[eq-sphere] covariance whitening: pct={float(getattr(args,'eq_sphere_pct',90.0)):.1f}, "
-              f"strength={float(args.eq_sphere_strength):.2f}")
-
-    # 5) Final auto-π after delay/scale/equalize (ensures |k|_p99 ≈ π)
-    if args.auto_pi:
-        p99 = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
-        if p99 > 0:
-            s = float(np.pi / p99)
-            coords *= s
-            print(f"[auto-pi-2] Re-normalized after scale/delay/equalize: factor {s:.4f}")
-
 
     # ----- PROD mode: fast tuner then final -----
     if args.prod:
