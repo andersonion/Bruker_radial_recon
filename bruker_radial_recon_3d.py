@@ -418,6 +418,28 @@ def adaptive_combine(coil_imgs, sens_maps, eps=1e-8):
     den = (np.abs(sens_maps) ** 2).sum(axis=0) + eps
     return num / den  # complex image
 
+def apply_scales_guarded(coords: np.ndarray,
+                         sx: float, sy: float, sz: float,
+                         args) -> np.ndarray:
+    """
+    Apply per-axis scale to coords with optional disable/cap.
+    Works regardless of how sx,sy,sz were obtained (auto or manual).
+    """
+    if getattr(args, "no_auto_scale", False):
+        sx, sy, sz = 1.0, 1.0, 1.0
+    else:
+        cap = float(getattr(args, "scale_cap", 0.05))
+        # Only cap *deviations from 1.0*; manual scales still pass through
+        sx = float(np.clip(sx, 1.0 - cap, 1.0 + cap))
+        sy = float(np.clip(sy, 1.0 - cap, 1.0 + cap))
+        sz = float(np.clip(sz, 1.0 - cap, 1.0 + cap))
+
+    coords = coords.reshape(-1, 3)
+    coords[:, 0] *= sx
+    coords[:, 1] *= sy
+    coords[:, 2] *= sz
+    print(f"[scale] Applied per-axis scales (x,y,z) = ({sx:.3f}, {sy:.3f}, {sz:.3f})")
+    return coords
 
 
 # ---------------- PNG helpers ----------------
@@ -504,6 +526,10 @@ def main():
     ap.add_argument(
         "--eq-sphere-strength", type=float, default=0.0,
         help="0..1 blend toward isotropic k-sphere; 0 disables (safe).")
+    ap.add_argument("--no-auto-scale", action="store_true",
+                help="Disable per-axis scale search (trust traj units).")
+    ap.add_argument("--scale-cap", type=float, default=0.05,
+                help="Max |scale-1| allowed per axis when auto-scaling (default ±5%).")
 
     args = ap.parse_args()
 
@@ -621,15 +647,36 @@ def main():
         # Final recon uses full settings; also export a JSON sidecar
         args.rd_shift = float(best_d)
         args.scale_x, args.scale_y, args.scale_z = float(scales[0]), float(scales[1]), float(scales[2])
+    # ----- Manual delay / manual per-axis scale (safe version) -----
 
-    # Manual delay/scale (if provided)
+    # 1) Readout delay (unchanged)
     if abs(args.rd_shift) > 1e-12:
         coords = apply_read_shift(coords, nread, nspokes, args.rd_shift)
         print(f"[delay] Applied read shift of {args.rd_shift:.3f} samples.")
-    if any(abs(s-1.0)>1e-12 for s in (args.scale_x,args.scale_y,args.scale_z)):
-        s = np.array([args.scale_x,args.scale_y,args.scale_z], float)
-        coords = coords * s[None,:]
-        print(f"[scale] Applied per-axis scales (x,y,z) = {tuple(s)}")
+
+    # 2) Manual scale (with optional cap; by default we respect your explicit values)
+    #    If you want a cap, run with:  --scale-cap 0.05  --cap-manual-scale
+    sx, sy, sz = float(args.scale_x), float(args.scale_y), float(args.scale_z)
+    if any(abs(s - 1.0) > 1e-12 for s in (sx, sy, sz)):
+        if getattr(args, "cap_manual_scale", False):
+            cap = float(getattr(args, "scale_cap", 0.05))
+            sx = float(np.clip(sx, 1.0 - cap, 1.0 + cap))
+            sy = float(np.clip(sy, 1.0 - cap, 1.0 + cap))
+            sz = float(np.clip(sz, 1.0 - cap, 1.0 + cap))
+        coords = coords.reshape(-1, 3)
+        coords[:, 0] *= sx
+        coords[:, 1] *= sy
+        coords[:, 2] *= sz
+        print(f"[scale] Applied per-axis scales (x,y,z) = ({sx:.3f}, {sy:.3f}, {sz:.3f})")
+
+    # 3) Gentle |k| clip to π (broadcast-safe)
+    if args.clip_pi:
+        r = np.linalg.norm(coords, axis=1)            # (M,)
+        mask = r > np.pi
+        if np.any(mask):
+            coords[mask] *= (np.pi / r[mask])[:, None]
+            print(f"[pre] Clipped |k| to ≤ π for {int(mask.sum())}/{coords.shape[0]} samples.")
+
     
     # 2) OPTIONAL: sphere equalize (then π renorm) — AFTER delay/scale, BEFORE recon
 
