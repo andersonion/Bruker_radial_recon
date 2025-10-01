@@ -239,23 +239,63 @@ def load_series_traj(series_dir: str, nread: int, nspokes: int,
     return None
 
 
-def equalize_k_sphere(coords: np.ndarray, strength: float = 0.0,
-                      clip: tuple[float, float] = (0.90, 1.10)) -> np.ndarray:
+def equalize_k_sphere(coords, strength=1.0, pct=95.0, eps=1e-8, max_gain=3.0, verbose=True):
     """
-    Blend coords toward an isotropic sampling sphere.
-    strength=0 -> identity; strength=1 -> full equalization.
-    Gains are clipped to avoid geometric distortion.
+    Make the per-axis spread of k-space samples more spherical by equalizing
+    the axis-wise percentiles. Works in-place on `coords` and also returns it.
+
+    Args
+    ----
+    coords : (M,3) array-like
+        NUFFT coordinates in radians (kx, ky, kz).
+    strength : float in [0, 1]
+        0 = no change, 1 = full equalization to the target (geometric mean).
+    pct : float
+        Percentile of |kx|, |ky|, |kz| used to estimate axis extent (default 95).
+    eps : float
+        Small number to avoid divide-by-zero.
+    max_gain : float
+        Clamp the applied gain per axis to [1/max_gain, max_gain] for safety.
+    verbose : bool
+        If True, prints applied gains.
+
+    Returns
+    -------
+    coords : (M,3) ndarray
+        Same array after equalization (scaled in-place).
     """
-    if strength <= 0:
-        return coords
-    std = coords.std(axis=0)              # [σx, σy, σz]
-    std[std == 0] = 1.0
-    raw_gain = (std.mean() / std)         # full equalization
-    gain = 1.0 + strength * (raw_gain - 1.0)  # blend toward 1
-    gain = np.clip(gain, clip[0], clip[1])    # safety bounds
-    print(f"[eq-sphere] raw=({raw_gain[0]:.3f},{raw_gain[1]:.3f},{raw_gain[2]:.3f}) "
-          f"applied=({gain[0]:.3f},{gain[1]:.3f},{gain[2]:.3f})")
-    return coords * gain[None, :]
+    import numpy as np
+
+    c = np.asarray(coords)
+    if c.ndim != 2 or c.shape[1] < 3:
+        raise ValueError(f"coords must be (M,3); got {c.shape}")
+
+    # Percentile of absolute axis components as a robust extent estimate
+    kx, ky, kz = np.abs(c[:, 0]), np.abs(c[:, 1]), np.abs(c[:, 2])
+    px = float(np.percentile(kx, pct))
+    py = float(np.percentile(ky, pct))
+    pz = float(np.percentile(kz, pct))
+
+    # Target = geometric mean of axis extents
+    target = (px * py * pz) ** (1.0 / 3.0) + eps
+
+    raw = np.array([target / (px + eps), target / (py + eps), target / (pz + eps)], dtype=float)
+    # Blend toward unity with "strength" (1.0 = full, 0.0 = none)
+    gains = 1.0 + strength * (raw - 1.0)
+
+    # Safety clamp
+    gains = np.clip(gains, 1.0 / max_gain, max_gain)
+
+    # Apply in-place
+    c[:, 0] *= gains[0]
+    c[:, 1] *= gains[1]
+    c[:, 2] *= gains[2]
+
+    if verbose:
+        print(f"[eq-sphere] gains (x,y,z) = ({gains[0]:.3f},{gains[1]:.3f},{gains[2]:.3f}) "
+              f"(raw={raw[0]:.3f},{raw[1]:.3f},{raw[2]:.3f}), pct={pct}, strength={strength}")
+
+    return coords
 
 # ---------------- NUFFT helpers ----------------
 def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width: int = 4):
@@ -680,7 +720,7 @@ def main():
     
     # 2) OPTIONAL: sphere equalize (then π renorm) — AFTER delay/scale, BEFORE recon
 
-    coords = equalize_k_sphere(coords, strength=getattr(args, "eq_sphere_strength", 0.0))
+    coords = equalize_k_sphere(coords, strength=float(args.eq_sphere_strength))
 
     # Final π re-normalization so p99(|k|) ≈ π after all edits
     p99_final = np.percentile(np.linalg.norm(coords, axis=1), 99.0)
