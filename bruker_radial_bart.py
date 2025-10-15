@@ -11,12 +11,14 @@ Features
 - Recon paths:
   * Gridding (adjoint NUFFT) + SoS combine
   * Iterative PICS (CG-SENSE / L1-wavelet optional) with NUFFT operator
+- **GPU toggle**: `--gpu` adds BART global `-g` to enable CUDA when available
 - Exports NIfTI via `bart toimg`
 
 Notes
 - This wrapper assumes BART is installed and `bart` is on PATH.
 - Reading raw Bruker FID is instrument/sequence-specific. A minimal hook is
-  provided (`load_bruker_kspace(...)`). Replace that with your lab's loader.
+  provided (`load_bruker_kspace(...)`). Replace that with your lab's loader,
+  or use the new `--from-fid` pathway with dtype/endianness hints.
 - All interchange with BART uses .cfl/.hdr files via helpers here.
 
 Example
@@ -30,7 +32,8 @@ python bruker_radial_bart.py \
   --traj golden \
   --dcf pipe:10 \
   --combine sos \
-  --out img_sos
+  --gpu \
+  --out img_sos --export-nifti
 
 # Iterative PICS (CG-SENSE with L1-wavelets)
 python bruker_radial_bart.py \
@@ -44,13 +47,13 @@ python bruker_radial_bart.py \
   --lambda 0.002 \
   --iters 40 \
   --wavelets 3 \
-  --out img_iter
+  --gpu \
+  --out img_iter --export-nifti
 
 """
 
 from __future__ import annotations
 import argparse
-import json
 import math
 import os
 import shutil
@@ -97,45 +100,105 @@ def read_cfl(name: Path) -> np.ndarray:
 
 
 # -----------------------------
-# Bruker loader hook
+# Bruker loader hooks
 # -----------------------------
 
-def load_bruker_kspace(series_dir: Path, ncoils: Optional[int] = None,
-                        spokes: Optional[int] = None, readout: Optional[int] = None) -> np.ndarray:
-    """Return k-space as complex array with shape (readout, spokes, coils).
+def _read_text_kv(path: Path) -> dict:
+    d = {}
+    if not path.exists():
+        return d
+    for line in path.read_text(errors='ignore').splitlines():
+        if '=' in line:
+            k, v = line.split('=', 1)
+            d[k].strip() if k in d else None
+            d[k.strip()] = v.strip()
+    return d
 
-    This is a hook: replace with your lab's reader. We keep a conservative
-    implementation that looks for pre-converted .npy or .cfl if present.
+
+def _parse_acq_size(method_txt: dict, acqp_txt: dict) -> Optional[Tuple[int, int, int]]:
+    # Try to parse ACQ_size or PVM_Matrix
+    for key in ('ACQ_size', 'PVM_Matrix'):  # {RO,PE1,PE2}
+        if key in method_txt:
+            try:
+                nums = [int(x) for x in method_txt[key].replace('{', ' ').replace('}', ' ').split() if x.isdigit()]
+                if len(nums) >= 3:
+                    return (nums[0], nums[1], nums[2])
+            except Exception:
+                pass
+    return None
+
+
+def load_bruker_kspace(series_dir: Path,
+                        spokes: Optional[int] = None,
+                        readout: Optional[int] = None,
+                        coils: Optional[int] = None,
+                        from_fid: bool = False,
+                        fid_dtype: str = 'int32',
+                        fid_endian: str = 'little') -> np.ndarray:
+    """Return k-space as complex array with shape (readout, spokes, coils).
 
     Priority:
       1) series_dir/ksp.cfl (BART format) -> return loaded
-      2) series_dir/ksp.npy  (numpy complex64) with shape (readout, spokes, coils)
-      3) NotImplementedError with clear message
+      2) series_dir/ksp.npy  (numpy complex64) with shape (RO, Spokes, Coils)
+      3) If `from_fid` and `fid` exists: attempt raw read using provided dims
+      4) NotImplementedError with clear message
     """
     series_dir = Path(series_dir)
     cfl = series_dir / 'ksp'
     npy = series_dir / 'ksp.npy'
     if cfl.with_suffix('.cfl').exists() and cfl.with_suffix('.hdr').exists():
         arr = read_cfl(cfl)
-        # normalize to expected axis order if necessary
-        if arr.ndim == 3:
-            # try to coerce to (readout, spokes, coils)
-            # heuristic: longest dim is spokes, smallest often coils
-            dims = list(arr.shape)
-            ro = readout or dims[0]
-            if dims[0] != ro and ro in dims:
-                # roll ro to axis 0
-                arr = np.moveaxis(arr, dims.index(ro), 0)
-            return arr
         return arr
     if npy.exists():
         arr = np.load(npy)
         if arr.ndim != 3:
             raise ValueError(f"ksp.npy must be 3D (readout, spokes, coils); got {arr.shape}")
         return arr
+
+    if from_fid:
+        fid_path = series_dir / 'fid'
+        if not fid_path.exists():
+            raise FileNotFoundError(f"--from-fid requested but no 'fid' found in {series_dir}")
+        if readout is None or spokes is None or coils is None:
+            # try to glean from method/acqp
+            method_txt = _read_text_kv(series_dir / 'method')
+            acqp_txt = _read_text_kv(series_dir / 'acqp')
+            acq = _parse_acq_size(method_txt, acqp_txt)
+            if acq is None:
+                raise ValueError("--from-fid requires --readout, --spokes, --coils (couldn't parse headers)")
+            if readout is None:
+                readout = acq[0]
+        dtype_map = {
+            'int16': np.int16,
+            'int32': np.int32,
+            'float32': np.float32,
+            'float64': np.float64,
+        }
+        if fid_dtype not in dtype_map:
+            raise ValueError('--fid-dtype must be one of int16,int32,float32,float64')
+        dt = dtype_map[fid_dtype]
+        data = np.fromfile(fid_path, dtype=dt)
+        if fid_endian == 'big':
+            data = data.byteswap().newbyteorder()
+        # Bruker interleaves complex as [re, im, re, im, ...]
+        if data.size % 2 != 0:
+            raise ValueError('FID length not even: cannot form complex pairs')
+        data = data.astype(np.float32)
+        cpx = data.view(np.complex64)
+        expected = readout * spokes * coils
+        if cpx.size != expected:
+            # try to infer coils from size if not provided
+            if coils is None and readout and spokes and cpx.size % (readout * spokes) == 0:
+                coils = cpx.size // (readout * spokes)
+                expected = readout * spokes * coils
+            else:
+                raise ValueError(f"FID size mismatch: have {cpx.size}, expected {expected} (ro*sp*coils)")
+        arr = np.reshape(cpx, (readout, spokes, coils), order='F')
+        return arr
+
     raise NotImplementedError(
         "No k-space found. Provide ksp.cfl/.hdr or ksp.npy in the series directory, "
-        "or replace load_bruker_kspace(...) with your Bruker FID reader.")
+        "or use --from-fid with --readout/--spokes/--coils and --fid-dtype/--fid-endian hints.")
 
 
 # -----------------------------
@@ -186,12 +249,8 @@ def save_traj_for_bart(traj: np.ndarray, out_base: Path):
 # Density Compensation (pipe-style iterative)
 # -----------------------------
 
-def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int] = (256, 256, 256)) -> np.ndarray:
+def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int] = (256, 256, 256), gpu: bool = False) -> np.ndarray:
     """Simple iterative DCF (pipe): w_{n+1} = w_n / G^H G w_n on ones.
-
-    This is an approximate CPU implementation using NUFFT via BART calls for
-    accuracy (delegating gridding kernel). If BART is unavailable at runtime,
-    falls back to a rough CPU gridding which is slower and cruder.
 
     Returns DCF with shape (readout, spokes).
     """
@@ -201,8 +260,7 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
     # attempt BART-based iteration by shuttling through .cfl files
     bart = shutil.which('bart')
     if bart is None:
-        # crude fallback: normalize by local sampling density in k-space voxels
-        # bin samples to nearest voxel and use inverse of hit-counts
+        # crude fallback: bin samples to nearest voxel and use inverse of hit-counts
         kx = np.rint(traj[0] - traj[0].min()).astype(int)
         ky = np.rint(traj[1] - traj[1].min()).astype(int)
         kz = np.rint(traj[2] - traj[2].min()).astype(int)
@@ -217,6 +275,13 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
 
     tmp = Path('./.tmp_bart_dcf')
     tmp.mkdir(exist_ok=True)
+
+    def bart_cmd(*args):
+        base = [bart]
+        if gpu:
+            base.append('-g')
+        return base + list(args)
+
     try:
         for _ in range(iters):
             # ones -> forward NUFFT -> weighted adjoint -> update
@@ -224,16 +289,16 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
             write_cfl(tmp / 'ones', ones)
             save_traj_for_bart(traj, tmp / 'traj')
             # forward NUFFT: kspace of ones
-            subprocess.run([bart, 'nufft', '-t', str(tmp / 'traj'), str(tmp / 'ones'), str(tmp / 'kones')], check=True)
+            subprocess.run(bart_cmd('nufft', '-t', str(tmp / 'traj'), str(tmp / 'ones'), str(tmp / 'kones')), check=True)
             # apply current weights
             write_cfl(tmp / 'w', w.astype(np.complex64))
-            subprocess.run([bart, 'fmac', str(tmp / 'kones'), str(tmp / 'w'), str(tmp / 'kw')], check=True)
+            subprocess.run(bart_cmd('fmac', str(tmp / 'kones'), str(tmp / 'w'), str(tmp / 'kw')), check=True)
             # adjoint NUFFT
-            subprocess.run([bart, 'nufft', '-a', '-t', str(tmp / 'traj'), str(tmp / 'kw'), str(tmp / 'backproj')], check=True)
+            subprocess.run(bart_cmd('nufft', '-a', '-t', str(tmp / 'traj'), str(tmp / 'kw'), str(tmp / 'backproj')), check=True)
             back = read_cfl(tmp / 'backproj')
             # sample backprojected values at sample locations via second forward
             write_cfl(tmp / 'back', back)
-            subprocess.run([bart, 'nufft', '-t', str(tmp / 'traj'), str(tmp / 'back'), str(tmp / 'kback')], check=True)
+            subprocess.run(bart_cmd('nufft', '-t', str(tmp / 'traj'), str(tmp / 'back'), str(tmp / 'kback')), check=True)
             kback = read_cfl(tmp / 'kback')
             denom = np.abs(kback).astype(np.float32) + 1e-6
             w = w / denom
@@ -246,12 +311,19 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
 
 
 # -----------------------------
-# BART ops
+# BART ops (GPU-aware)
 # -----------------------------
 
-def run(cmd: list[str]):
-    print('[bart]', ' '.join(cmd))
-    subprocess.run(cmd, check=True)
+def run_bart(cmd: list[str], gpu: bool = False):
+    bart = shutil.which('bart')
+    if not bart:
+        raise RuntimeError('BART not found in PATH')
+    full = [bart]
+    if gpu:
+        full.append('-g')
+    full += cmd
+    print('[bart]', ' '.join(full))
+    subprocess.run(full, check=True)
 
 
 def bart_exists() -> bool:
@@ -262,60 +334,49 @@ def bart_exists() -> bool:
 # Coil maps (ESPiRIT) helper
 # -----------------------------
 
-def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int] = None):
-    """Estimate ESPiRIT maps using BART ecalib.
-    If `calib` provided, pass as -r radius to ecalib.
-    """
-    bart = shutil.which('bart')
-    assert bart, 'BART not found in PATH.'
-    cmd = [bart, 'ecalib']
+def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int] = None, gpu: bool = False):
+    cmd = ['ecalib']
     if calib is not None:
         cmd += ['-r', str(calib)]
     cmd += [str(coil_imgs_base), str(out_base)]
-    run(cmd)
+    run_bart(cmd, gpu=gpu)
 
 
 # -----------------------------
 # Main recon flows
 # -----------------------------
 
-def recon_adjoint(traj_base: Path, ksp_base: Path, combine: str, out_base: Path):
-    bart = shutil.which('bart')
-    assert bart, 'BART not found in PATH.'
-
+def recon_adjoint(traj_base: Path, ksp_base: Path, combine: str, out_base: Path, gpu: bool):
     # NUFFT adjoint to coil images
-    run([bart, 'nufft', '-a', '-t', str(traj_base), str(ksp_base), str(out_base.with_name(out_base.name + '_coil'))])
+    coil_base = out_base.with_name(out_base.name + '_coil')
+    run_bart(['nufft', '-a', '-t', str(traj_base), str(ksp_base), str(coil_base)], gpu=gpu)
 
     if combine.lower() == 'sos':
-        run([bart, 'rss', '8', str(out_base.with_name(out_base.name + '_coil')), str(out_base)])
+        run_bart(['rss', '8', str(coil_base), str(out_base)], gpu=gpu)
     elif combine.lower() == 'sens':
-        # estimate maps then SENSE combine via pics with identity data-consistency
         maps = out_base.with_name(out_base.name + '_maps')
-        estimate_sens_maps(out_base.with_name(out_base.name + '_coil'), maps)
-        # pics with zero DC weight approximates SENSE combine from coil images
-        run([bart, 'pics', '-S', str(out_base.with_name(out_base.name + '_coil')), str(maps), str(out_base)])
+        estimate_sens_maps(coil_base, maps, gpu=gpu)
+        run_bart(['pics', '-S', str(coil_base), str(maps), str(out_base)], gpu=gpu)
     else:
         raise ValueError('combine must be sos|sens')
 
 
 def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
-                    lam: float, iters: int, wavelets: Optional[int] = None):
-    bart = shutil.which('bart')
-    assert bart, 'BART not found in PATH.'
-
+                    lam: float, iters: int, wavelets: Optional[int], gpu: bool):
     # quick coil maps: adjoint per coil -> ecalib
     tmpcoil = out_base.with_name(out_base.name + '_coil')
-    run([bart, 'nufft', '-a', '-t', str(traj_base), str(ksp_base), str(tmpcoil)])
+    run_bart(['nufft', '-a', '-t', str(traj_base), str(ksp_base), str(tmpcoil)], gpu=gpu)
     maps = out_base.with_name(out_base.name + '_maps')
-    estimate_sens_maps(tmpcoil, maps)
+    estimate_sens_maps(tmpcoil, maps, gpu=gpu)
 
     # PICS with NUFFT operator
-    cmd = [bart, 'pics', '-S', '-i', str(iters), '-R', f'W:7:0:{lam}']
-    if wavelets:
-        # W:7:scale:lambda (7 selects wavelets)
-        cmd = [bart, 'pics', '-S', '-i', str(iters), '-R', f'W:7:{wavelets}:{lam}']
+    cmd = ['pics', '-S', '-i', str(iters)]
+    if wavelets is not None:
+        cmd += ['-R', f'W:7:{wavelets}:{lam}']
+    elif lam > 0:
+        cmd += ['-R', f'W:7:0:{lam}']
     cmd += ['-t', str(traj_base), str(ksp_base), str(maps), str(out_base)]
-    run(cmd)
+    run_bart(cmd, gpu=gpu)
 
 
 # -----------------------------
@@ -338,6 +399,12 @@ def main():
     ap.add_argument('--iters', type=int, default=40, help='Iterations for iterative recon')
     ap.add_argument('--wavelets', type=int, default=None, help='Wavelet scale parameter (optional)')
     ap.add_argument('--export-nifti', action='store_true', help='Export NIfTI via bart toimg')
+    ap.add_argument('--gpu', action='store_true', help='Enable BART GPU (adds global -g)')
+    # optional raw FID path
+    ap.add_argument('--from-fid', action='store_true', help="Attempt to read raw Bruker 'fid' when ksp.* not present")
+    ap.add_argument('--coils', type=int, default=None, help='Number of coils (required with --from-fid if not inferrable)')
+    ap.add_argument('--fid-dtype', type=str, default='int32', choices=['int16','int32','float32','float64'], help='Scalar type of fid samples before complex pairing')
+    ap.add_argument('--fid-endian', type=str, default='little', choices=['little','big'], help='Endianness of fid file')
 
     args = ap.parse_args()
 
@@ -352,7 +419,8 @@ def main():
     sp = args.spokes
 
     # ---- k-space (readout, spokes, coils)
-    ksp = load_bruker_kspace(series_dir, spokes=sp, readout=ro)
+    ksp = load_bruker_kspace(series_dir, spokes=sp, readout=ro, coils=args.coils,
+                             from_fid=args.from_fid, fid_dtype=args.fid_dtype, fid_endian=args.fid_endian)
     if ksp.shape[0] != ro or ksp.shape[1] != sp:
         raise ValueError(f"k-space shape mismatch: got {ksp.shape}, expected (readout={ro}, spokes={sp}, coils)")
 
@@ -383,10 +451,10 @@ def main():
                 nit = int(dcf_mode.split(':', 1)[1])
             except Exception:
                 pass
-        dcf = dcf_pipe(traj, iters=nit, grid_shape=(nx, ny, nz))
+        dcf = dcf_pipe(traj, iters=nit, grid_shape=(nx, ny, nz), gpu=args.gpu)
         write_cfl(out_base.with_name(out_base.name + '_dcf'), dcf.astype(np.complex64))
         # weight kspace in-place for adjoint path; for PICS we can pass unweighted
-        run(['bart', 'fmac', str(out_base.with_name(out_base.name + '_ksp')), str(out_base.with_name(out_base.name + '_dcf')), str(out_base.with_name(out_base.name + '_kspw'))])
+        run_bart(['fmac', str(out_base.with_name(out_base.name + '_ksp')), str(out_base.with_name(out_base.name + '_dcf')), str(out_base.with_name(out_base.name + '_kspw'))], gpu=args.gpu)
         ksp_base = out_base.with_name(out_base.name + '_kspw')
     else:
         ksp_base = out_base.with_name(out_base.name + '_ksp')
@@ -394,15 +462,15 @@ def main():
     # ---- reconstruction
     if args.iterative:
         recon_iterative(out_base.with_name(out_base.name + '_traj'), ksp_base, out_base.with_name(out_base.name + '_recon'),
-                        lam=args.lam, iters=args.iters, wavelets=args.wavelets)
+                        lam=args.lam, iters=args.iters, wavelets=args.wavelets, gpu=args.gpu)
         img_base = out_base.with_name(out_base.name + '_recon')
     else:
-        recon_adjoint(out_base.with_name(out_base.name + '_traj'), ksp_base, args.combine, out_base.with_name(out_base.name + '_adj'))
+        recon_adjoint(out_base.with_name(out_base.name + '_traj'), ksp_base, args.combine, out_base.with_name(out_base.name + '_adj'), gpu=args.gpu)
         img_base = out_base.with_name(out_base.name + '_adj')
 
     # ---- export
     if args.export_nifti:
-        run(['bart', 'toimg', str(img_base), str(out_base)])
+        run_bart(['toimg', str(img_base), str(out_base)], gpu=args.gpu)
         print(f'Wrote NIfTI: {out_base}.nii')
     else:
         print(f'Recon complete. BART base: {img_base} (.cfl/.hdr)')
