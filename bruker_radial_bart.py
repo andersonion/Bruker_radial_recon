@@ -222,20 +222,47 @@ def load_bruker_kspace(series_dir: Path,
 
     raise NotImplementedError(
         "No k-space found. Provide ksp.cfl/.hdr or ksp.npy in the series directory, "
-        "or include a 'fid' file (auto-detected) or use --from-fid with --readout/--spokes/--coils and dtype/endian hints.") / 2.0)  # golden ratio spacing
+        "or include a 'fid' file (auto-detected) or use --from-fid with --readout/--spokes/--coils and dtype/endian hints.")
+
+
+# -----------------------------
+# Trajectory generators
+# -----------------------------
+
+@dataclass
+class TrajSpec:
+    readout: int
+    spokes: int
+    matrix: Tuple[int, int, int]
+    fov: Optional[Tuple[float, float, float]] = None  # optional meters
+
+
+def golden_angle_3d(spec: TrajSpec) -> np.ndarray:
+    """3D kooshball golden-angle trajectory in units of k-space pixels.
+
+    Returns array shape (3, readout, spokes).
+    * Direction set via spherical Fibonacci ordering (quasi-uniform)
+    * Readout samples linearly from -kmax..+kmax (Nyquist-normalized)
+    """
+    ro, sp = spec.readout, spec.spokes
+    nx, ny, nz = spec.matrix
+    kmax = 0.5 * max(nx, ny, nz)
+    i = np.arange(sp) + 0.5
+    phi = 2.0 * math.pi * i / ((1 + math.sqrt(5)) / 2.0)  # golden ratio spacing
     cos_theta = 1 - 2 * i / sp
     sin_theta = np.sqrt(np.maximum(0.0, 1.0 - cos_theta**2))
-    dirs = np.stack([sin_theta * np.cos(phi),
-                     sin_theta * np.sin(phi),
-                     cos_theta], axis=1)  # (spokes, 3)
-    # readout positions along each spoke
-    t = np.linspace(-1.0, 1.0, ro, endpoint=True)  # normalized
-    radii = kmax * t  # pixels
+    dirs = np.stack([
+        sin_theta * np.cos(phi),
+        sin_theta * np.sin(phi),
+        cos_theta
+    ], axis=1)  # (spokes, 3)
+    t = np.linspace(-1.0, 1.0, ro, endpoint=True)
+    radii = kmax * t
     xyz = np.einsum('sr,sd->drs', radii[None, :], dirs)  # (3, ro, spokes)
     return xyz.astype(np.float32)
 
 
-def save_traj_for_bart(traj: np.ndarray, out_base: Path):
+def save_traj_for_bart(traj: np.ndarray, out_base: Path):(traj: np.ndarray, out_base: Path):
     """Save trajectory as BART .cfl/.hdr with dims (3, RO, Spokes)."""
     assert traj.shape[0] == 3, "Trajectory must have leading dim 3 (kx,ky,kz)."
     write_cfl(out_base, traj)
@@ -386,7 +413,7 @@ def main():
     ap.add_argument('--matrix', type=int, nargs=3, required=True, metavar=('NX','NY','NZ'))
     ap.add_argument('--spokes', type=int, required=True)
     ap.add_argument('--readout', type=int, required=True)
-    ap.add_argument('--traj', choices=['golden', 'file'], default='golden')
+    ap.add_argument('--traj', choices=['golden', 'file'], default='file')
     ap.add_argument('--traj-file', type=Path, help='If --traj file, path to traj.cfl/.hdr or .npy with shape (3,RO,Spokes)')
     ap.add_argument('--dcf', type=str, default='none', help='DCF mode: none | pipe:Niters')
     ap.add_argument('--combine', type=str, default='sos', help='Coil combine for adjoint: sos|sens')
@@ -427,12 +454,20 @@ def main():
     if args.traj == 'golden':
         traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp, matrix=(nx, ny, nz)))
     else:
+        # default: try to load from series_dir/traj.{cfl,hdr} or traj.npy when --traj-file not given
         if args.traj_file is None:
-            raise ValueError('--traj file requires --traj-file path')
-        if args.traj_file.suffix == '.npy':
-            traj = np.load(args.traj_file)
+            default_traj_base = series_dir / 'traj'
+            if default_traj_base.with_suffix('.cfl').exists() and default_traj_base.with_suffix('.hdr').exists():
+                traj = read_cfl(default_traj_base)
+            elif (series_dir / 'traj.npy').exists():
+                traj = np.load(series_dir / 'traj.npy')
+            else:
+                raise ValueError("--traj file requires --traj-file path or a default 'traj.cfl/.hdr' or 'traj.npy' in the series directory")
         else:
-            traj = read_cfl(args.traj_file)
+            if args.traj_file.suffix == '.npy':
+                traj = np.load(args.traj_file)
+            else:
+                traj = read_cfl(args.traj_file)
     if traj.shape != (3, ro, sp):
         raise ValueError(f"trajectory must have shape (3,{ro},{sp}), got {traj.shape}")
 
