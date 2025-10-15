@@ -140,34 +140,55 @@ def load_bruker_kspace(series_dir: Path,
     Priority:
       1) series_dir/ksp.cfl (BART format) -> return loaded
       2) series_dir/ksp.npy  (numpy complex64) with shape (RO, Spokes, Coils)
-      3) If `from_fid` and `fid` exists: attempt raw read using provided dims
+      3) If `from_fid` **or fid exists with no ksp**, attempt raw read using header hints
       4) NotImplementedError with clear message
     """
     series_dir = Path(series_dir)
     cfl = series_dir / 'ksp'
     npy = series_dir / 'ksp.npy'
     if cfl.with_suffix('.cfl').exists() and cfl.with_suffix('.hdr').exists():
-        arr = read_cfl(cfl)
-        return arr
+        return read_cfl(cfl)
     if npy.exists():
         arr = np.load(npy)
         if arr.ndim != 3:
             raise ValueError(f"ksp.npy must be 3D (readout, spokes, coils); got {arr.shape}")
         return arr
 
-    if from_fid:
-        fid_path = series_dir / 'fid'
-        if not fid_path.exists():
-            raise FileNotFoundError(f"--from-fid requested but no 'fid' found in {series_dir}")
-        if readout is None or spokes is None or coils is None:
-            # try to glean from method/acqp
-            method_txt = _read_text_kv(series_dir / 'method')
-            acqp_txt = _read_text_kv(series_dir / 'acqp')
+    fid_path = series_dir / 'fid'
+    auto_from_fid = fid_path.exists()
+    if from_fid or auto_from_fid:
+        method_txt = _read_text_kv(series_dir / 'method')
+        acqp_txt = _read_text_kv(series_dir / 'acqp')
+        # Infer defaults from headers when possible
+        if coils is None:
+            for key in ('PVM_EncNReceivers', 'ACQ_ReceiverSelect', 'PVM_EncChanScaling'):  # primary -> fallback heuristics
+                if key in method_txt:
+                    try:
+                        nums = [int(x) for x in method_txt[key].replace('{',' ').replace('}',' ').replace('(',' ').replace(')',' ').split() if x.isdigit()]
+                        if nums:
+                            coils = nums[0]
+                            break
+                    except Exception:
+                        pass
+        if readout is None or spokes is None:
             acq = _parse_acq_size(method_txt, acqp_txt)
-            if acq is None:
-                raise ValueError("--from-fid requires --readout, --spokes, --coils (couldn't parse headers)")
-            if readout is None:
+            if acq and readout is None:
                 readout = acq[0]
+        # Endianness from BYTORDA
+        if 'BYTORDA' in acqp_txt:
+            val = acqp_txt['BYTORDA'].lower()
+            fid_endian = 'little' if 'little' in val else ('big' if 'big' in val else fid_endian)
+        # Word size -> dtype
+        if 'ACQ_word_size' in acqp_txt:
+            try:
+                ws = int(''.join([c for c in acqp_txt['ACQ_word_size'] if c.isdigit()]))
+                if ws == 16:
+                    fid_dtype = 'int16'
+                elif ws == 32:
+                    fid_dtype = 'int32'
+            except Exception:
+                pass
+        # Read raw
         dtype_map = {
             'int16': np.int16,
             'int32': np.int32,
@@ -177,56 +198,31 @@ def load_bruker_kspace(series_dir: Path,
         if fid_dtype not in dtype_map:
             raise ValueError('--fid-dtype must be one of int16,int32,float32,float64')
         dt = dtype_map[fid_dtype]
-        data = np.fromfile(fid_path, dtype=dt)
+        if not fid_path.exists():
+            raise FileNotFoundError(f"No 'fid' file found in {series_dir}")
+        raw = np.fromfile(fid_path, dtype=dt)
         if fid_endian == 'big':
-            data = data.byteswap().newbyteorder()
-        # Bruker interleaves complex as [re, im, re, im, ...]
-        if data.size % 2 != 0:
+            raw = raw.byteswap().newbyteorder()
+        if raw.size % 2 != 0:
             raise ValueError('FID length not even: cannot form complex pairs')
-        data = data.astype(np.float32)
-        cpx = data.view(np.complex64)
+        raw = raw.astype(np.float32)
+        cpx = raw.view(np.complex64)
+        if readout is None or spokes is None or coils is None:
+            raise ValueError('Cannot infer (readout, spokes, coils) from headers; please pass --readout/--spokes/--coils')
         expected = readout * spokes * coils
         if cpx.size != expected:
-            # try to infer coils from size if not provided
-            if coils is None and readout and spokes and cpx.size % (readout * spokes) == 0:
+            # Try infer coils if missing/mismatched
+            if coils and cpx.size % (readout * spokes) == 0:
                 coils = cpx.size // (readout * spokes)
                 expected = readout * spokes * coils
-            else:
-                raise ValueError(f"FID size mismatch: have {cpx.size}, expected {expected} (ro*sp*coils)")
+            if cpx.size != expected:
+                raise ValueError(f"FID size mismatch: have {cpx.size}, expected {expected} (ro*sp*coils); check --coils/--readout/--spokes")
         arr = np.reshape(cpx, (readout, spokes, coils), order='F')
         return arr
 
     raise NotImplementedError(
         "No k-space found. Provide ksp.cfl/.hdr or ksp.npy in the series directory, "
-        "or use --from-fid with --readout/--spokes/--coils and --fid-dtype/--fid-endian hints.")
-
-
-# -----------------------------
-# Trajectory generators
-# -----------------------------
-
-@dataclass
-class TrajSpec:
-    readout: int
-    spokes: int
-    matrix: Tuple[int, int, int]
-    fov: Optional[Tuple[float, float, float]] = None  # in meters (optional)
-
-
-def golden_angle_3d(spec: TrajSpec) -> np.ndarray:
-    """3D kooshball golden-angle trajectory in units of k-space pixels.
-
-    Returns array shape (3, readout, spokes).
-    * Direction set via Fibonacci sphere ordering (quasi-uniform)
-    * Readout samples linearly from -kmax..+kmax (normalized to Nyquist)
-    """
-    ro, sp = spec.readout, spec.spokes
-    nx, ny, nz = spec.matrix
-    # kmax in pixels (half the matrix along the limiting dimension)
-    kmax = 0.5 * max(nx, ny, nz)
-    # directions using spherical Fibonacci points
-    i = np.arange(sp) + 0.5
-    phi = 2.0 * math.pi * i / ((1 + math.sqrt(5)) / 2.0)  # golden ratio spacing
+        "or include a 'fid' file (auto-detected) or use --from-fid with --readout/--spokes/--coils and dtype/endian hints.") / 2.0)  # golden ratio spacing
     cos_theta = 1 - 2 * i / sp
     sin_theta = np.sqrt(np.maximum(0.0, 1.0 - cos_theta**2))
     dirs = np.stack([sin_theta * np.cos(phi),
