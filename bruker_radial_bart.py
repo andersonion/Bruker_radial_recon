@@ -293,4 +293,120 @@ def recon_adjoint(traj_base: Path, ksp_base: Path, combine: str, out_base: Path)
         maps = out_base.with_name(out_base.name + '_maps')
         estimate_sens_maps(out_base.with_name(out_base.name + '_coil'), maps)
         # pics with zero DC weight approximates SENSE combine from coil images
-        run([bart, 'pics', '-S', str(out_base.with_name(out_base.name + '_coil
+        run([bart, 'pics', '-S', str(out_base.with_name(out_base.name + '_coil')), str(maps), str(out_base)])
+    else:
+        raise ValueError('combine must be sos|sens')
+
+
+def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
+                    lam: float, iters: int, wavelets: Optional[int] = None):
+    bart = shutil.which('bart')
+    assert bart, 'BART not found in PATH.'
+
+    # quick coil maps: adjoint per coil -> ecalib
+    tmpcoil = out_base.with_name(out_base.name + '_coil')
+    run([bart, 'nufft', '-a', '-t', str(traj_base), str(ksp_base), str(tmpcoil)])
+    maps = out_base.with_name(out_base.name + '_maps')
+    estimate_sens_maps(tmpcoil, maps)
+
+    # PICS with NUFFT operator
+    cmd = [bart, 'pics', '-S', '-i', str(iters), '-R', f'W:7:0:{lam}']
+    if wavelets:
+        # W:7:scale:lambda (7 selects wavelets)
+        cmd = [bart, 'pics', '-S', '-i', str(iters), '-R', f'W:7:{wavelets}:{lam}']
+    cmd += ['-t', str(traj_base), str(ksp_base), str(maps), str(out_base)]
+    run(cmd)
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description='Bruker 3D radial reconstruction using BART')
+    ap.add_argument('--series', type=Path, required=True, help='Path to Bruker scan directory (PV 6.x) or folder containing ksp.*')
+    ap.add_argument('--out', type=Path, required=True, help='Output basename (no extension) for BART/NIfTI')
+    ap.add_argument('--matrix', type=int, nargs=3, required=True, metavar=('NX','NY','NZ'))
+    ap.add_argument('--spokes', type=int, required=True)
+    ap.add_argument('--readout', type=int, required=True)
+    ap.add_argument('--traj', choices=['golden', 'file'], default='golden')
+    ap.add_argument('--traj-file', type=Path, help='If --traj file, path to traj.cfl/.hdr or .npy with shape (3,RO,Spokes)')
+    ap.add_argument('--dcf', type=str, default='none', help='DCF mode: none | pipe:Niters')
+    ap.add_argument('--combine', type=str, default='sos', help='Coil combine for adjoint: sos|sens')
+    ap.add_argument('--iterative', action='store_true', help='Use iterative PICS reconstruction')
+    ap.add_argument('--lambda', dest='lam', type=float, default=0.0, help='Regularization weight for iterative recon')
+    ap.add_argument('--iters', type=int, default=40, help='Iterations for iterative recon')
+    ap.add_argument('--wavelets', type=int, default=None, help='Wavelet scale parameter (optional)')
+    ap.add_argument('--export-nifti', action='store_true', help='Export NIfTI via bart toimg')
+
+    args = ap.parse_args()
+
+    if not bart_exists():
+        print('ERROR: BART not found on PATH. Install BART and try again.', file=sys.stderr)
+        sys.exit(1)
+
+    series_dir: Path = args.series
+    out_base: Path = args.out
+    nx, ny, nz = args.matrix
+    ro = args.readout
+    sp = args.spokes
+
+    # ---- k-space (readout, spokes, coils)
+    ksp = load_bruker_kspace(series_dir, spokes=sp, readout=ro)
+    if ksp.shape[0] != ro or ksp.shape[1] != sp:
+        raise ValueError(f"k-space shape mismatch: got {ksp.shape}, expected (readout={ro}, spokes={sp}, coils)")
+
+    # Save k-space for BART (dims: RO, Spokes, Coils)
+    write_cfl(out_base.with_name(out_base.name + '_ksp'), ksp)
+
+    # ---- trajectory (3, ro, sp)
+    if args.traj == 'golden':
+        traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp, matrix=(nx, ny, nz)))
+    else:
+        if args.traj_file is None:
+            raise ValueError('--traj file requires --traj-file path')
+        if args.traj_file.suffix == '.npy':
+            traj = np.load(args.traj_file)
+        else:
+            traj = read_cfl(args.traj_file)
+    if traj.shape != (3, ro, sp):
+        raise ValueError(f"trajectory must have shape (3,{ro},{sp}), got {traj.shape}")
+
+    save_traj_for_bart(traj, out_base.with_name(out_base.name + '_traj'))
+
+    # ---- optional DCF
+    dcf_mode = args.dcf.lower()
+    if dcf_mode.startswith('pipe'):
+        nit = 10
+        if ':' in dcf_mode:
+            try:
+                nit = int(dcf_mode.split(':', 1)[1])
+            except Exception:
+                pass
+        dcf = dcf_pipe(traj, iters=nit, grid_shape=(nx, ny, nz))
+        write_cfl(out_base.with_name(out_base.name + '_dcf'), dcf.astype(np.complex64))
+        # weight kspace in-place for adjoint path; for PICS we can pass unweighted
+        run(['bart', 'fmac', str(out_base.with_name(out_base.name + '_ksp')), str(out_base.with_name(out_base.name + '_dcf')), str(out_base.with_name(out_base.name + '_kspw'))])
+        ksp_base = out_base.with_name(out_base.name + '_kspw')
+    else:
+        ksp_base = out_base.with_name(out_base.name + '_ksp')
+
+    # ---- reconstruction
+    if args.iterative:
+        recon_iterative(out_base.with_name(out_base.name + '_traj'), ksp_base, out_base.with_name(out_base.name + '_recon'),
+                        lam=args.lam, iters=args.iters, wavelets=args.wavelets)
+        img_base = out_base.with_name(out_base.name + '_recon')
+    else:
+        recon_adjoint(out_base.with_name(out_base.name + '_traj'), ksp_base, args.combine, out_base.with_name(out_base.name + '_adj'))
+        img_base = out_base.with_name(out_base.name + '_adj')
+
+    # ---- export
+    if args.export_nifti:
+        run(['bart', 'toimg', str(img_base), str(out_base)])
+        print(f'Wrote NIfTI: {out_base}.nii')
+    else:
+        print(f'Recon complete. BART base: {img_base} (.cfl/.hdr)')
+
+
+if __name__ == '__main__':
+    main()
