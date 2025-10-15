@@ -71,10 +71,8 @@ def dbg(*args):
 
 def _write_hdr(path: Path, dims: Tuple[int, ...]):
     with open(path, 'w') as f:
-        f.write('# Dimensions
-')
-        f.write(' '.join(str(d) for d in dims) + '
-')
+        f.write('# Dimensions\\n')
+        f.write(' '.join(str(d) for d in dims) + '\\n')
 
 
 def write_cfl(name: Path, array: np.ndarray):
