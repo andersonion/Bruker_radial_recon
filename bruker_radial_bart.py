@@ -71,8 +71,10 @@ def dbg(*args):
 
 def _write_hdr(path: Path, dims: Tuple[int, ...]):
     with open(path, 'w') as f:
-        f.write('# Dimensions\\n')
-        f.write(' '.join(str(d) for d in dims) + '\\n')
+        f.write('# Dimensions
+')
+        f.write(' '.join(str(d) for d in dims) + '
+')
 
 
 def write_cfl(name: Path, array: np.ndarray):
@@ -281,7 +283,29 @@ def load_bruker_kspace(series_dir: Path,
     expected = readout * spokes * coils
     dbg('complex samples =', cpx.size, 'expected =', expected)
     if cpx.size != expected:
-        raise ValueError(f'FID size mismatch: have {cpx.size}, expected {expected} (ro*sp*coils)')
+        # --- try to auto-adjust one dimension to fit the FID length ---
+        adjusted = False
+        # prefer adjusting spokes if RO & coils are known (typical when user supplies RO)
+        if readout and coils and (cpx.size % (readout * coils) == 0):
+            spokes = cpx.size // (readout * coils)
+            adjusted = True
+            dbg('auto-adjust: spokes ->', spokes)
+        # else try adjust coils if RO & spokes known
+        elif readout and spokes and (cpx.size % (readout * spokes) == 0):
+            coils = cpx.size // (readout * spokes)
+            adjusted = True
+            dbg('auto-adjust: coils ->', coils)
+        # else try adjust readout as last resort
+        elif spokes and coils and (cpx.size % (spokes * coils) == 0):
+            readout = cpx.size // (spokes * coils)
+            adjusted = True
+            dbg('auto-adjust: readout ->', readout)
+
+        if adjusted:
+            expected = readout * spokes * coils
+            dbg('after auto-adjust expected =', expected)
+        if (not adjusted) or (cpx.size != expected):
+            raise ValueError(f'FID size mismatch: have {cpx.size}, expected {expected} (ro*sp*coils)')
 
     return np.reshape(cpx, (readout, spokes, coils), order='F')
 
