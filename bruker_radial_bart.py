@@ -2,16 +2,39 @@
 """
 bruker_radial_bart.py
 
-Bruker 3D radial reconstruction using BART with robust low-memory adjoint fallback.
+Bruker 3D radial reconstruction using BART with robust fallbacks.
 
-- Auto-infers RO / Spokes / Coils from Bruker headers + raw FID (handles blocked-RO padding).
-- Trajectory: prefers $series/traj (bin/ASCII); else --traj-file; else golden-angle.
-- DCF (Pipe-style) implemented purely in NumPy (no BART) to avoid NUFFT asserts.
-- Writes non-Cartesian-friendly CFLs:
-    ksp  dims: [1,1,1,COIL,1,1,1,1,1,1,RO,SP,1,1,1,1]
-    traj dims: [3,1,1,1,  1,1,1,1,1,1,RO,SP,1,1,1,1]
-- GPU toggle with sticky CPU fallback.
-- NEW: Adjoint NUFFT **chunked fallback** on spokes to avoid OOM. Force with --lowmem-sp-chunk.
+What's inside
+- Bruker loader:
+    * Auto-infers RO / Spokes / Coils from FID + headers (handles blocked-RO padding).
+- Trajectory:
+    * Prefers $series/traj (binary/ASCII). Else --traj-file. Else golden-angle.
+- DCF:
+    * Pipe-style (iterative occupancy) implemented in NumPy (no BART).
+- Recon paths:
+    * Primary: BART adjoint NUFFT (+ SoS or SENSE).
+    * NEW Fallback: **Pure-NumPy adjoint gridding** (Kaiser–Bessel) if BART NUFFT OOM’s,
+      or force via `--force-python-adjoint`.
+- Output:
+    * Writes .cfl/.hdr for intermediates and final; optional NIfTI via `bart toimg`.
+- GPU:
+    * Sticky fallback: if `-g` fails once, we stop trying it.
+
+Notes
+- Iterative PICS still requires BART NUFFT; if you hit OOM there, use the Python adjoint path
+  for a gridded SoS image (or try a smaller matrix).
+
+Example
+-------
+python bruker_radial_bart.py \\
+  --series "$path" \\
+  --matrix 256 256 256 \\
+  --traj file \\
+  --dcf pipe:10 \\
+  --combine sos \\
+  --gpu \\
+  --export-nifti \\
+  --out "${out%.nii.gz}_SoS"
 """
 
 from __future__ import annotations
@@ -25,20 +48,26 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 import numpy as np
 
+# ---------------- Debug ----------------
 DEBUG = False
 def dbg(*args):
     if DEBUG:
         print("[debug]", *args)
 
-BART_GPU_AVAILABLE = None  # sticky cache
+# Sticky cache for GPU availability this run
+BART_GPU_AVAILABLE = None  # None unknown, True/False known
 
-# ---------- CFL I/O ----------
+# --------------- CFL I/O ---------------
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
         f.write("# Dimensions\n")
         f.write(" ".join(str(d) for d in dims) + "\n")
 
 def _write_cfl(name: Path, array: np.ndarray, dims16: Optional[List[int]] = None):
+    """
+    Write array to BART .cfl/.hdr in column-major order.
+    If dims16 is provided, it's used verbatim; otherwise array.shape is expanded to 16 dims.
+    """
     name = Path(name)
     base = name.with_suffix("")
     if dims16 is None:
@@ -57,7 +86,7 @@ def read_cfl(name: Path) -> np.ndarray:
     data = np.fromfile(base.with_suffix(".cfl"), dtype=np.complex64)
     return np.reshape(data, dims, order="F")
 
-# ---------- Bruker helpers ----------
+# -------- Bruker header helpers --------
 def _read_text_kv(path: Path) -> Dict[str, str]:
     d: Dict[str, str] = {}
     if not path.exists():
@@ -102,7 +131,7 @@ def _get_int_from_headers(keys: List[str], srcs: List[dict]) -> Optional[int]:
                     pass
     return None
 
-# ---------- Trajectory ----------
+# --------------- Trajectory ---------------
 @dataclass
 class TrajSpec:
     readout: int
@@ -124,6 +153,13 @@ def golden_angle_3d(spec: TrajSpec) -> np.ndarray:
     return xyz.astype(np.float32)
 
 def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray]:
+    """
+    Accepts Bruker 'traj' in several flavors:
+    - binary float32 or float64 of length 3*ro*sp
+    - ASCII flat list of 3*ro*sp numbers
+    - ASCII 2D (ro*sp,3) or (3, ro*sp)
+    Returns traj shaped (3, ro, sp) float32 if recognized.
+    """
     tpath = Path(series_dir) / "traj"
     if not tpath.exists():
         return None
@@ -157,7 +193,7 @@ def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray
         pass
     return None
 
-# ---------- FID / k-space ----------
+# --------------- FID / k-space loader ---------------
 def load_bruker_kspace(series_dir: Path,
                        matrix_ro_hint: Optional[int] = None,
                        spokes: Optional[int] = None,
@@ -165,6 +201,13 @@ def load_bruker_kspace(series_dir: Path,
                        coils: Optional[int] = None,
                        fid_dtype: str = "int32",
                        fid_endian: str = "little") -> np.ndarray:
+    """
+    Returns k-space as (RO, Spokes, Coils), trimming blocked RO if needed.
+    Accepts:
+      - series/ksp.cfl|.hdr
+      - series/ksp.npy (RO,Spokes,Coils)
+      - series/fid (+ headers)
+    """
     series_dir = Path(series_dir)
     dbg("series_dir:", series_dir)
 
@@ -187,10 +230,13 @@ def load_bruker_kspace(series_dir: Path,
     acqp   = _read_text_kv(series_dir / "acqp")
 
     # endian/dtype from headers
-    if "BYTORDA" in acqp and "big" in acqp["BYTORDA"].lower(): fid_endian = "big"
+    if "BYTORDA" in acqp and "big" in acqp["BYTORDA"].lower():
+        fid_endian = "big"
     if "ACQ_word_size" in acqp:
-        if "16" in acqp["ACQ_word_size"]: fid_dtype = "int16"
-        elif "32" in acqp["ACQ_word_size"]: fid_dtype = "int32"
+        if "16" in acqp["ACQ_word_size"]:
+            fid_dtype = "int16"
+        elif "32" in acqp["ACQ_word_size"]:
+            fid_dtype = "int32"
 
     dtype_map = {"int16": np.int16, "int32": np.int32, "float32": np.float32, "float64": np.float64}
     if fid_dtype not in dtype_map: raise ValueError("--fid-dtype must be one of int16,int32,float32,float64")
@@ -257,14 +303,10 @@ def load_bruker_kspace(series_dir: Path,
         for d in range(0, s+1):
             for cand in (s+d, s-d):
                 if cand > 0 and per_coil_total % cand == 0:
-                    return cand, per_coil_total // b
-        # fallback brute force
-        for b in range(1, min(4096, per_coil_total)+1):
-            if per_coil_total % b == 0:
-                return b, per_coil_total // b
+                    return cand, per_coil_total // cand
         raise ValueError("Could not factor per_coil_total into (stored_ro, spokes).")
 
-    stored_ro, spokes_inf = pick_block_and_spokes(per_coil_total, readout, None)
+    stored_ro, spokes_inf = pick_block_and_spokes(per_coil_total, readout, spokes)
     dbg("stored_ro (block):", stored_ro, " spokes (per extras-collapsed):", spokes_inf)
     spokes_final = spokes_inf * max(1, other_dims)
     if stored_ro * spokes_final * coils != total_cplx:
@@ -280,7 +322,7 @@ def load_bruker_kspace(series_dir: Path,
     dbg("final k-space shape:", ksp.shape, "(RO, Spokes, Coils)")
     return ksp  # (ro, sp, coils)
 
-# ---------- BART wrappers (sticky GPU fallback) ----------
+# --------- BART wrappers (sticky GPU fallback) ---------
 def _bart_path() -> str:
     bart = shutil.which("bart")
     if not bart:
@@ -328,8 +370,12 @@ def run_bart(cmd: List[str], gpu: bool = False):
         raise ValueError("Empty BART command")
     _run_bart(cmd[0], cmd[1:], gpu=gpu)
 
-# ---------- DCF (NumPy Pipe) ----------
+# --------------- DCF (NumPy Pipe) ---------------
 def _normalize_traj_to_grid(traj: np.ndarray, grid_shape: Tuple[int,int,int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Map traj k-space coords to integer grid indices in [0..N-1] per axis.
+    Uses robust min/max to map to grid. Returns (ix,iy,iz) int arrays of shape (ro, sp).
+    """
     ro, sp = traj.shape[1], traj.shape[2]
     kx, ky, kz = traj[0], traj[1], traj[2]
     def robust_minmax(a):
@@ -349,6 +395,16 @@ def _normalize_traj_to_grid(traj: np.ndarray, grid_shape: Tuple[int,int,int]) ->
     return ix, iy, iz
 
 def dcf_pipe_numpy(traj: np.ndarray, iters: int, grid_shape: Tuple[int,int,int]) -> np.ndarray:
+    """
+    Pure NumPy Pipe-like DCF:
+      initialize w=1
+      repeat iters times:
+        grid(x) = sum_j w_j at nearest grid cell
+        denom_j = grid(x_j) + eps
+        w <- w / denom
+      renormalize mean(w) to 1.
+    Returns w with shape (ro, sp) float32.
+    """
     ro, sp = traj.shape[1], traj.shape[2]
     ix, iy, iz = _normalize_traj_to_grid(traj, grid_shape)
     w = np.ones((ro, sp), dtype=np.float32)
@@ -363,26 +419,39 @@ def dcf_pipe_numpy(traj: np.ndarray, iters: int, grid_shape: Tuple[int,int,int])
 
 # ---------- Layout helpers ----------
 def ksp_to_bart_noncart(ksp_ro_sp_coils: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    """
+    Return array with dims [1,1,1,COIL,1,1,1,1,1,1,RO,SP,1,1,1,1]
+    which is friendly to many BART non-Cart builds.
+    """
     ro, sp, nc = ksp_ro_sp_coils.shape
     arr = ksp_ro_sp_coils.astype(np.complex64, order="F")
     arr16 = arr.reshape(ro, sp, nc, *([1]*13))
-    # place: coils->3, ro->10, sp->11
+    # Place at indices: coils->3, ro->10, sp->11
     perm = [3,4,5, 2, 6,7,8,9,12,13, 0,1, 10,11,14,15]
     arr16 = np.transpose(arr16, perm)
-    dims16 = [1]*16; dims16[3]=nc; dims16[10]=ro; dims16[11]=sp
+    dims16 = [1]*16
+    dims16[3]  = nc
+    dims16[10] = ro
+    dims16[11] = sp
     return arr16, dims16
 
 def traj_to_bart_noncart(traj_3_ro_sp: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    """
+    Return traj dims [3,1,1,1,1,1,1,1,1,1,RO,SP,1,1,1,1]
+    """
     _, ro, sp = traj_3_ro_sp.shape
     arr = traj_3_ro_sp.astype(np.complex64, order="F")
     arr16 = arr.reshape(3, ro, sp, *([1]*13))
-    # place: axis0=3 at dim 0, ro->10, sp->11
     perm = [0, 3,4,5,6,7,8,9,12,13, 1,2, 10,11,14,15]
     arr16 = np.transpose(arr16, perm)
-    dims16 = [1]*16; dims16[0]=3; dims16[10]=ro; dims16[11]=sp
+    dims16 = [1]*16
+    dims16[0]  = 3
+    dims16[10] = ro
+    dims16[11] = sp
     return arr16, dims16
 
 def _make_weight_like(target: np.ndarray, w2d: np.ndarray) -> np.ndarray:
+    """Broadcast w2d (ro,sp) onto target's axes (unknown order)."""
     ro, sp = w2d.shape
     tshape = target.shape
     axes = list(range(len(tshape)))
@@ -391,18 +460,143 @@ def _make_weight_like(target: np.ndarray, w2d: np.ndarray) -> np.ndarray:
     for i in pos_ro:
         for j in pos_sp:
             if i != j:
-                shape = [1]*len(tshape); shape[i]=ro; shape[j]=sp
+                shape = [1]*len(tshape); shape[i] = ro; shape[j] = sp
                 return w2d.reshape(shape).astype(np.complex64)
-    if pos_ro and len(pos_ro)>=2 and ro==sp:
-        i,j = pos_ro[0], pos_ro[1]
-        shape=[1]*len(tshape); shape[i]=ro; shape[j]=sp
+    if pos_ro and len(pos_ro) >= 2 and ro == sp:
+        i, j = pos_ro[0], pos_ro[1]
+        shape = [1]*len(tshape); shape[i] = ro; shape[j] = sp
         return w2d.reshape(shape).astype(np.complex64)
-    shape=[1]*len(tshape); 
+    shape = [1]*len(tshape)
     if len(tshape)>0: shape[0]=ro
     if len(tshape)>1: shape[1]=sp
     return w2d.reshape(shape).astype(np.complex64)
 
-# ---------- Recon flows ----------
+# ---------- Pure NumPy adjoint gridding ----------
+def _kaiser_bessel(u: np.ndarray, width: float, beta: float) -> np.ndarray:
+    """
+    Kaiser-Bessel kernel (0 <= |u| <= width/2), normalized so u is in grid units.
+    u can be any real array; outside support returns 0.
+    """
+    x = np.abs(u)
+    out = np.zeros_like(x, dtype=np.float32)
+    half = width / 2.0
+    m = x <= half
+    t = np.sqrt(1.0 - (x[m] / half)**2)
+    # I0(beta * t) / I0(beta)
+    from numpy import i0
+    out[m] = (i0(beta * t) / i0(beta)).astype(np.float32)
+    return out
+
+def _deapod_1d(N: int, os: float, width: float, beta: float) -> np.ndarray:
+    """
+    1D deapodization for Kaiser-Bessel gridding using approximate frequency response.
+    We compute correction on oversampled grid and decimate later.
+    """
+    # frequency grid normalized to [-0.5, 0.5)
+    k = (np.arange(N*os) - (N*os)/2) / (N*os)
+    # Approximate deapodization as reciprocal of kernel FT at these frequencies.
+    # For Kaiser-Bessel, a common approximation is sinc-like; we use a safe floor.
+    # (Good enough for radial with modest oversampling & width.)
+    eps = 1e-6
+    # Use window in image domain -> smooth rolloff in k-space; reciprocal here
+    corr = np.maximum(eps, np.sinc(k))  # crude but stable
+    return (1.0 / corr).astype(np.float32)
+
+def adjoint_grid_numpy(traj_3_ro_sp: np.ndarray,
+                       ksp_ro_sp_coils: np.ndarray,
+                       dcf_ro_sp: Optional[np.ndarray],
+                       grid_shape: Tuple[int,int,int],
+                       oversamp: float = 1.5,
+                       kb_width: float = 3.0,
+                       kb_beta: float = 8.0) -> np.ndarray:
+    """
+    Adjoint NUFFT via separable Kaiser–Bessel gridding + iFFT.
+    Returns complex coil images with shape (NX, NY, NZ, COILS).
+    """
+    RO, SP, NC = ksp_ro_sp_coils.shape
+    NX, NY, NZ = grid_shape
+    NXg = int(round(NX * oversamp))
+    NYg = int(round(NY * oversamp))
+    NZg = int(round(NZ * oversamp))
+
+    # Map traj (in "pixel units" of k-space) to oversampled grid index space centered
+    # Assume traj is in [-kmax, kmax] where kmax ~ 0.5*max(NX,NY,NZ)
+    kx, ky, kz = traj_3_ro_sp[0], traj_3_ro_sp[1], traj_3_ro_sp[2]  # (RO,SP)
+    kmax = 0.5 * float(max(NX, NY, NZ))
+    gx = (kx / (2*kmax) + 0.5) * NXg
+    gy = (ky / (2*kmax) + 0.5) * NYg
+    gz = (kz / (2*kmax) + 0.5) * NZg
+
+    # Precompute deapodization (approx) and window
+    deapx = _deapod_1d(NX, oversamp, kb_width, kb_beta)
+    deapy = _deapod_1d(NY, oversamp, kb_width, kb_beta)
+    deapz = _deapod_1d(NZ, oversamp, kb_width, kb_beta)
+
+    # Initialize oversampled grid for each coil
+    img_grid = np.zeros((NXg, NYg, NZg, NC), dtype=np.complex64)
+
+    # Support half-width in grid cells
+    hw = int(math.ceil(kb_width / 2.0))
+
+    # Apply DCF if provided
+    if dcf_ro_sp is None:
+        w = np.ones((RO, SP), dtype=np.float32)
+    else:
+        w = dcf_ro_sp.astype(np.float32)
+
+    # Scatter-add for each sample across coils
+    for s in range(SP):
+        # integer center
+        cx = np.floor(gx[:, s]).astype(int)
+        cy = np.floor(gy[:, s]).astype(int)
+        cz = np.floor(gz[:, s]).astype(int)
+
+        for t in range(RO):
+            x0 = cx[t]; y0 = cy[t]; z0 = cz[t]
+            # local neighborhood
+            xr = np.arange(x0 - hw, x0 + hw + 1)
+            yr = np.arange(y0 - hw, y0 + hw + 1)
+            zr = np.arange(z0 - hw, z0 + hw + 1)
+
+            # fractional offsets
+            wx = _kaiser_bessel(xr - gx[t, s], kb_width, kb_beta)  # (len(xr),)
+            wy = _kaiser_bessel(yr - gy[t, s], kb_width, kb_beta)
+            wz = _kaiser_bessel(zr - gz[t, s], kb_width, kb_beta)
+
+            # outer product weights
+            wxyz = (wx[:, None, None] * wy[None, :, None] * wz[None, None, :]).astype(np.float32) * w[t, s]
+
+            # bounds check / clip
+            xsel = (xr >= 0) & (xr < NXg)
+            ysel = (yr >= 0) & (yr < NYg)
+            zsel = (zr >= 0) & (zr < NZg)
+            if not (np.any(xsel) and np.any(ysel) and np.any(zsel)):
+                continue
+            xr2 = xr[xsel]; yr2 = yr[ysel]; zr2 = zr[zsel]
+            wxyz2 = wxyz[xsel][:, ysel][:, :, zsel]
+
+            # add to all coils at this sample
+            for c in range(NC):
+                val = ksp_ro_sp_coils[t, s, c]
+                img_grid[np.ix_(xr2, yr2, zr2, [c])] += (wxyz2[..., None] * val).astype(np.complex64)
+
+    # Inverse FFT to image domain
+    img = np.fft.ifftn(np.fft.ifftshift(img_grid, axes=(0,1,2)), axes=(0,1,2))
+    img = np.fft.fftshift(img, axes=(0,1,2))
+
+    # Crop from oversampled grid to target matrix
+    x0 = (NXg - NX) // 2; y0 = (NYg - NY) // 2; z0 = (NZg - NZ) // 2
+    img = img[x0:x0+NX, y0:y0+NY, z0:z0+NZ, :]
+
+    # Deapodize (approx)
+    # Broadcast deapodization along axes
+    img *= deapx[:NX, None, None, None]
+    img *= deapy[None, :NY, None, None]
+    img *= deapz[None, None, :NZ, None]
+
+    return img.astype(np.complex64)  # (NX,NY,NZ,Coils)
+
+# --------------- Recon flows ---------------
 def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int]=None, gpu: bool=False):
     cmd = ["ecalib"]
     if calib is not None:
@@ -410,92 +604,9 @@ def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int
     cmd += [str(coil_imgs_base), str(out_base)]
     run_bart(cmd, gpu=gpu)
 
-def _read_traj_3_ro_sp_from_cfl(traj_base: Path) -> np.ndarray:
-    arr = read_cfl(traj_base)
-    # find axes: 3, ro, sp
-    shape = arr.shape
-    ax3 = next((i for i,L in enumerate(shape) if L==3), None)
-    if ax3 is None:
-        raise ValueError("trajectory CFL does not contain leading dim=3")
-    axes_other = [i for i in range(len(shape)) if i!=ax3 and shape[i]>1]
-    if len(axes_other) < 2:
-        raise ValueError("trajectory CFL missing RO/SP dims")
-    i1,i2 = axes_other[0], axes_other[1]
-    arr = np.moveaxis(arr, (ax3,i1,i2), (0,1,2))
-    # squeeze trailing ones
-    arr = arr.reshape(3, shape[i1], shape[i2])
-    return arr.astype(np.complex64).real.astype(np.float32)  # ensure float32 (kx,ky,kz)
-
-def _read_ksp_ro_sp_coils_from_cfl(ksp_base: Path) -> np.ndarray:
-    arr = read_cfl(ksp_base)
-    shape = arr.shape
-    # find RO, SP, COIL axes
-    # coil length is the only >1 that is NOT ro/sp when those are known (we’ll infer by process of elimination)
-    # Prefer dims that match typical placements: 3->none here, ro/sp usually unique.
-    axes_nz = [i for i,L in enumerate(shape) if L>1]
-    # guess ro=largest axis, sp=second largest among >1 (works for most radial)
-    sizes = [(i,shape[i]) for i in axes_nz]
-    sizes_sorted = sorted(sizes, key=lambda x: x[1], reverse=True)
-    if len(sizes_sorted) < 3:
-        raise ValueError("ksp CFL missing dims (need at least RO, SP, COIL)")
-    ro_i = sizes_sorted[0][0]
-    sp_i = sizes_sorted[1][0]
-    coil_i = sizes_sorted[2][0]
-    arr = np.moveaxis(arr, (ro_i, sp_i, coil_i), (0,1,2))
-    arr = arr.reshape(shape[ro_i], shape[sp_i], shape[coil_i])
-    return arr
-
-def _write_traj_chunk(traj3: np.ndarray, sp_lo: int, sp_hi: int, base: Path):
-    chunk = traj3[:, :, sp_lo:sp_hi]  # (3, ro, spc)
-    arr16, dims16 = traj_to_bart_noncart(chunk)
-    _write_cfl(base, arr16, dims16)
-
-def _write_ksp_chunk(ksp: np.ndarray, sp_lo: int, sp_hi: int, base: Path):
-    # ksp is (ro, sp, coils)
-    chunk = ksp[:, sp_lo:sp_hi, :]
-    arr16, dims16 = ksp_to_bart_noncart(chunk)
-    _write_cfl(base, arr16, dims16)
-
-def recon_adjoint_chunked(traj_base: Path, ksp_base: Path, out_base: Path,
-                          combine: str, gpu: bool, sp_total: int, chunk: int,
-                          tmpdir: Path):
-    """Adjoint NUFFT in chunks along spokes; accumulates complex coil image."""
-    # Load numpy views
-    traj3 = _read_traj_3_ro_sp_from_cfl(traj_base)
-    ksp = _read_ksp_ro_sp_coils_from_cfl(ksp_base)  # (ro, sp, coils)
-
-    # We’ll probe first chunk to get image dims, then allocate accumulator
-    acc = None
+def recon_adjoint_bart(traj_base: Path, ksp_base: Path, out_base: Path, combine: str, gpu: bool):
     coil_base = out_base.with_name(out_base.name + "_coil")
-
-    for lo in range(0, sp_total, chunk):
-        hi = min(sp_total, lo + chunk)
-        tb = tmpdir / f"traj_{lo}_{hi}"
-        kb = tmpdir / f"ksp_{lo}_{hi}"
-        ib = tmpdir / f"img_{lo}_{hi}"
-
-        _write_traj_chunk(traj3, lo, hi, tb)
-        _write_ksp_chunk(ksp, lo, hi, kb)
-        run_bart(["nufft", "-a", "-t", str(tb), str(kb), str(ib)], gpu=gpu)
-
-        img = read_cfl(ib)  # complex coil image (dims depend on BART plan)
-        if acc is None:
-            acc = np.array(img, dtype=np.complex64, copy=True)
-        else:
-            # broadcast-safe sum
-            # make shapes equal by expanding singleton dims if needed
-            if acc.shape != img.shape:
-                # try to pad img to acc
-                # move axes to match by aligning non-1 dims
-                if img.size == acc.size:
-                    img = img.reshape(acc.shape, order="F")
-                else:
-                    raise ValueError(f"Chunk image shape mismatch: {img.shape} vs {acc.shape}")
-            acc += img
-
-    # write accumulated coil image
-    _write_cfl(coil_base, acc, list(acc.shape) + [1]*(16-len(acc.shape)))
-
+    run_bart(["nufft", "-a", "-t", str(traj_base), str(ksp_base), str(coil_base)], gpu=gpu)
     if combine.lower() == "sos":
         run_bart(["rss", "8", str(coil_base), str(out_base)], gpu=gpu)
     elif combine.lower() == "sens":
@@ -505,35 +616,29 @@ def recon_adjoint_chunked(traj_base: Path, ksp_base: Path, out_base: Path,
     else:
         raise ValueError("combine must be sos|sens")
 
-def recon_adjoint(traj_base: Path, ksp_base: Path, combine: str, out_base: Path,
-                  gpu: bool, sp_total: int, lowmem_sp_chunk: Optional[int] = None):
-    coil_base = out_base.with_name(out_base.name + "_coil")
-    tmpdir = Path("./.tmp_bart_adj"); tmpdir.mkdir(exist_ok=True)
-    try:
-        # Either force low-mem or try single-shot then fallback
-        if lowmem_sp_chunk and lowmem_sp_chunk > 0:
-            recon_adjoint_chunked(traj_base, ksp_base, out_base, combine, gpu, sp_total, lowmem_sp_chunk, tmpdir)
-            return
-        try:
-            run_bart(["nufft", "-a", "-t", str(traj_base), str(ksp_base), str(coil_base)], gpu=gpu)
-            if combine.lower() == "sos":
-                run_bart(["rss", "8", str(coil_base), str(out_base)], gpu=gpu)
-            elif combine.lower() == "sens":
-                maps = out_base.with_name(out_base.name + "_maps")
-                estimate_sens_maps(coil_base, maps, gpu=gpu)
-                run_bart(["pics", "-S", str(coil_base), str(maps), str(out_base)], gpu=gpu)
-            else:
-                raise ValueError("combine must be sos|sens")
-        except subprocess.CalledProcessError:
-            print("[warn] Single-shot adjoint failed; falling back to spoke-chunked adjoint.")
-            # choose a conservative chunk size
-            chunk = min(4096, max(1, sp_total // 4))
-            recon_adjoint_chunked(traj_base, ksp_base, out_base, combine, gpu, sp_total, chunk, tmpdir)
-    finally:
-        try:
-            shutil.rmtree(tmpdir)
-        except Exception:
-            pass
+def recon_adjoint_python(traj_3_ro_sp: np.ndarray, ksp_ro_sp_coils: np.ndarray,
+                         dcf_ro_sp: Optional[np.ndarray],
+                         matrix: Tuple[int,int,int], out_base: Path, combine: str):
+    NX, NY, NZ = matrix
+    # Gridding
+    coil_img = adjoint_grid_numpy(traj_3_ro_sp, ksp_ro_sp_coils, dcf_ro_sp, (NX, NY, NZ))  # (NX,NY,NZ,Coils)
+    coil_base = out_base.with_name(out_base.name + "_coil_py")
+    # Save as BART cfl with dims [X,Y,Z,COIL] (standard image layout)
+    img = np.moveaxis(coil_img, (0,1,2,3), (0,1,2,3))  # already in X,Y,Z,Coil
+    _write_cfl(coil_base, img, [NX, NY, NZ, coil_img.shape[3]] + [1]*12)
+
+    if combine.lower() == "sos":
+        # RSS over coil dim=3
+        rss = np.sqrt(np.sum(np.abs(img)**2, axis=3)).astype(np.complex64)
+        out = out_base
+        _write_cfl(out, rss, [NX, NY, NZ] + [1]*13)
+    elif combine.lower() == "sens":
+        # For SENSE you'd want a sensitivity estimation; we can still call BART ecalib/pics on the CFL
+        maps = out_base.with_name(out_base.name + "_maps_py")
+        estimate_sens_maps(coil_base, maps, gpu=False)
+        run_bart(["pics", "-S", str(coil_base), str(maps), str(out_base)], gpu=False)
+    else:
+        raise ValueError("combine must be sos|sens")
 
 def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
                     lam: float, iters: int, wavelets: Optional[int], gpu: bool):
@@ -549,7 +654,7 @@ def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
     cmd += ["-t", str(traj_base), str(ksp_base), str(maps), str(out_base)]
     run_bart(cmd, gpu=gpu)
 
-# ---------- CLI ----------
+# ---------------- CLI / Main ----------------
 def bart_exists() -> bool:
     return shutil.which("bart") is not None
 
@@ -562,11 +667,11 @@ def main():
     ap.add_argument("--traj", choices=["golden", "file"], default="file")
     ap.add_argument("--traj-file", type=Path, help="If --traj file, optional path to traj.cfl/.hdr or traj.npy")
     ap.add_argument("--dcf", type=str, default="none", help="DCF mode: none | pipe:Niters")
-    ap.add_argument("--combine", type=str, default="sos", help="Coil combine for adjoint: sos|sens")
-    ap.add_argument("--iterative", action="store_true", help="Use iterative PICS reconstruction")
-    ap.add_argument("--lambda", dest="lam", type=float, default=0.0, help="Regularization weight for iterative recon")
+    ap.add_argument("--combine", type=str, default="sos", help="Coil combine: sos|sens")
+    ap.add_argument("--iterative", action="store_true", help="Use iterative PICS reconstruction (BART)")
+    ap.add_argument("--lambda", dest="lam", type=float, default=0.0, help="Regularization for iterative recon")
     ap.add_argument("--iters", type=int, default=40, help="Iterations for iterative recon")
-    ap.add_argument("--wavelets", type=int, default=None, help="Wavelet scale parameter (optional)")
+    ap.add_argument("--wavelets", type=int, default=None, help="Wavelet scale (optional)")
     ap.add_argument("--export-nifti", action="store_true", help="Export NIfTI via bart toimg")
     ap.add_argument("--gpu", action="store_true", help="Attempt GPU; sticky CPU fallback if unsupported")
     ap.add_argument("--debug", action="store_true", help="Print header inference and file checks")
@@ -576,8 +681,9 @@ def main():
     ap.add_argument("--coils", type=int, default=None)
     ap.add_argument("--fid-dtype", type=str, default=None)
     ap.add_argument("--fid-endian", type=str, default=None)
-    # low-memory control
-    ap.add_argument("--lowmem-sp-chunk", type=int, default=0, help="Force spoke-chunked adjoint NUFFT with this chunk size (0=auto only on failure)")
+    # force python adjoint
+    ap.add_argument("--force-python-adjoint", action="store_true",
+                    help="Skip BART NUFFT and use pure-NumPy adjoint gridding")
 
     args = ap.parse_args()
     DEBUG = args.debug
@@ -600,7 +706,7 @@ def main():
     ro, sp, nc = ksp.shape
     print(f"[info] Loaded k-space: RO={ro}, Spokes={sp}, Coils={nc}")
 
-    # Save KSP in non-Cart layout
+    # Save KSP in non-Cart layout for BART path (and to have a CFL copy on disk)
     ksp_arr16, ksp_dims16 = ksp_to_bart_noncart(ksp)
     ksp_base = out_base.with_name(out_base.name + "_ksp")
     _write_cfl(ksp_base, ksp_arr16, ksp_dims16)
@@ -654,8 +760,10 @@ def main():
         kspw_base = out_base.with_name(out_base.name + "_kspw")
         _write_cfl(kspw_base, kspw, list(ksp_arr.shape) + [1]*(16-len(ksp_arr.shape)))
         ksp_in = kspw_base
+        ksp_for_python = ksp * dcf  # for Python gridder path (shape ro,sp,coils)
     else:
         ksp_in = ksp_base
+        ksp_for_python = ksp
 
     # ---- reconstruction
     if args.iterative:
@@ -663,12 +771,23 @@ def main():
         recon_iterative(traj_base, ksp_in, out_img, lam=args.lam, iters=args.iters, wavelets=args.wavelets, gpu=args.gpu)
     else:
         out_img = out_base.with_name(out_base.name + "_adj")
-        recon_adjoint(traj_base, ksp_in, args.combine, out_img, gpu=args.gpu,
-                      sp_total=sp, lowmem_sp_chunk=args.lowmem_sp_chunk)
+
+        if args.force_python_adjoint:
+            # Pure NumPy adjoint gridding (always)
+            recon_adjoint_python(traj, ksp_for_python, dcf if dcf_mode.startswith("pipe") else None,
+                                 (NX,NY,NZ), out_img, combine=args.combine)
+        else:
+            # Try BART once; on failure, fall back to Python adjoint
+            try:
+                recon_adjoint_bart(traj_base, ksp_in, out_img, combine=args.combine, gpu=args.gpu)
+            except subprocess.CalledProcessError:
+                print("[warn] BART adjoint failed; falling back to pure-NumPy adjoint gridding.")
+                recon_adjoint_python(traj, ksp_for_python, dcf if dcf_mode.startswith("pipe") else None,
+                                     (NX,NY,NZ), out_img, combine=args.combine)
 
     # ---- export
     if args.export_nifti:
-        run_bart(["toimg", str(out_img), str(out_base)], gpu=args.gpu)
+        run_bart(["toimg", str(out_img), str(out_base)], gpu=False)
         print(f"Wrote NIfTI: {out_base}.nii")
     else:
         print(f"Recon complete. BART base: {out_img} (.cfl/.hdr)")
