@@ -284,7 +284,7 @@ def load_bruker_kspace(series_dir: Path,
     if readout is not None and stored_ro >= readout:
         ksp = ksp_blk[:readout, :, :]; dbg('trimmed RO from', stored_ro, 'to', readout)
     else:
-        ksp = ksp_blk; 
+        ksp = ksp_blk
         if readout is None: readout = stored_ro
     dbg('final k-space shape:', ksp.shape, '(RO, Spokes, Coils)')
     return ksp
@@ -334,42 +334,64 @@ def run_bart(cmd: List[str], gpu: bool = False):
     _run_bart(cmd[0], cmd[1:], gpu=gpu)
 
 # ------------------------
-# DCF utils (NumPy-safe multiply)
+# DCF helpers
 # ------------------------
 def _make_weight_like(target: np.ndarray, w2d: np.ndarray) -> np.ndarray:
-    """Return complex w that broadcasts exactly to target's axes (unknown order).
-    We find the two axes in target whose lengths match w2d's (ro, sp), in either order,
-    and reshape w2d with singleton dims elsewhere.
-    """
+    """Broadcast w2d (ro,sp) onto target's axes (unknown order)."""
     ro, sp = w2d.shape
     tshape = target.shape
-    # find candidate axes
     axes = list(range(len(tshape)))
     pos_ro = [i for i in axes if tshape[i] == ro]
     pos_sp = [i for i in axes if tshape[i] == sp]
-    # try ro!=sp straightforward first
     for i in pos_ro:
         for j in pos_sp:
             if i != j:
-                shape = [1]*len(tshape)
-                shape[i] = ro; shape[j] = sp
+                shape = [1]*len(tshape); shape[i] = ro; shape[j] = sp
                 return w2d.reshape(shape).astype(np.complex64)
-    # fallback: if ro==sp or ambiguous, just place along first two matching
     if pos_ro and len(pos_ro) >= 2 and ro == sp:
         i, j = pos_ro[0], pos_ro[1]
         shape = [1]*len(tshape); shape[i] = ro; shape[j] = sp
         return w2d.reshape(shape).astype(np.complex64)
-    # ultimate fallback: assume first two axes are (ro,sp)
     shape = [1]*len(tshape)
     shape[0] = ro if len(tshape) > 0 else 1
     shape[1] = sp if len(tshape) > 1 else 1
     return w2d.reshape(shape).astype(np.complex64)
 
+def _extract_ro_sp(arr: np.ndarray, ro: int, sp: int) -> np.ndarray:
+    """Reduce/permute arr to (ro, sp): find axes matching ro & sp, mean over the rest."""
+    if arr.ndim == 2 and arr.shape == (ro, sp):
+        return arr
+    if arr.ndim == 2 and arr.shape == (sp, ro):
+        return arr.T
+    shape = arr.shape
+    idx_ro = [i for i, L in enumerate(shape) if L == ro]
+    idx_sp = [i for i, L in enumerate(shape) if L == sp]
+    if idx_ro and idx_sp:
+        i = idx_ro[0]
+        j = next((k for k in idx_sp if k != i), idx_sp[0])
+        arr2 = np.moveaxis(arr, (i, j), (0, 1))
+        # reduce all remaining axes
+        while arr2.ndim > 2:
+            arr2 = arr2.mean(axis=-1)
+        if arr2.shape == (ro, sp):
+            return arr2
+        if arr2.shape == (sp, ro):
+            return arr2.T
+    # last resort: try transpose if swapped in front then reduce
+    a2 = arr
+    while a2.ndim > 2:
+        a2 = a2.mean(axis=-1)
+    if a2.shape == (ro, sp):
+        return a2
+    if a2.shape == (sp, ro):
+        return a2.T
+    raise ValueError(f"Cannot map denom shape {arr.shape} to (ro={ro}, sp={sp})")
+
 # ------------------------
 # DCF (Pipe): no bart fmac
 # ------------------------
 def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int,int,int]=(256,256,256), gpu: bool=False) -> np.ndarray:
-    """Iterative DCF (Pipe): w_{n+1} = w_n / (|A A^H A 1|) with NumPy multiplies."""
+    """Iterative DCF (Pipe): w_{n+1} = w_n / denom, denom ~ |A A^H A 1|."""
     ro, sp = traj.shape[1], traj.shape[2]
     w = np.ones((ro, sp), dtype=np.float32)
 
@@ -408,9 +430,8 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int,int,int]=(
             _run_bart('nufft', ['-t', str(tmp / 'traj'), str(tmp / 'back'), str(tmp / 'kback')], gpu=gpu)
             kback = read_cfl(tmp / 'kback')
             denom = np.abs(kback).astype(np.float32) + 1e-6
-            while denom.ndim > 2:
-                denom = denom.mean(axis=-1)
-            w = w / denom
+            denom2 = _extract_ro_sp(denom, ro, sp)
+            w = w / denom2
 
         return w.astype(np.float32)
     finally:
@@ -549,7 +570,6 @@ def main():
 
         # apply DCF to ksp using NumPy (avoid bart fmac shape asserts)
         ksp_arr = read_cfl(ksp_base)
-        # make dcf broadcastable to ksp (RO, Spokes, Coils)
         dcf_b = dcf.reshape(ro, sp, *([1] * max(0, ksp_arr.ndim - 2))).astype(np.complex64)
         kspw = ksp_arr * dcf_b
         kspw_base = out_base.with_name(out_base.name + '_kspw')
