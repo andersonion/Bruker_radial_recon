@@ -760,7 +760,8 @@ def main():
         kspw_base = out_base.with_name(out_base.name + "_kspw")
         _write_cfl(kspw_base, kspw, list(ksp_arr.shape) + [1]*(16-len(ksp_arr.shape)))
         ksp_in = kspw_base
-        ksp_for_python = ksp * dcf  # for Python gridder path (shape ro,sp,coils)
+        ksp_for_python = ksp * dcf[..., None]  # (ro, sp, coils) * (ro, sp, 1)
+		  # for Python gridder path (shape ro,sp,coils)
     else:
         ksp_in = ksp_base
         ksp_for_python = ksp
