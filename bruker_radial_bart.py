@@ -8,8 +8,8 @@ Full Python wrapper for Bruker 3D radial MRI reconstruction using BART.
 - Automatically infers readout, spokes, and coils from headers/FID
 - Handles blocked readout padding (e.g., true RO=420 stored as 512)
 - Trajectory source: reads Bruker `$series/traj` by default; falls back to `--traj-file`; if none, auto-generates golden-angle
-- Optional DCF (pipe-style)
-- GPU toggle: we *attempt* `-g` per-tool; if BART lacks GPU support we auto-fallback to CPU
+- Optional DCF (pipe-style); weight array is shaped to match BART's k-space dims
+- GPU toggle: attempts `-g` per-tool; if BART lacks GPU support we auto-fallback to CPU
 - Recon: adjoint NUFFT + SoS/SENSE, or iterative PICS (CG-SENSE + optional wavelets)
 - Optional NIfTI export (`bart toimg`)
 """
@@ -25,20 +25,20 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 import numpy as np
 
-# =========================================================
+# ------------------------
 # Debug
-# =========================================================
+# ------------------------
 DEBUG = False
 def dbg(*args):
     if DEBUG:
         print('[debug]', *args)
 
-# Global flag that turns off further GPU attempts if we detect no GPU support
-BART_GPU_AVAILABLE = None  # None=unknown, True/False once tested
+# Global cache: whether BART GPU is available
+BART_GPU_AVAILABLE = None  # None unknown, True/False set after first probe
 
-# =========================================================
+# ------------------------
 # BART .cfl I/O
-# =========================================================
+# ------------------------
 def _write_hdr(path: Path, dims: Tuple[int, ...]):
     with open(path, 'w') as f:
         f.write('# Dimensions\n')
@@ -63,9 +63,9 @@ def read_cfl(name: Path) -> np.ndarray:
     data = np.fromfile(base.with_suffix('.cfl'), dtype=np.complex64)
     return np.reshape(data, dims, order='F')
 
-# =========================================================
+# ------------------------
 # Bruker header helpers
-# =========================================================
+# ------------------------
 def _read_text_kv(path: Path) -> Dict[str, str]:
     d: Dict[str, str] = {}
     if not path.exists():
@@ -111,9 +111,9 @@ def _get_int_from_headers(keys: List[str], srcs: List[dict]) -> Optional[int]:
                     pass
     return None
 
-# =========================================================
+# ------------------------
 # Trajectory
-# =========================================================
+# ------------------------
 @dataclass
 class TrajSpec:
     readout: int
@@ -185,9 +185,9 @@ def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray
         pass
     return None
 
-# =========================================================
+# ------------------------
 # FID / k-space loader (auto RO/spokes/coils, blocked-RO aware)
-# =========================================================
+# ------------------------
 def load_bruker_kspace(series_dir: Path,
                         matrix_ro_hint: Optional[int] = None,
                         spokes: Optional[int] = None,
@@ -333,9 +333,9 @@ def load_bruker_kspace(series_dir: Path,
     dbg('final k-space shape:', ksp.shape, '(RO, Spokes, Coils)')
     return ksp
 
-# =========================================================
-# BART wrappers with robust GPU fallback
-# =========================================================
+# ------------------------
+# BART wrappers with GPU fallback
+# ------------------------
 def _bart_path() -> str:
     bart = shutil.which('bart')
     if not bart:
@@ -343,78 +343,64 @@ def _bart_path() -> str:
     return bart
 
 def _bart_supports_gpu(tool: str) -> bool:
-    """Return True if we should try -g for this tool (cached)."""
     global BART_GPU_AVAILABLE
     if BART_GPU_AVAILABLE is False:
         return False
     if BART_GPU_AVAILABLE is True:
         return True
-    # Unknown yet: try a harmless '-h' with -g; if it crashes, mark False
+    # Probe once
     bart = _bart_path()
     try:
-        # Most tools accept '-h'; if it errors with GPU disabled, it will abort.
         subprocess.run([bart, tool, '-g', '-h'], stdout=subprocess.DEVNULL,
                        stderr=subprocess.PIPE, check=True)
         BART_GPU_AVAILABLE = True
     except subprocess.CalledProcessError as e:
         msg = (e.stderr or b'').decode(errors='ignore')
-        if 'compiled without GPU' in msg or 'unknown option g' in msg or 'invalid option -- \'g\'' in msg:
+        if 'compiled without GPU' in msg or "invalid option -- 'g'" in msg or 'unknown option g' in msg:
             BART_GPU_AVAILABLE = False
         else:
-            # If some other error, assume GPU not available to be safe
             BART_GPU_AVAILABLE = False
     except Exception:
         BART_GPU_AVAILABLE = False
     return BART_GPU_AVAILABLE
 
 def _run_bart(tool: str, args: List[str], gpu: bool):
-    """Run a single BART tool with optional -g and safe CPU fallback."""
     bart = _bart_path()
-    # Try GPU if requested and supported
+    # Try GPU
     if gpu and _bart_supports_gpu(tool):
         cmd = [bart, tool, '-g'] + args
         print('[bart]', ' '.join(cmd))
         try:
             subprocess.run(cmd, check=True)
             return
-        except subprocess.CalledProcessError as e:
-            # If GPU not supported at runtime, fall back to CPU
-            msg = (e.stderr or b'').decode(errors='ignore') if hasattr(e, 'stderr') else ''
-            if ('compiled without GPU' in msg) or ('invalid option -- \'g\'' in msg) or ('unknown option g' in msg):
-                print('[warn] BART GPU not available; falling back to CPU.')
-                global BART_GPU_AVAILABLE
-                BART_GPU_AVAILABLE = False
-            else:
-                # Retry once on CPU anyway
-                print('[warn] BART GPU attempt failed; retrying on CPU.')
+        except subprocess.CalledProcessError:
+            print('[warn] BART GPU attempt failed; retrying on CPU.')
         except Exception:
             print('[warn] BART GPU attempt failed; retrying on CPU.')
-
-    # CPU path
+    # CPU
     cmd = [bart, tool] + args
     print('[bart]', ' '.join(cmd))
     subprocess.run(cmd, check=True)
 
 def run_bart(cmd: List[str], gpu: bool = False):
-    """
-    cmd like ['nufft', '-a', '-t', traj, ksp, out]
-    """
     if not cmd:
         raise ValueError("Empty BART command")
-    tool, args = cmd[0], cmd[1:]
-    _run_bart(tool, args, gpu=gpu)
+    _run_bart(cmd[0], cmd[1:], gpu=gpu)
 
-# =========================================================
-# DCF (pipe-style iterative)
-# =========================================================
+# ------------------------
+# DCF (pipe-style iterative): shape-safe
+# ------------------------
 def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int] = (256, 256, 256), gpu: bool = False) -> np.ndarray:
-    """Simple iterative DCF (Pipe): w_{n+1} = w_n / (G^H G w_n) on ones."""
+    """Simple iterative DCF (Pipe): w_{n+1} = w_n / (G^H G w_n) on ones.
+
+    Ensures weight array is shaped to match `kones` for BART `fmac`.
+    """
     ro, sp = traj.shape[1], traj.shape[2]
     w = np.ones((ro, sp), dtype=np.float32)
 
     bart = shutil.which('bart')
     if bart is None:
-        # Fallback: occupancy-based
+        # Fallback: occupancy
         kx = np.rint(traj[0] - traj[0].min()).astype(int)
         ky = np.rint(traj[1] - traj[1].min()).astype(int)
         kz = np.rint(traj[2] - traj[2].min()).astype(int)
@@ -431,32 +417,50 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
 
     try:
         for _ in range(iters):
+            # Forward NUFFT of ones -> k-space ones (kones)
             ones = np.ones(grid_shape, dtype=np.complex64)
             write_cfl(tmp / 'ones', ones)
             save_traj_for_bart(traj, tmp / 'traj')
-
             _run_bart('nufft', ['-t', str(tmp / 'traj'), str(tmp / 'ones'), str(tmp / 'kones')], gpu=gpu)
-            write_cfl(tmp / 'w', w.astype(np.complex64))
-            # fmac: keep CPU for portability
-            subprocess.run([bart, 'fmac', str(tmp / 'kones'), str(tmp / 'w'), str(tmp / 'kw')], check=True)
+
+            # Read kones to discover its exact BART dims
+            kones = read_cfl(tmp / 'kones')
+
+            # Expand w to the same shape as kones for fmac
+            # Make w_full with shape == kones.shape, by adding singleton dims after first two axes
+            extra_dims = kones.ndim - 2
+            w_full = w.reshape(ro, sp, *([1] * max(0, extra_dims))).astype(np.complex64)
+            # If kones has any size-1 axes not at the end, broadcasting still works via numpy; write exact dims to CFL
+            write_cfl(tmp / 'w', w_full)
+
+            # Multiply in k-space
+            _run_bart('fmac', [str(tmp / 'kones'), str(tmp / 'w'), str(tmp / 'kw')], gpu=False)
+
+            # Backproject: A^H (kw)
             _run_bart('nufft', ['-a', '-t', str(tmp / 'traj'), str(tmp / 'kw'), str(tmp / 'backproj')], gpu=gpu)
 
+            # Forward again: A (A^H(kw)) to get denom
             back = read_cfl(tmp / 'backproj')
             write_cfl(tmp / 'back', back)
             _run_bart('nufft', ['-t', str(tmp / 'traj'), str(tmp / 'back'), str(tmp / 'kback')], gpu=gpu)
 
             kback = read_cfl(tmp / 'kback')
             denom = np.abs(kback).astype(np.float32) + 1e-6
+            # Shrink denom to (ro, sp) if needed by averaging across extra dims
+            while denom.ndim > 2:
+                denom = denom.mean(axis=-1)
             w = w / denom
 
         return w.astype(np.float32)
     finally:
-        try: shutil.rmtree(tmp)
-        except Exception: pass
+        try:
+            shutil.rmtree(tmp)
+        except Exception:
+            pass
 
-# =========================================================
+# ------------------------
 # Recon flows
-# =========================================================
+# ------------------------
 def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int] = None, gpu: bool = False):
     cmd = ['ecalib']
     if calib is not None:
@@ -490,12 +494,20 @@ def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
     cmd += ['-t', str(traj_base), str(ksp_base), str(maps), str(out_base)]
     run_bart(cmd, gpu=gpu)
 
-# =========================================================
-# CLI
-# =========================================================
+# ------------------------
+# BART run helper
+# ------------------------
 def bart_exists() -> bool:
     return shutil.which('bart') is not None
 
+def run_bart(cmd: List[str], gpu: bool = False):
+    if not cmd:
+        raise ValueError("Empty BART command")
+    _run_bart(cmd[0], cmd[1:], gpu=gpu)
+
+# ------------------------
+# CLI
+# ------------------------
 def main():
     global DEBUG
     ap = argparse.ArgumentParser(description='Bruker 3D radial reconstruction using BART')
@@ -579,15 +591,13 @@ def main():
     if dcf_mode.startswith('pipe'):
         nit = 10
         if ':' in dcf_mode:
-            try:
-                nit = int(dcf_mode.split(':', 1)[1])
-            except Exception:
-                pass
+            try: nit = int(dcf_mode.split(':', 1)[1])
+            except Exception: pass
         dcf = dcf_pipe(traj, iters=nit, grid_shape=(NX, NY, NZ), gpu=args.gpu)
         dcf_base = out_base.with_name(out_base.name + '_dcf')
         write_cfl(dcf_base, dcf.astype(np.complex64))
         kspw_base = out_base.with_name(out_base.name + '_kspw')
-        # fmac on CPU for maximal compatibility
+        # Multiply k-space by weights (CPU for max compatibility)
         subprocess.run([_bart_path(), 'fmac', str(ksp_base), str(dcf_base), str(kspw_base)], check=True)
         ksp_in = kspw_base
     else:
