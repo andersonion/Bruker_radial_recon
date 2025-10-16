@@ -7,8 +7,10 @@ Clean Python wrapper for Bruker 3D radial reconstruction using **BART**.
 Highlights
 - Bruker-centric CLI (point to an experiment dir containing `fid`, `method`, `acqp`),
 - **Trajectory read-from-file by default** (`traj.cfl/.hdr` or `traj.npy`) with optional golden-angle generator,
-- **Automatic coil-count inference**: header (`PVM_EncNReceivers`) or fallback from FID length when RO & spokes are known,
-- **GPU toggle** (`--gpu`) adds global `bart -g`,
+- **Automatic inference of readout & spokes from metadata** (and from FID length if needed),
+- **Automatic coil-count inference** (header `PVM_EncNReceivers` then FID length),
+- Handles **blocked readout padding** (e.g., true RO=420 stored in blocks of 512; trims to true RO),
+- **GPU toggle** (`--gpu`) adds global `bart -g` to all calls,
 - **DCF**: pipe-style iterative estimator,
 - Recon: adjoint NUFFT (+SoS / SENSE) or iterative PICS (CG-SENSE with optional L1-wavelets),
 - Export NIfTI via `bart toimg`,
@@ -20,8 +22,6 @@ Usage examples
 python bruker_radial_bart.py \
   --series /path/to/Bruker/2 \
   --matrix 256 256 256 \
-  --spokes 200000 \
-  --readout 256 \
   --traj file \
   --dcf pipe:10 \
   --combine sos \
@@ -32,8 +32,6 @@ python bruker_radial_bart.py \
 python bruker_radial_bart.py \
   --series /path/to/Bruker/2 \
   --matrix 256 256 256 \
-  --spokes 200000 \
-  --readout 256 \
   --traj file \
   --dcf pipe:10 \
   --iterative \
@@ -71,8 +69,10 @@ def dbg(*args):
 
 def _write_hdr(path: Path, dims: Tuple[int, ...]):
     with open(path, 'w') as f:
-        f.write('# Dimensions\\n')
-        f.write(' '.join(str(d) for d in dims) + '\\n')
+        f.write('# Dimensions
+')
+        f.write(' '.join(str(d) for d in dims) + '
+')
 
 
 def write_cfl(name: Path, array: np.ndarray):
@@ -110,12 +110,36 @@ def _read_text_kv(path: Path) -> dict:
     return d
 
 
+def _get_int_from_headers(keys: list[str], srcs: list[dict]) -> Optional[int]:
+    for key in keys:
+        for src in srcs:
+            if key in src:
+                try:
+                    txt = src[key]
+                    # pull first integer (robust to braces and signs)
+                    num = ''
+                    tmp = ''
+                    for ch in txt:
+                        if ch.isdigit() or (ch in '+-' and not tmp):
+                            tmp += ch
+                        elif tmp:
+                            num = tmp
+                            break
+                    if not num and tmp:
+                        num = tmp
+                    if num:
+                        return int(num)
+                except Exception:
+                    pass
+    return None
+
+
 def _parse_acq_size(method_txt: dict, acqp_txt: dict) -> Optional[Tuple[int, int, int]]:
     # Try to parse ACQ_size or PVM_Matrix
     for key in ('ACQ_size', 'PVM_Matrix'):
         if key in method_txt:
             try:
-                nums = [int(x) for x in method_txt[key].replace('{', ' ').replace('}', ' ').split() if x.lstrip('+-').isdigit()]
+                nums = [int(x) for x in method_txt[key].replace('{', ' ').replace('}', ' ').replace('(', ' ').replace(')', ' ').split() if x.lstrip('+-').isdigit()]
                 if len(nums) >= 3:
                     return (nums[0], nums[1], nums[2])
             except Exception:
@@ -161,7 +185,7 @@ def save_traj_for_bart(traj: np.ndarray, out_base: Path):
     write_cfl(out_base, traj)
 
 # -----------------------------
-# K-space loader (auto coils inference)
+# K-space loader (auto inference of RO/Spokes/Coils, blocked-RO aware)
 # -----------------------------
 
 def load_bruker_kspace(series_dir: Path,
@@ -177,7 +201,7 @@ def load_bruker_kspace(series_dir: Path,
       1) series_dir/ksp.cfl (BART format)
       2) series_dir/ksp.npy  (numpy complex64) with shape (RO, Spokes, Coils)
       3) If `from_fid` OR a `fid` exists: attempt raw read using headers + hints,
-         auto-infer coils from header or FID size when possible.
+         auto-infer readout, spokes, coils; handle blocked readout and trim.
     """
     series_dir = Path(series_dir)
     dbg('series_dir =', series_dir)
@@ -212,12 +236,25 @@ def load_bruker_kspace(series_dir: Path,
     method_txt = _read_text_kv(series_dir / 'method'); dbg('have method?:', bool(method_txt))
     acqp_txt   = _read_text_kv(series_dir / 'acqp');   dbg('have acqp?:', bool(acqp_txt))
 
-    # Infer RO (and maybe spokes)
-    if readout is None or spokes is None:
-        dbg('inferring readout/spokes from headers…')
+    # Try to infer readout & spokes from headers first
+    if readout is None:
+        ro_hdr = _get_int_from_headers(['ACQ_size', 'PVM_Matrix'], [method_txt])
+        # ACQ_size is a triplet; fallback to pick first from parse
         acq = _parse_acq_size(method_txt, acqp_txt)
-        if acq and readout is None:
+        if acq:
             readout = acq[0]
+        elif ro_hdr:
+            readout = ro_hdr
+        dbg('readout (hdr) =', readout)
+
+    if spokes is None:
+        sp_hdr = _get_int_from_headers([
+            'PVM_EncNProjections', 'PVM_EncNProj', 'PVM_EncSteps1', 'NPROJ',
+            'PVM_RadialSpokes', 'RadialSpokes', 'PVM_EncNShots'
+        ], [method_txt, acqp_txt])
+        if sp_hdr:
+            spokes = sp_hdr
+        dbg('spokes (hdr) =', spokes)
 
     # Endianness from BYTORDA
     if 'BYTORDA' in acqp_txt:
@@ -243,17 +280,12 @@ def load_bruker_kspace(series_dir: Path,
             coils_hdr = int(''.join(ch for ch in method_txt['PVM_EncNReceivers'] if ch.lstrip('+-').isdigit()))
             if coils_hdr > 0:
                 coils = coils_hdr
-                dbg('coils from header =', coils)
+                dbg('coils (hdr) =', coils)
         except Exception:
             pass
 
-    # Read raw fid
-    dtype_map = {
-        'int16':   np.int16,
-        'int32':   np.int32,
-        'float32': np.float32,
-        'float64': np.float64,
-    }
+    # ---- read raw fid ----
+    dtype_map = {'int16': np.int16, 'int32': np.int32, 'float32': np.float32, 'float64': np.float64}
     if fid_dtype not in dtype_map:
         raise ValueError('--fid-dtype must be one of int16,int32,float32,float64')
     if not fid_path.exists():
@@ -268,44 +300,88 @@ def load_bruker_kspace(series_dir: Path,
         raise ValueError('FID length not even: cannot form complex pairs')
     raw = raw.astype(np.float32)
     cpx = raw.view(np.complex64)
+    total_cplx = cpx.size
 
-    # AUTO-INFER coils from FID length if still unknown
-    if (coils is None) and (readout is not None) and (spokes is not None) and (readout * spokes) > 0:
-        if (cpx.size % (readout * spokes)) == 0:
-            coils = cpx.size // (readout * spokes)
-            dbg('coils from FID length =', coils)
+    # ---- factor out extra dimensions (echoes/reps/averages/slices/…) ----
+    extras = {
+        'echoes':     _get_int_from_headers(['NECHOES', 'ACQ_n_echo_images', 'PVM_NEchoImages'], [method_txt, acqp_txt]) or 1,
+        'reps':       _get_int_from_headers(['PVM_NRepetitions', 'NR'], [method_txt, acqp_txt]) or 1,
+        'averages':   _get_int_from_headers(['PVM_NAverages', 'NA'], [method_txt, acqp_txt]) or 1,
+        'slices':     _get_int_from_headers(['NSLICES', 'PVM_SPackArrNSlices'], [method_txt, acqp_txt]) or 1,
+    }
+    other_dims = 1
+    for name, val in extras.items():
+        if isinstance(val, int) and val > 1:
+            other_dims *= val
+    dbg('other_dims factor =', other_dims, extras)
 
-    if readout is None or spokes is None or coils is None:
-        raise ValueError('Cannot infer (readout, spokes, coils); pass --readout/--spokes/--coils or ensure headers are present')
+    # ---- coils fallback from FID length if still unknown ----
+    if coils is None and readout is not None and (readout > 0):
+        if other_dims > 1 and (total_cplx % (readout * other_dims) == 0):
+            coils = total_cplx // (readout * other_dims)
+            dbg('coils (fid/other_dims) =', coils)
+        elif (total_cplx % readout) == 0:
+            coils = max(1, total_cplx // readout)
+            dbg('coils (fid/fallback) =', coils)
 
-    expected = readout * spokes * coils
-    dbg('complex samples =', cpx.size, 'expected =', expected)
-    if cpx.size != expected:
-        # --- try to auto-adjust one dimension to fit the FID length ---
-        adjusted = False
-        # prefer adjusting spokes if RO & coils are known (typical when user supplies RO)
-        if readout and coils and (cpx.size % (readout * coils) == 0):
-            spokes = cpx.size // (readout * coils)
-            adjusted = True
-            dbg('auto-adjust: spokes ->', spokes)
-        # else try adjust coils if RO & spokes known
-        elif readout and spokes and (cpx.size % (readout * spokes) == 0):
-            coils = cpx.size // (readout * spokes)
-            adjusted = True
-            dbg('auto-adjust: coils ->', coils)
-        # else try adjust readout as last resort
-        elif spokes and coils and (cpx.size % (spokes * coils) == 0):
-            readout = cpx.size // (spokes * coils)
-            adjusted = True
-            dbg('auto-adjust: readout ->', readout)
+    if coils is None or coils <= 0:
+        raise ValueError('Cannot infer coils from headers or FID length')
 
-        if adjusted:
-            expected = readout * spokes * coils
-            dbg('after auto-adjust expected =', expected)
-        if (not adjusted) or (cpx.size != expected):
-            raise ValueError(f'FID size mismatch: have {cpx.size}, expected {expected} (ro*sp*coils)')
+    if total_cplx % (coils * other_dims) != 0:
+        raise ValueError('FID length not divisible by coils*other_dims; unknown packing')
 
-    return np.reshape(cpx, (readout, spokes, coils), order='F')
+    # Collapse extras and coils to work with (stored_ro * spokes) per coil
+    per_coil_total = total_cplx // (coils * other_dims)  # = stored_ro * spokes
+    dbg('per_coil_total (stored_ro*spokes) =', per_coil_total)
+
+    # ---- handle blocked readout (e.g., RO=420 stored in blocks of 512) ----
+    stored_ro = None
+    spokes_inf = None
+
+    # If headers specify spokes and it divides, use it to get stored_ro
+    if spokes is not None and spokes > 0 and per_coil_total % spokes == 0:
+        stored_ro = per_coil_total // spokes
+        dbg('using header spokes -> stored_ro =', stored_ro)
+    else:
+        # Try common block sizes (prefer >= requested readout)
+        BLOCKS = [128,160,192,200,224,240,256,288,320,352,384,400,416,420,432,448,480,496,512,544,560,576,608,640,672,704,736,768,800,832,896,960,992,1024]
+        req_ro = readout or 1
+        candidates = [b for b in BLOCKS if b >= req_ro] + [per_coil_total]  # allow exact fit
+        for b in candidates:
+            if per_coil_total % b == 0:
+                stored_ro = b
+                spokes_inf = per_coil_total // b
+                dbg('picked stored_ro block =', stored_ro, ' -> spokes =', spokes_inf)
+                break
+        if stored_ro is None and readout and per_coil_total % readout == 0:
+            stored_ro = readout
+            spokes_inf = per_coil_total // readout
+            dbg('fallback no-padding: stored_ro = readout -> spokes =', spokes_inf)
+
+    if stored_ro is None:
+        raise ValueError('Could not factor FID into (stored_ro, spokes)')
+
+    if spokes_inf is None:
+        spokes_inf = spokes
+    if spokes_inf is None or spokes_inf <= 0:
+        raise ValueError('Could not determine spokes from FID length or headers')
+
+    # Rebuild total spokes including extra dims we collapsed
+    spokes_final = spokes_inf * other_dims
+
+    # Validate length
+    if stored_ro * spokes_final * coils != total_cplx:
+        raise ValueError('Internal factoring error: stored_ro*spokes_final*coils != FID length')
+
+    # Reshape to (stored_ro, spokes_final, coils) and trim block padding down to true readout
+    arr_blk = np.reshape(cpx, (stored_ro, spokes_final, coils), order='F')
+    if readout is not None and stored_ro >= readout:
+        arr = arr_blk[:readout, :, :]
+        dbg('trimmed RO from', stored_ro, 'to', readout)
+    else:
+        arr = arr_blk
+
+    return arr
 
 # -----------------------------
 # DCF (pipe-style iterative)
@@ -438,8 +514,8 @@ def main():
     ap.add_argument('--series', type=Path, required=True, help='Path to Bruker experiment dir (contains fid/method/acqp or ksp.*)')
     ap.add_argument('--out', type=Path, required=True, help='Output basename (no extension) for BART/NIfTI')
     ap.add_argument('--matrix', type=int, nargs=3, required=True, metavar=('NX','NY','NZ'))
-    ap.add_argument('--spokes', type=int, required=True)
-    ap.add_argument('--readout', type=int, required=True)
+    ap.add_argument('--spokes', type=int, default=None, help='(Optional) Number of spokes; inferred from headers/FID if omitted')
+    ap.add_argument('--readout', type=int, default=None, help='(Optional) Readout samples; inferred from headers/FID if omitted')
     ap.add_argument('--traj', choices=['golden', 'file'], default='file')
     ap.add_argument('--traj-file', type=Path, help='If --traj file, path to traj.cfl/.hdr or traj.npy (shape (3,RO,Spokes))')
     ap.add_argument('--dcf', type=str, default='none', help='DCF mode: none | pipe:Niters')
@@ -467,14 +543,13 @@ def main():
     series_dir: Path = args.series
     out_base: Path = args.out
     nx, ny, nz = args.matrix
-    ro = args.readout
-    sp = args.spokes
 
-    # ---- k-space (readout, spokes, coils)
-    ksp = load_bruker_kspace(series_dir, spokes=sp, readout=ro, coils=args.coils,
+    # ---- k-space (readout, spokes, coils) — fully auto if not provided
+    ksp = load_bruker_kspace(series_dir, spokes=args.spokes, readout=args.readout, coils=args.coils,
                              from_fid=args.from_fid, fid_dtype=args.fid_dtype, fid_endian=args.fid_endian)
-    if ksp.shape[0] != ro or ksp.shape[1] != sp:
-        raise ValueError(f'k-space shape mismatch: got {ksp.shape}, expected (readout={ro}, spokes={sp}, coils)')
+
+    # Capture inferred dims
+    ro, sp, nc = ksp.shape
 
     write_cfl(out_base.with_name(out_base.name + '_ksp'), ksp)  # dims: RO, Spokes, Coils
 
