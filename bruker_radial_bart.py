@@ -9,7 +9,7 @@ Full Python wrapper for Bruker 3D radial MRI reconstruction using BART.
 - Handles blocked readout padding (e.g., true RO=420 stored as 512)
 - Trajectory source: reads Bruker `$series/traj` by default; falls back to `--traj-file`; if none, auto-generates golden-angle
 - Optional DCF (pipe-style)
-- GPU toggle (`--gpu` adds global `-g`)
+- GPU toggle: inserts `-g` **after** the subcommand for GPU-aware tools (no global `bart -g`)
 - Recon: adjoint NUFFT + SoS/SENSE, or iterative PICS (CG-SENSE + optional wavelets)
 - Optional NIfTI export (`bart toimg`)
 - `_write_hdr` uses proper '\n' newlines; `.cfl` writer ensures Fortran-contiguous buffer
@@ -23,16 +23,15 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 import numpy as np
 
 # =========================================================
 # Debug
 # =========================================================
 DEBUG = False
-
-def dbg(*args):
-    if DEBUG:
+def dbg(*args): 
+    if DEBUG: 
         print('[debug]', *args)
 
 # =========================================================
@@ -88,7 +87,7 @@ def _parse_acq_size(method_txt: dict, acqp_txt: dict) -> Optional[Tuple[int, int
                 pass
     return None
 
-def _get_int_from_headers(keys: list[str], srcs: list[dict]) -> Optional[int]:
+def _get_int_from_headers(keys: List[str], srcs: List[dict]) -> Optional[int]:
     for key in keys:
         for src in srcs:
             if key in src:
@@ -355,14 +354,17 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
         sample_counts = hist[kx, ky, kz] + 1e-6
         return (1.0 / sample_counts).astype(np.float32)
 
-    tmp = Path('./.tmp_bart_dcf')
-    tmp.mkdir(exist_ok=True)
+    tmp = Path('./.tmp_bart_dcf'); tmp.mkdir(exist_ok=True)
+
+    GPU_TOOLS = {'nufft', 'pics', 'rss', 'ecalib', 'toimg'}  # safe set; we will only add -g for these
 
     def bart_cmd(*args):
-        base = [bart]
-        if gpu:
-            base.append('-g')
-        return base + list(args)
+        # args: (tool, tool-args...)
+        tool = args[0]
+        tool_args = list(args[1:])
+        if gpu and tool in GPU_TOOLS:
+            tool_args = ['-g'] + tool_args
+        return [bart, tool] + tool_args
 
     try:
         for _ in range(iters):
@@ -371,7 +373,8 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
             save_traj_for_bart(traj, tmp / 'traj')
             subprocess.run(bart_cmd('nufft', '-t', str(tmp / 'traj'), str(tmp / 'ones'), str(tmp / 'kones')), check=True)
             write_cfl(tmp / 'w', w.astype(np.complex64))
-            subprocess.run(bart_cmd('fmac', str(tmp / 'kones'), str(tmp / 'w'), str(tmp / 'kw')), check=True)
+            # fmac typically doesn't need -g; keep CPU for portability
+            subprocess.run([bart, 'fmac', str(tmp / 'kones'), str(tmp / 'w'), str(tmp / 'kw')], check=True)
             subprocess.run(bart_cmd('nufft', '-a', '-t', str(tmp / 'traj'), str(tmp / 'kw'), str(tmp / 'backproj')), check=True)
             back = read_cfl(tmp / 'backproj')
             write_cfl(tmp / 'back', back)
@@ -381,10 +384,8 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
             w = w / denom
         return w.astype(np.float32)
     finally:
-        try:
-            shutil.rmtree(tmp)
-        except Exception:
-            pass
+        try: shutil.rmtree(tmp)
+        except Exception: pass
 
 # =========================================================
 # BART wrappers
@@ -392,14 +393,22 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
 def bart_exists() -> bool:
     return shutil.which('bart') is not None
 
-def run_bart(cmd: list[str], gpu: bool = False):
+def run_bart(cmd: List[str], gpu: bool = False):
+    """
+    cmd like ['nufft', '-a', '-t', traj, ksp, out]
+    Insert '-g' *after* the tool name for GPU-aware tools.
+    """
     bart = shutil.which('bart')
     if not bart:
-        raise RuntimeError('BART not found in PATH')
-    full = [bart]
-    if gpu:
-        full.append('-g')
-    full += cmd
+        raise RuntimeError("BART not found in PATH")
+
+    GPU_TOOLS = {'nufft', 'pics', 'rss', 'ecalib', 'toimg'}
+    tool = cmd[0]
+    args = cmd[1:]
+    if gpu and tool in GPU_TOOLS:
+        args = ['-g'] + args
+
+    full = [bart, tool] + args
     print('[bart]', ' '.join(full))
     subprocess.run(full, check=True)
 
@@ -444,7 +453,6 @@ def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
 # =========================================================
 def main():
     global DEBUG
-
     ap = argparse.ArgumentParser(description='Bruker 3D radial reconstruction using BART')
     ap.add_argument('--series', type=Path, required=True, help='Bruker experiment dir (contains fid/method/acqp or ksp.*)')
     ap.add_argument('--out', type=Path, required=True, help='Output basename (no extension) for BART/NIfTI')
@@ -458,9 +466,9 @@ def main():
     ap.add_argument('--iters', type=int, default=40, help='Iterations for iterative recon')
     ap.add_argument('--wavelets', type=int, default=None, help='Wavelet scale parameter (optional)')
     ap.add_argument('--export-nifti', action='store_true', help='Export NIfTI via bart toimg')
-    ap.add_argument('--gpu', action='store_true', help='Enable BART GPU (adds global -g)')
+    ap.add_argument('--gpu', action='store_true', help='Enable GPU on GPU-aware tools (nufft, pics, rss, ecalib, toimg)')
     ap.add_argument('--debug', action='store_true', help='Print header inference and file checks')
-    # optional overrides if you really want to force dims
+    # optional manual overrides
     ap.add_argument('--readout', type=int, default=None, help='Override readout samples')
     ap.add_argument('--spokes', type=int, default=None, help='Override number of spokes')
     ap.add_argument('--coils', type=int, default=None, help='Override number of coils')
@@ -478,7 +486,7 @@ def main():
     out_base: Path = args.out
     NX, NY, NZ = args.matrix
 
-    # ---- k-space (readout, spokes, coils) — fully auto if not provided
+    # ---- k-space
     ksp = load_bruker_kspace(series_dir,
                              matrix_ro_hint=NX,
                              spokes=args.spokes,
@@ -486,16 +494,12 @@ def main():
                              coils=args.coils,
                              fid_dtype=(args.fid_dtype or 'int32'),
                              fid_endian=(args.fid_endian or 'little'))
-
-    # Capture inferred dims
     ro, sp, nc = ksp.shape
     print(f"[info] Loaded k-space: RO={ro}, Spokes={sp}, Coils={nc}")
-
     ksp_base = out_base.with_name(out_base.name + '_ksp')
-    write_cfl(ksp_base, ksp)  # dims: RO, Spokes, Coils
+    write_cfl(ksp_base, ksp)
 
     # ---- trajectory (3, ro, sp)
-    # Priority: Bruker raw 'traj' file in series dir -> user --traj-file -> golden (fallback)
     bruker_traj = _read_bruker_traj(series_dir, ro, sp)
     if bruker_traj is not None:
         traj = bruker_traj
@@ -522,7 +526,6 @@ def main():
 
     if traj.shape != (3, ro, sp):
         raise ValueError(f'trajectory must have shape (3,{ro},{sp}); got {traj.shape}')
-
     traj_base = out_base.with_name(out_base.name + '_traj')
     save_traj_for_bart(traj, traj_base)
 
@@ -539,26 +542,25 @@ def main():
         dcf_base = out_base.with_name(out_base.name + '_dcf')
         write_cfl(dcf_base, dcf.astype(np.complex64))
         kspw_base = out_base.with_name(out_base.name + '_kspw')
-        run_bart(['fmac', str(ksp_base), str(dcf_base), str(kspw_base)], gpu=args.gpu)
+        run_bart(['fmac', str(ksp_base), str(dcf_base), str(kspw_base)], gpu=False)  # keep CPU for max compatibility
         ksp_in = kspw_base
     else:
         ksp_in = ksp_base
 
     # ---- reconstruction
     if args.iterative:
-        recon_iterative(traj_base, ksp_in, out_base.with_name(out_base.name + '_recon'),
-                        lam=args.lam, iters=args.iters, wavelets=args.wavelets, gpu=args.gpu)
-        img_base = out_base.with_name(out_base.name + '_recon')
+        out_img = out_base.with_name(out_base.name + '_recon')
+        recon_iterative(traj_base, ksp_in, out_img, lam=args.lam, iters=args.iters, wavelets=args.wavelets, gpu=args.gpu)
     else:
-        recon_adjoint(traj_base, ksp_in, args.combine, out_base.with_name(out_base.name + '_adj'), gpu=args.gpu)
-        img_base = out_base.with_name(out_base.name + '_adj')
+        out_img = out_base.with_name(out_base.name + '_adj')
+        recon_adjoint(traj_base, ksp_in, args.combine, out_img, gpu=args.gpu)
 
     # ---- export
     if args.export_nifti:
-        run_bart(['toimg', str(img_base), str(out_base)], gpu=args.gpu)
+        run_bart(['toimg', str(out_img), str(out_base)], gpu=args.gpu)
         print(f'Wrote NIfTI: {out_base}.nii')
     else:
-        print(f'Recon complete. BART base: {img_base} (.cfl/.hdr)')
+        print(f'Recon complete. BART base: {out_img} (.cfl/.hdr)')
 
 if __name__ == '__main__':
     main()
