@@ -7,13 +7,12 @@ Full Python wrapper for Bruker 3D radial MRI reconstruction using BART.
 - Reads Bruker `fid` or pre-saved `ksp.cfl/.hdr` or `ksp.npy`
 - Automatically infers readout, spokes, and coils from headers/FID
 - Handles blocked readout padding (e.g., true RO=420 stored as 512)
-- **Trajectory source**: reads Bruker `$series/traj` by default; falls back to `--traj-file`; if none, auto-generates golden-angle
+- Trajectory source: reads Bruker `$series/traj` by default; falls back to `--traj-file`; if none, auto-generates golden-angle
 - Optional DCF (pipe-style)
 - GPU toggle (`--gpu` adds global `-g`)
 - Recon: adjoint NUFFT + SoS/SENSE, or iterative PICS (CG-SENSE + optional wavelets)
 - Optional NIfTI export (`bart toimg`)
-- `_write_hdr` uses proper `
-` newlines; `.cfl` writer ensures Fortran-contiguous buffer
+- `_write_hdr` uses proper '\n' newlines; `.cfl` writer ensures Fortran-contiguous buffer
 """
 
 from __future__ import annotations
@@ -39,14 +38,10 @@ def dbg(*args):
 # =========================================================
 # BART .cfl I/O
 # =========================================================
-
 def _write_hdr(path: Path, dims: Tuple[int, ...]):
     with open(path, 'w') as f:
-        f.write('# Dimensions
-')
-        f.write(' '.join(str(d) for d in dims) + '
-')
-
+        f.write('# Dimensions\n')
+        f.write(' '.join(str(d) for d in dims) + '\n')
 
 def write_cfl(name: Path, array: np.ndarray):
     """Write array to BART .cfl/.hdr (column-major)."""
@@ -56,7 +51,6 @@ def write_cfl(name: Path, array: np.ndarray):
     _write_hdr(base.with_suffix('.hdr'), tuple(dims))
     arrF = np.asarray(array, dtype=np.complex64, order='F')
     arrF.ravel(order='F').view(np.float32).tofile(base.with_suffix('.cfl'))
-
 
 def read_cfl(name: Path) -> np.ndarray:
     name = Path(name)
@@ -71,7 +65,6 @@ def read_cfl(name: Path) -> np.ndarray:
 # =========================================================
 # Bruker header helpers
 # =========================================================
-
 def _read_text_kv(path: Path) -> Dict[str, str]:
     d: Dict[str, str] = {}
     if not path.exists():
@@ -81,7 +74,6 @@ def _read_text_kv(path: Path) -> Dict[str, str]:
             k, v = line.split('=', 1)
             d[k.strip().strip('#$')] = v.strip()
     return d
-
 
 def _parse_acq_size(method_txt: dict, acqp_txt: dict) -> Optional[Tuple[int, int, int]]:
     # Try to parse ACQ_size or PVM_Matrix (three ints)
@@ -95,7 +87,6 @@ def _parse_acq_size(method_txt: dict, acqp_txt: dict) -> Optional[Tuple[int, int
             except Exception:
                 pass
     return None
-
 
 def _get_int_from_headers(keys: list[str], srcs: list[dict]) -> Optional[int]:
     for key in keys:
@@ -128,7 +119,6 @@ class TrajSpec:
     spokes: int
     matrix: Tuple[int, int, int]
 
-
 def golden_angle_3d(spec: TrajSpec) -> np.ndarray:
     ro, sp = spec.readout, spec.spokes
     nx, ny, nz = spec.matrix
@@ -143,11 +133,9 @@ def golden_angle_3d(spec: TrajSpec) -> np.ndarray:
     xyz = np.einsum('sr,sd->drs', radii[None, :], dirs)  # (3, ro, sp)
     return xyz.astype(np.float32)
 
-
 def save_traj_for_bart(traj: np.ndarray, out_base: Path):
     assert traj.shape[0] == 3, "Trajectory must have leading dim=3"
     write_cfl(out_base, traj)
-
 
 def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray]:
     """Read Bruker-provided trajectory file named exactly 'traj' in series_dir.
@@ -178,18 +166,17 @@ def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray
         pass
     # try ASCII
     try:
-        # quick path: whitespace list
-        txt = tpath.read_text(errors='ignore').strip().split()
-        vals = np.array([float(x) for x in txt], dtype=np.float32)
+        toks = tpath.read_text(errors='ignore').strip().split()
+        vals = np.array([float(x) for x in toks], dtype=np.float32)
         if vals.size == 3 * ro * sp:
             return vals.reshape(3, ro, sp, order='F')
         # structured 3 columns
         try:
             data = np.loadtxt(tpath, dtype=np.float32)
             if data.ndim == 2:
-                if data.shape == (ro*sp, 3):
+                if data.shape == (ro * sp, 3):
                     return data.T.reshape(3, ro, sp, order='F')
-                if data.shape == (3, ro*sp):
+                if data.shape == (3, ro * sp):
                     return data.reshape(3, ro, sp, order='F')
         except Exception:
             pass
@@ -200,7 +187,6 @@ def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray
 # =========================================================
 # FID / k-space loader (auto RO/spokes/coils, blocked-RO aware)
 # =========================================================
-
 def load_bruker_kspace(series_dir: Path,
                         matrix_ro_hint: Optional[int] = None,
                         spokes: Optional[int] = None,
@@ -245,6 +231,8 @@ def load_bruker_kspace(series_dir: Path,
 
     # Read FID
     dtype_map = {'int16': np.int16, 'int32': np.int32, 'float32': np.float32, 'float64': np.float64}
+    if fid_dtype not in dtype_map:
+        raise ValueError("--fid-dtype must be one of int16,int32,float32,float64")
     dt = dtype_map[fid_dtype]
     raw = np.fromfile(fid_path, dtype=dt)
     if fid_endian == 'big':
@@ -347,7 +335,6 @@ def load_bruker_kspace(series_dir: Path,
 # =========================================================
 # DCF (pipe-style iterative)
 # =========================================================
-
 def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int] = (256, 256, 256), gpu: bool = False) -> np.ndarray:
     """Simple iterative DCF (Pipe): w_{n+1} = w_n / (G^H G w_n) on ones."""
     ro, sp = traj.shape[1], traj.shape[2]
@@ -402,10 +389,8 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
 # =========================================================
 # BART wrappers
 # =========================================================
-
 def bart_exists() -> bool:
     return shutil.which('bart') is not None
-
 
 def run_bart(cmd: list[str], gpu: bool = False):
     bart = shutil.which('bart')
@@ -421,14 +406,12 @@ def run_bart(cmd: list[str], gpu: bool = False):
 # =========================================================
 # Recon flows
 # =========================================================
-
 def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int] = None, gpu: bool = False):
     cmd = ['ecalib']
     if calib is not None:
         cmd += ['-r', str(calib)]
     cmd += [str(coil_imgs_base), str(out_base)]
     run_bart(cmd, gpu=gpu)
-
 
 def recon_adjoint(traj_base: Path, ksp_base: Path, combine: str, out_base: Path, gpu: bool):
     coil_base = out_base.with_name(out_base.name + '_coil')
@@ -442,14 +425,12 @@ def recon_adjoint(traj_base: Path, ksp_base: Path, combine: str, out_base: Path,
     else:
         raise ValueError('combine must be sos|sens')
 
-
 def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
                     lam: float, iters: int, wavelets: Optional[int], gpu: bool):
     tmpcoil = out_base.with_name(out_base.name + '_coil')
     run_bart(['nufft', '-a', '-t', str(traj_base), str(ksp_base), str(tmpcoil)], gpu=gpu)
     maps = out_base.with_name(out_base.name + '_maps')
     estimate_sens_maps(tmpcoil, maps, gpu=gpu)
-
     cmd = ['pics', '-S', '-i', str(iters)]
     if wavelets is not None:
         cmd += ['-R', f'W:7:{wavelets}:{lam}']
@@ -461,7 +442,6 @@ def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
 # =========================================================
 # CLI
 # =========================================================
-
 def main():
     global DEBUG
 
@@ -480,12 +460,12 @@ def main():
     ap.add_argument('--export-nifti', action='store_true', help='Export NIfTI via bart toimg')
     ap.add_argument('--gpu', action='store_true', help='Enable BART GPU (adds global -g)')
     ap.add_argument('--debug', action='store_true', help='Print header inference and file checks')
-    # raw FID optional overrides
+    # optional overrides if you really want to force dims
     ap.add_argument('--readout', type=int, default=None, help='Override readout samples')
     ap.add_argument('--spokes', type=int, default=None, help='Override number of spokes')
     ap.add_argument('--coils', type=int, default=None, help='Override number of coils')
-    ap.add_argument('--fid-dtype', type=str, default=None, choices=[None, 'int16','int32','float32','float64'])
-    ap.add_argument('--fid-endian', type=str, default=None, choices=[None, 'little','big'])
+    ap.add_argument('--fid-dtype', type=str, default=None, help='Override fid dtype (int16|int32|float32|float64)')
+    ap.add_argument('--fid-endian', type=str, default=None, help='Override fid endian (little|big)')
 
     args = ap.parse_args()
     DEBUG = args.debug
@@ -504,8 +484,8 @@ def main():
                              spokes=args.spokes,
                              readout=args.readout,
                              coils=args.coils,
-                             fid_dtype=args.fid_dtype or 'int32',
-                             fid_endian=args.fid_endian or 'little')
+                             fid_dtype=(args.fid_dtype or 'int32'),
+                             fid_endian=(args.fid_endian or 'little'))
 
     # Capture inferred dims
     ro, sp, nc = ksp.shape
