@@ -5,13 +5,12 @@ bruker_radial_bart.py
 Full Python wrapper for Bruker 3D radial MRI reconstruction using BART.
 
 - Reads Bruker `fid` or pre-saved `ksp.cfl/.hdr` or `ksp.npy`
-- Automatically infers readout, spokes, and coils from headers/FID
-- Handles blocked readout padding (e.g., true RO=420 stored as 512)
-- Trajectory source: reads Bruker `$series/traj` by default; falls back to `--traj-file`; if none, auto-generates golden-angle
-- Optional DCF (pipe-style); weight array is shaped to match BART's k-space dims
-- GPU toggle: attempts `-g` per-tool; if BART lacks GPU support we auto-fallback to CPU
+- Auto-infers readout, spokes, coils (handles blocked readout padding)
+- Trajectory: uses Bruker `$series/traj` by default (bin/ASCII), else `--traj-file`, else golden-angle
+- Optional DCF (Pipe-style); all k-space multiplies done in NumPy (no bart fmac) to avoid dim asserts
+- GPU toggle: tries per-tool `-g`, auto-falls back to CPU if unsupported
 - Recon: adjoint NUFFT + SoS/SENSE, or iterative PICS (CG-SENSE + optional wavelets)
-- Optional NIfTI export (`bart toimg`)
+- Optional NIfTI export
 """
 
 from __future__ import annotations
@@ -33,8 +32,7 @@ def dbg(*args):
     if DEBUG:
         print('[debug]', *args)
 
-# Global cache: whether BART GPU is available
-BART_GPU_AVAILABLE = None  # None unknown, True/False set after first probe
+BART_GPU_AVAILABLE = None  # probe result cached (None unknown, True/False)
 
 # ------------------------
 # BART .cfl I/O
@@ -77,11 +75,10 @@ def _read_text_kv(path: Path) -> Dict[str, str]:
     return d
 
 def _parse_acq_size(method_txt: dict, acqp_txt: dict) -> Optional[Tuple[int, int, int]]:
-    # Try to parse ACQ_size or PVM_Matrix (three ints)
     for key in ('ACQ_size', 'PVM_Matrix'):
         if key in method_txt:
             try:
-                toks = method_txt[key].replace('{', ' ').replace('}', ' ').replace('(', ' ').replace(')', ' ').split()
+                toks = method_txt[key].replace('{',' ').replace('}',' ').replace('(',' ').replace(')',' ').split()
                 nums = [int(x) for x in toks if x.lstrip('+-').isdigit()]
                 if len(nums) >= 3:
                     return nums[0], nums[1], nums[2]
@@ -125,7 +122,7 @@ def golden_angle_3d(spec: TrajSpec) -> np.ndarray:
     nx, ny, nz = spec.matrix
     kmax = 0.5 * max(nx, ny, nz)
     i = np.arange(sp) + 0.5
-    phi = 2.0 * math.pi * i / ((1 + math.sqrt(5)) / 2.0)  # golden ratio spacing
+    phi = 2.0 * math.pi * i / ((1 + math.sqrt(5)) / 2.0)
     cos_theta = 1 - 2 * i / sp
     sin_theta = np.sqrt(np.maximum(0.0, 1.0 - cos_theta**2))
     dirs = np.stack([sin_theta * np.cos(phi), sin_theta * np.sin(phi), cos_theta], axis=1)  # (sp,3)
@@ -139,15 +136,6 @@ def save_traj_for_bart(traj: np.ndarray, out_base: Path):
     write_cfl(out_base, traj)
 
 def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray]:
-    """Read Bruker-provided trajectory file named exactly 'traj' in series_dir.
-
-    Tries encodings:
-      1) binary float32 of length 3*ro*sp
-      2) binary float64 of length 3*ro*sp
-      3) ASCII whitespace-separated floats (3*ro*sp)
-      4) ASCII with 3 columns and (ro*sp) rows
-    Returns (3, ro, sp) or None.
-    """
     tpath = Path(series_dir) / 'traj'
     if not tpath.exists():
         return None
@@ -165,22 +153,18 @@ def _read_bruker_traj(series_dir: Path, ro: int, sp: int) -> Optional[np.ndarray
             return arr.reshape(3, ro, sp, order='F').astype(np.float32)
     except Exception:
         pass
-    # try ASCII
+    # try ASCII (flat or 3-col)
     try:
         toks = tpath.read_text(errors='ignore').strip().split()
         vals = np.array([float(x) for x in toks], dtype=np.float32)
         if vals.size == 3 * ro * sp:
             return vals.reshape(3, ro, sp, order='F')
-        # structured 3 columns
-        try:
-            data = np.loadtxt(tpath, dtype=np.float32)
-            if data.ndim == 2:
-                if data.shape == (ro * sp, 3):
-                    return data.T.reshape(3, ro, sp, order='F')
-                if data.shape == (3, ro * sp):
-                    return data.reshape(3, ro, sp, order='F')
-        except Exception:
-            pass
+        data = np.loadtxt(tpath, dtype=np.float32)
+        if data.ndim == 2:
+            if data.shape == (ro * sp, 3):
+                return data.T.reshape(3, ro, sp, order='F')
+            if data.shape == (3, ro * sp):
+                return data.reshape(3, ro, sp, order='F')
     except Exception:
         pass
     return None
@@ -195,25 +179,20 @@ def load_bruker_kspace(series_dir: Path,
                         coils: Optional[int] = None,
                         fid_dtype: str = 'int32',
                         fid_endian: str = 'little') -> np.ndarray:
-
     series_dir = Path(series_dir)
     dbg('series_dir:', series_dir)
 
-    # 1) Pre-made ksp
+    # pre-made ksp?
     cfl = series_dir / 'ksp'
     if cfl.with_suffix('.cfl').exists() and cfl.with_suffix('.hdr').exists():
-        arr = read_cfl(cfl)
-        dbg('loaded ksp.cfl:', arr.shape)
-        return arr
+        arr = read_cfl(cfl); dbg('loaded ksp.cfl:', arr.shape); return arr
     npy = series_dir / 'ksp.npy'
     if npy.exists():
-        arr = np.load(npy)
-        dbg('loaded ksp.npy:', arr.shape)
-        if arr.ndim != 3:
-            raise ValueError('ksp.npy must be 3D (RO,Spokes,Coils)')
+        arr = np.load(npy); dbg('loaded ksp.npy:', arr.shape)
+        if arr.ndim != 3: raise ValueError('ksp.npy must be 3D (RO,Spokes,Coils)')
         return arr
 
-    # 2) Raw FID
+    # raw FID
     fid_path = series_dir / 'fid'
     if not fid_path.exists():
         raise FileNotFoundError('No k-space found (no fid, ksp.cfl, or ksp.npy)')
@@ -221,47 +200,36 @@ def load_bruker_kspace(series_dir: Path,
     method = _read_text_kv(series_dir / 'method')
     acqp   = _read_text_kv(series_dir / 'acqp')
 
-    # Endian/dtype from headers
-    if 'BYTORDA' in acqp and 'big' in acqp['BYTORDA'].lower():
-        fid_endian = 'big'
+    # endian/dtype from headers
+    if 'BYTORDA' in acqp and 'big' in acqp['BYTORDA'].lower(): fid_endian = 'big'
     if 'ACQ_word_size' in acqp:
-        if '16' in acqp['ACQ_word_size']:
-            fid_dtype = 'int16'
-        elif '32' in acqp['ACQ_word_size']:
-            fid_dtype = 'int32'
+        if '16' in acqp['ACQ_word_size']: fid_dtype = 'int16'
+        elif '32' in acqp['ACQ_word_size']: fid_dtype = 'int32'
 
-    # Read FID
     dtype_map = {'int16': np.int16, 'int32': np.int32, 'float32': np.float32, 'float64': np.float64}
-    if fid_dtype not in dtype_map:
-        raise ValueError("--fid-dtype must be one of int16,int32,float32,float64")
+    if fid_dtype not in dtype_map: raise ValueError("--fid-dtype must be one of int16,int32,float32,float64")
     dt = dtype_map[fid_dtype]
+
     raw = np.fromfile(fid_path, dtype=dt)
-    if fid_endian == 'big':
-        raw = raw.byteswap().newbyteorder()
-    if raw.size % 2 != 0:
-        raw = raw[:-1]
+    if fid_endian == 'big': raw = raw.byteswap().newbyteorder()
+    if raw.size % 2 != 0: raw = raw[:-1]
     cpx = raw.astype(np.float32).view(np.complex64)
     total_cplx = cpx.size
     dbg('total complex samples:', total_cplx, '(dtype:', fid_dtype, ', endian:', fid_endian, ')')
 
-    # Metadata-derived hints
+    # hints
     if readout is None:
         acq_size = _parse_acq_size(method, acqp)
-        if acq_size:
-            readout = acq_size[0]
-    if readout is None and matrix_ro_hint:
-        readout = matrix_ro_hint
+        if acq_size: readout = acq_size[0]
+    if readout is None and matrix_ro_hint: readout = matrix_ro_hint
     dbg('readout (hdr/matrix hint):', readout)
 
     if coils is None:
         nrec = _get_int_from_headers(['PVM_EncNReceivers'], [method])
-        if nrec and nrec > 0:
-            coils = nrec
-    if coils is None or coils <= 0:
-        coils = 1
+        if nrec and nrec > 0: coils = nrec
+    if coils is None or coils <= 0: coils = 1
     dbg('coils (initial):', coils)
 
-    # Extras (echoes, reps, averages, slices)
     extras = {
         'echoes':   _get_int_from_headers(['NECHOES', 'ACQ_n_echo_images', 'PVM_NEchoImages'], [method, acqp]) or 1,
         'reps':     _get_int_from_headers(['PVM_NRepetitions', 'NR'], [method, acqp]) or 1,
@@ -269,31 +237,25 @@ def load_bruker_kspace(series_dir: Path,
         'slices':   _get_int_from_headers(['NSLICES', 'PVM_SPackArrNSlices'], [method, acqp]) or 1,
     }
     other_dims = 1
-    for _, v in extras.items():
-        if isinstance(v, int) and v > 1:
-            other_dims *= v
+    for v in extras.values():
+        if isinstance(v, int) and v > 1: other_dims *= v
     dbg('other_dims factor:', other_dims, extras)
 
-    # Collapse extras & coils to per-coil bucket
     denom = coils * max(1, other_dims)
     if total_cplx % denom != 0:
         dbg('total not divisible by coils*other_dims; relaxing extras')
         denom = coils
         if total_cplx % denom != 0:
             dbg('still not divisible; relaxing coils->1')
-            coils = 1
-            denom = coils
+            coils = 1; denom = coils
             if total_cplx % denom != 0:
                 raise ValueError('Cannot factor FID length with any (coils, other_dims) combo.')
-    per_coil_total = total_cplx // denom  # = stored_ro * spokes
+    per_coil_total = total_cplx // denom  # stored_ro * spokes
     dbg('per_coil_total (stored_ro*spokes):', per_coil_total, '  coils:', coils, ' other_dims:', other_dims)
 
-    # Choose stored block and spokes using readout hint
-    def pick_block_and_spokes(per_coil_total: int, readout_hint: Optional[int], spokes_hint: Optional[int]) -> Tuple[int, int]:
-        # If spoke hint divides, use it
+    def pick_block_and_spokes(per_coil_total: int, readout_hint: Optional[int], spokes_hint: Optional[int]) -> Tuple[int,int]:
         if spokes_hint and spokes_hint > 0 and per_coil_total % spokes_hint == 0:
             return per_coil_total // spokes_hint, spokes_hint
-        # Candidate block sizes (prefer >= readout hint)
         BLOCKS = [128,160,192,200,224,240,256,288,320,352,384,400,416,420,432,448,480,496,512,
                   544,560,576,608,640,672,704,736,768,800,832,896,960,992,1024,1152,1280,1536,2048]
         cands = []
@@ -301,35 +263,29 @@ def load_bruker_kspace(series_dir: Path,
             cands += [b for b in BLOCKS if b >= readout_hint]
             if per_coil_total % readout_hint == 0:
                 return readout_hint, per_coil_total // readout_hint
-        cands += [per_coil_total]  # allow exact fit
+        cands += [per_coil_total]
         for b in cands:
             if b > 0 and per_coil_total % b == 0:
                 return b, per_coil_total // b
-        # Last resort: search near sqrt
         s = int(round(per_coil_total ** 0.5))
-        for delta in range(0, s+1):
-            for cand in (s+delta, s-delta):
+        for d in range(0, s+1):
+            for cand in (s+d, s-d):
                 if cand > 0 and per_coil_total % cand == 0:
                     return cand, per_coil_total // cand
         raise ValueError('Could not factor per_coil_total into (stored_ro, spokes).')
 
     stored_ro, spokes_inf = pick_block_and_spokes(per_coil_total, readout, spokes)
     dbg('stored_ro (block):', stored_ro, ' spokes (per extras-collapsed):', spokes_inf)
-
     spokes_final = spokes_inf * max(1, other_dims)
     if stored_ro * spokes_final * coils != total_cplx:
         raise ValueError('Internal factoring error: stored_ro*spokes_final*coils != total samples')
 
-    # Reshape & trim to true readout (if known)
     ksp_blk = np.reshape(cpx, (stored_ro, spokes_final, coils), order='F')
     if readout is not None and stored_ro >= readout:
-        ksp = ksp_blk[:readout, :, :]
-        dbg('trimmed RO from', stored_ro, 'to', readout)
+        ksp = ksp_blk[:readout, :, :]; dbg('trimmed RO from', stored_ro, 'to', readout)
     else:
-        ksp = ksp_blk
-        if readout is None:
-            readout = stored_ro
-
+        ksp = ksp_blk; 
+        if readout is None: readout = stored_ro
     dbg('final k-space shape:', ksp.shape, '(RO, Spokes, Coils)')
     return ksp
 
@@ -338,17 +294,13 @@ def load_bruker_kspace(series_dir: Path,
 # ------------------------
 def _bart_path() -> str:
     bart = shutil.which('bart')
-    if not bart:
-        raise RuntimeError("BART not found in PATH")
+    if not bart: raise RuntimeError("BART not found in PATH")
     return bart
 
 def _bart_supports_gpu(tool: str) -> bool:
     global BART_GPU_AVAILABLE
-    if BART_GPU_AVAILABLE is False:
-        return False
-    if BART_GPU_AVAILABLE is True:
-        return True
-    # Probe once
+    if BART_GPU_AVAILABLE is not None:
+        return BART_GPU_AVAILABLE
     bart = _bart_path()
     try:
         subprocess.run([bart, tool, '-g', '-h'], stdout=subprocess.DEVNULL,
@@ -366,41 +318,64 @@ def _bart_supports_gpu(tool: str) -> bool:
 
 def _run_bart(tool: str, args: List[str], gpu: bool):
     bart = _bart_path()
-    # Try GPU
     if gpu and _bart_supports_gpu(tool):
         cmd = [bart, tool, '-g'] + args
         print('[bart]', ' '.join(cmd))
         try:
-            subprocess.run(cmd, check=True)
-            return
-        except subprocess.CalledProcessError:
-            print('[warn] BART GPU attempt failed; retrying on CPU.')
+            subprocess.run(cmd, check=True); return
         except Exception:
             print('[warn] BART GPU attempt failed; retrying on CPU.')
-    # CPU
     cmd = [bart, tool] + args
     print('[bart]', ' '.join(cmd))
     subprocess.run(cmd, check=True)
 
 def run_bart(cmd: List[str], gpu: bool = False):
-    if not cmd:
-        raise ValueError("Empty BART command")
+    if not cmd: raise ValueError("Empty BART command")
     _run_bart(cmd[0], cmd[1:], gpu=gpu)
 
 # ------------------------
-# DCF (pipe-style iterative): shape-safe
+# DCF utils (NumPy-safe multiply)
 # ------------------------
-def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int] = (256, 256, 256), gpu: bool = False) -> np.ndarray:
-    """Simple iterative DCF (Pipe): w_{n+1} = w_n / (G^H G w_n) on ones.
-
-    Ensures weight array is shaped to match `kones` for BART `fmac`.
+def _make_weight_like(target: np.ndarray, w2d: np.ndarray) -> np.ndarray:
+    """Return complex w that broadcasts exactly to target's axes (unknown order).
+    We find the two axes in target whose lengths match w2d's (ro, sp), in either order,
+    and reshape w2d with singleton dims elsewhere.
     """
+    ro, sp = w2d.shape
+    tshape = target.shape
+    # find candidate axes
+    axes = list(range(len(tshape)))
+    pos_ro = [i for i in axes if tshape[i] == ro]
+    pos_sp = [i for i in axes if tshape[i] == sp]
+    # try ro!=sp straightforward first
+    for i in pos_ro:
+        for j in pos_sp:
+            if i != j:
+                shape = [1]*len(tshape)
+                shape[i] = ro; shape[j] = sp
+                return w2d.reshape(shape).astype(np.complex64)
+    # fallback: if ro==sp or ambiguous, just place along first two matching
+    if pos_ro and len(pos_ro) >= 2 and ro == sp:
+        i, j = pos_ro[0], pos_ro[1]
+        shape = [1]*len(tshape); shape[i] = ro; shape[j] = sp
+        return w2d.reshape(shape).astype(np.complex64)
+    # ultimate fallback: assume first two axes are (ro,sp)
+    shape = [1]*len(tshape)
+    shape[0] = ro if len(tshape) > 0 else 1
+    shape[1] = sp if len(tshape) > 1 else 1
+    return w2d.reshape(shape).astype(np.complex64)
+
+# ------------------------
+# DCF (Pipe): no bart fmac
+# ------------------------
+def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int,int,int]=(256,256,256), gpu: bool=False) -> np.ndarray:
+    """Iterative DCF (Pipe): w_{n+1} = w_n / (|A A^H A 1|) with NumPy multiplies."""
     ro, sp = traj.shape[1], traj.shape[2]
     w = np.ones((ro, sp), dtype=np.float32)
 
     bart = shutil.which('bart')
     if bart is None:
-        # Fallback: occupancy
+        # crude occupancy fallback
         kx = np.rint(traj[0] - traj[0].min()).astype(int)
         ky = np.rint(traj[1] - traj[1].min()).astype(int)
         kz = np.rint(traj[2] - traj[2].min()).astype(int)
@@ -414,57 +389,40 @@ def dcf_pipe(traj: np.ndarray, iters: int = 10, grid_shape: Tuple[int, int, int]
         return (1.0 / sample_counts).astype(np.float32)
 
     tmp = Path('./.tmp_bart_dcf'); tmp.mkdir(exist_ok=True)
-
     try:
         for _ in range(iters):
-            # Forward NUFFT of ones -> k-space ones (kones)
             ones = np.ones(grid_shape, dtype=np.complex64)
             write_cfl(tmp / 'ones', ones)
             save_traj_for_bart(traj, tmp / 'traj')
+
             _run_bart('nufft', ['-t', str(tmp / 'traj'), str(tmp / 'ones'), str(tmp / 'kones')], gpu=gpu)
+            kones = read_cfl(tmp / 'kones')  # arbitrary dims
+            w_full = _make_weight_like(kones, w)
+            kw = kones * w_full  # NumPy multiply
+            write_cfl(tmp / 'kw', kw)
 
-            # Read kones to discover its exact BART dims
-            kones = read_cfl(tmp / 'kones')
-
-            # Expand w to the same shape as kones for fmac
-            # Make w_full with shape == kones.shape, by adding singleton dims after first two axes
-            extra_dims = kones.ndim - 2
-            w_full = w.reshape(ro, sp, *([1] * max(0, extra_dims))).astype(np.complex64)
-            # If kones has any size-1 axes not at the end, broadcasting still works via numpy; write exact dims to CFL
-            write_cfl(tmp / 'w', w_full)
-
-            # Multiply in k-space
-            _run_bart('fmac', [str(tmp / 'kones'), str(tmp / 'w'), str(tmp / 'kw')], gpu=False)
-
-            # Backproject: A^H (kw)
             _run_bart('nufft', ['-a', '-t', str(tmp / 'traj'), str(tmp / 'kw'), str(tmp / 'backproj')], gpu=gpu)
-
-            # Forward again: A (A^H(kw)) to get denom
             back = read_cfl(tmp / 'backproj')
             write_cfl(tmp / 'back', back)
-            _run_bart('nufft', ['-t', str(tmp / 'traj'), str(tmp / 'back'), str(tmp / 'kback')], gpu=gpu)
 
+            _run_bart('nufft', ['-t', str(tmp / 'traj'), str(tmp / 'back'), str(tmp / 'kback')], gpu=gpu)
             kback = read_cfl(tmp / 'kback')
             denom = np.abs(kback).astype(np.float32) + 1e-6
-            # Shrink denom to (ro, sp) if needed by averaging across extra dims
             while denom.ndim > 2:
                 denom = denom.mean(axis=-1)
             w = w / denom
 
         return w.astype(np.float32)
     finally:
-        try:
-            shutil.rmtree(tmp)
-        except Exception:
-            pass
+        try: shutil.rmtree(tmp)
+        except Exception: pass
 
 # ------------------------
 # Recon flows
 # ------------------------
-def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int] = None, gpu: bool = False):
-    cmd = ['ecalib']
-    if calib is not None:
-        cmd += ['-r', str(calib)]
+def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int]=None, gpu: bool=False):
+    cmd = ['ecalib']; 
+    if calib is not None: cmd += ['-r', str(calib)]
     cmd += [str(coil_imgs_base), str(out_base)]
     run_bart(cmd, gpu=gpu)
 
@@ -495,14 +453,12 @@ def recon_iterative(traj_base: Path, ksp_base: Path, out_base: Path,
     run_bart(cmd, gpu=gpu)
 
 # ------------------------
-# BART run helper
+# BART runners
 # ------------------------
 def bart_exists() -> bool:
     return shutil.which('bart') is not None
 
 def run_bart(cmd: List[str], gpu: bool = False):
-    if not cmd:
-        raise ValueError("Empty BART command")
     _run_bart(cmd[0], cmd[1:], gpu=gpu)
 
 # ------------------------
@@ -525,25 +481,24 @@ def main():
     ap.add_argument('--export-nifti', action='store_true', help='Export NIfTI via bart toimg')
     ap.add_argument('--gpu', action='store_true', help='Attempt GPU; auto-fallback to CPU if unsupported')
     ap.add_argument('--debug', action='store_true', help='Print header inference and file checks')
-    # optional manual overrides
-    ap.add_argument('--readout', type=int, default=None, help='Override readout samples')
-    ap.add_argument('--spokes', type=int, default=None, help='Override number of spokes')
-    ap.add_argument('--coils', type=int, default=None, help='Override number of coils')
-    ap.add_argument('--fid-dtype', type=str, default=None, help='Override fid dtype (int16|int32|float32|float64)')
-    ap.add_argument('--fid-endian', type=str, default=None, help='Override fid endian (little|big)')
+    # optional overrides
+    ap.add_argument('--readout', type=int, default=None)
+    ap.add_argument('--spokes', type=int, default=None)
+    ap.add_argument('--coils', type=int, default=None)
+    ap.add_argument('--fid-dtype', type=str, default=None)
+    ap.add_argument('--fid-endian', type=str, default=None)
 
     args = ap.parse_args()
     DEBUG = args.debug
 
     if not bart_exists():
-        print('ERROR: BART not found on PATH. Install BART and try again.', file=sys.stderr)
-        sys.exit(1)
+        print('ERROR: BART not found on PATH.', file=sys.stderr); sys.exit(1)
 
     series_dir: Path = args.series
     out_base: Path = args.out
     NX, NY, NZ = args.matrix
 
-    # ---- k-space
+    # k-space (RO, Spokes, Coils)
     ksp = load_bruker_kspace(series_dir,
                              matrix_ro_hint=NX,
                              spokes=args.spokes,
@@ -556,7 +511,7 @@ def main():
     ksp_base = out_base.with_name(out_base.name + '_ksp')
     write_cfl(ksp_base, ksp)
 
-    # ---- trajectory (3, ro, sp)
+    # trajectory (3, ro, sp)
     bruker_traj = _read_bruker_traj(series_dir, ro, sp)
     if bruker_traj is not None:
         traj = bruker_traj
@@ -572,21 +527,16 @@ def main():
                     traj = np.load(base.with_suffix('.npy'))
                 else:
                     t2 = _read_bruker_traj(base.parent, ro, sp)
-                    if t2 is not None:
-                        traj = t2
-                    else:
-                        print('[warn] --traj-file not found in known formats; generating golden-angle.')
-                        traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp, matrix=(NX, NY, NZ)))
+                    traj = t2 if t2 is not None else golden_angle_3d(TrajSpec(readout=ro, spokes=sp, matrix=(NX, NY, NZ)))
             else:
                 print('[warn] No trajectory file found in series dir; generating golden-angle trajectory to match k-space.')
                 traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp, matrix=(NX, NY, NZ)))
-
     if traj.shape != (3, ro, sp):
         raise ValueError(f'trajectory must have shape (3,{ro},{sp}); got {traj.shape}')
     traj_base = out_base.with_name(out_base.name + '_traj')
     save_traj_for_bart(traj, traj_base)
 
-    # ---- optional DCF
+    # DCF
     dcf_mode = args.dcf.lower()
     if dcf_mode.startswith('pipe'):
         nit = 10
@@ -596,14 +546,19 @@ def main():
         dcf = dcf_pipe(traj, iters=nit, grid_shape=(NX, NY, NZ), gpu=args.gpu)
         dcf_base = out_base.with_name(out_base.name + '_dcf')
         write_cfl(dcf_base, dcf.astype(np.complex64))
+
+        # apply DCF to ksp using NumPy (avoid bart fmac shape asserts)
+        ksp_arr = read_cfl(ksp_base)
+        # make dcf broadcastable to ksp (RO, Spokes, Coils)
+        dcf_b = dcf.reshape(ro, sp, *([1] * max(0, ksp_arr.ndim - 2))).astype(np.complex64)
+        kspw = ksp_arr * dcf_b
         kspw_base = out_base.with_name(out_base.name + '_kspw')
-        # Multiply k-space by weights (CPU for max compatibility)
-        subprocess.run([_bart_path(), 'fmac', str(ksp_base), str(dcf_base), str(kspw_base)], check=True)
+        write_cfl(kspw_base, kspw)
         ksp_in = kspw_base
     else:
         ksp_in = ksp_base
 
-    # ---- reconstruction
+    # Recon
     if args.iterative:
         out_img = out_base.with_name(out_base.name + '_recon')
         recon_iterative(traj_base, ksp_in, out_img, lam=args.lam, iters=args.iters, wavelets=args.wavelets, gpu=args.gpu)
@@ -611,7 +566,7 @@ def main():
         out_img = out_base.with_name(out_base.name + '_adj')
         recon_adjoint(traj_base, ksp_in, args.combine, out_img, gpu=args.gpu)
 
-    # ---- export
+    # Export
     if args.export_nifti:
         run_bart(['toimg', str(out_img), str(out_base)], gpu=args.gpu)
         print(f'Wrote NIfTI: {out_base}.nii')
