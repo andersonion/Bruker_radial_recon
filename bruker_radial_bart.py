@@ -70,8 +70,85 @@ BART_GPU_AVAILABLE = None  # sticky cache
 
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
-        f.write("# Dimensions\n")
-        f.write(" ".join(str(d) for d in dims) + "\n")
+        f.write("# Dimensions
+")
+        f.write(" ".join(str(d) for d in dims) + "
+")
+
+# Write complex array to BART .cfl/.hdr (16-dim header). Data saved as complex64 in Fortran order.
+def _write_cfl(name: Path, array: np.ndarray, dims16: Optional[List[int]] = None):
+    name = Path(name)
+    base = name.with_suffix("")
+    if dims16 is None:
+        dims16 = list(array.shape) + [1] * (16 - array.ndim)
+    with open(base.with_suffix(".hdr"), "w") as f:
+        f.write("# Dimensions
+")
+        f.write(" ".join(str(int(d)) for d in dims16) + "
+")
+    arrF = np.asarray(array, dtype=np.complex64, order="F")
+    arrF.ravel(order="F").view(np.float32).tofile(base.with_suffix(".cfl"))
+
+# Read BART .cfl/.hdr
+
+def read_cfl(name: Path) -> np.ndarray:
+    name = Path(name)
+    base = name.with_suffix("")
+    with open(base.with_suffix(".hdr"), "r") as f:
+        lines = f.read().strip().splitlines()
+    dims = tuple(int(x) for x in lines[1].split())
+    dims = tuple(d for d in dims if d > 0)
+    data = np.fromfile(base.with_suffix(".cfl"), dtype=np.complex64)
+    return np.reshape(data, dims, order="F")
+
+# ---- helper: infer spokes from $series/traj length ----
+
+def _probe_traj_spokes(series_dir: Path, ro_hint: Optional[int]) -> Optional[int]:
+    tpath = Path(series_dir) / "traj"
+    if ro_hint is None or ro_hint <= 0 or not tpath.exists():
+        return None
+    # Try binary float32 then float64
+    for dt in (np.float32, np.float64):
+        try:
+            vals = np.fromfile(tpath, dtype=dt)
+            if vals.size % 3 == 0:
+                nsamp = vals.size // 3
+                if nsamp % ro_hint == 0:
+                    sp = nsamp // ro_hint
+                    return int(sp) if sp > 0 else None
+        except Exception:
+            pass
+    # Fallback: ASCII tokens
+    try:
+        toks = (tpath.read_text(errors="ignore").replace("{"," ").replace("}"," ")
+                .replace(","," ").split())
+        cnt = 0
+        for t in toks:
+            try:
+                float(t)
+                cnt += 1
+            except Exception:
+                continue
+        if cnt % 3 == 0:
+            nsamp = cnt // 3
+            if nsamp % ro_hint == 0:
+                sp = nsamp // ro_hint
+                return int(sp) if sp > 0 else None
+    except Exception:
+        pass
+    return None
+
+# ---------- FID / k-space ----------
+
+def load_bruker_kspace(
+    series_dir: Path,
+    matrix_ro_hint: Optional[int] = None,
+    spokes: Optional[int] = None,
+    readout: Optional[int] = None,
+    coils: Optional[int] = None,
+    fid_dtype: str = "int32",
+    fid_endian: str = "little",
+) -> np.ndarray:
     series_dir = Path(series_dir)
     dbg("series_dir:", series_dir)
 
