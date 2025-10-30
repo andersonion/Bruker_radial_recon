@@ -70,8 +70,9 @@ BART_GPU_AVAILABLE = None  # sticky cache
 
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
-        f.write("# Dimensions\\n")
-        f.write(" ".join(str(d) for d in dims) + "\\n") -> np.ndarray:
+         f.write("# Dimensions\n")
+         f.write(" ".join(str(d) for d in dims) + "\n")
+
     series_dir = Path(series_dir)
     dbg("series_dir:", series_dir)
 
