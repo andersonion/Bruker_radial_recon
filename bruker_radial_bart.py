@@ -70,10 +70,8 @@ BART_GPU_AVAILABLE = None  # sticky cache
 
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
-        f.write("# Dimensions
-")
-        f.write(" ".join(str(d) for d in dims) + "
-")
+        f.write("# Dimensions\\n")
+        f.write(" ".join(str(d) for d in dims) + "\\n")
 
 def _write_cfl(name: Path, array: np.ndarray, dims16: Optional[List[int]] = None):
     """Write complex array to BART .cfl/.hdr.
