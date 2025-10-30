@@ -71,176 +71,7 @@ BART_GPU_AVAILABLE = None  # sticky cache
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
         f.write("# Dimensions\\n")
-        f.write(" ".join(str(d) for d in dims) + "\\n")
-
-def _write_cfl(name: Path, array: np.ndarray, dims16: Optional[List[int]] = None):
-    """Write complex array to BART .cfl/.hdr.
-    If dims16 is provided, it is written into the hdr (16 integers); otherwise we infer from array.shape.
-    Data are saved in Fortran order as complex64 (BART default).
-    """
-    name = Path(name)
-    base = name.with_suffix("")
-    if dims16 is None:
-        dims16 = list(array.shape) + [1] * (16 - array.ndim)
-    _write_hdr(base.with_suffix(".hdr"), dims16)
-    arrF = np.asarray(array, dtype=np.complex64, order="F")
-    arrF.ravel(order="F").view(np.float32).tofile(base.with_suffix(".cfl"))
-
-def read_cfl(name: Path) -> np.ndarray:
-    name = Path(name)
-    base = name.with_suffix("")
-    with open(base.with_suffix(".hdr"), "r") as f:
-        lines = f.read().strip().splitlines()
-    dims = tuple(int(x) for x in lines[1].split())
-    dims = tuple(d for d in dims if d > 0)
-    data = np.fromfile(base.with_suffix(".cfl"), dtype=np.complex64)
-    return np.reshape(data, dims, order="F")
-
-# ---------- Bruker helpers ----------
-
-def _read_text_kv(path: Path) -> Dict[str, str]:
-    d = {}
-    if not path.exists():
-        return d
-    for line in path.read_text(errors="ignore").splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            d[k.strip().strip("#$")] = v.strip()
-    return d
-
-def _parse_acq_size(method_txt: dict, acqp_txt: dict) -> Optional[Tuple[int,int,int]]:
-    for key in ("ACQ_size", "PVM_Matrix"):
-        if key in method_txt:
-            try:
-                toks = method_txt[key].replace("{"," ").replace("}"," ").replace("("," ").replace(")"," ").split()
-                nums = [int(x) for x in toks if x.lstrip("+-").isdigit()]
-                if len(nums) >= 3:
-                    return nums[0], nums[1], nums[2]
-            except:
-                pass
-    return None
-
-def _get_int_from_headers(keys: List[str], srcs: List[dict]) -> Optional[int]:
-    for key in keys:
-        for src in srcs:
-            if key in src:
-                try:
-                    txt = src[key]
-                    buf = ""
-                    for ch in txt:
-                        if ch.isdigit() or (ch in "+-" and not buf):
-                            buf += ch
-                        elif buf:
-                            break
-                    if buf:
-                        return int(buf)
-                except:
-                    pass
-    return None
-
-# ---------- Trajectory ----------
-
-@dataclass
-class TrajSpec:
-    readout: int
-    spokes: int
-    matrix: Tuple[int, int, int]
-
-def golden_angle_3d(spec: TrajSpec) -> np.ndarray:
-    ro, sp = spec.readout, spec.spokes
-    NX, NY, NZ = spec.matrix
-    kmax = 0.5 * max(NX, NY, NZ)
-    i = np.arange(sp) + 0.5
-    phi = 2 * np.pi * i / ((1 + math.sqrt(5)) / 2)
-    cos_t = 1 - 2 * i / sp
-    sin_t = np.sqrt(np.maximum(0.0, 1.0 - cos_t ** 2))
-    dirs = np.stack([sin_t * np.cos(phi), sin_t * np.sin(phi), cos_t], axis=1)  # (sp,3)
-    t = np.linspace(-1.0, 1.0, ro)
-    radii = kmax * t
-    xyz = np.einsum("sr,sd->drs", radii[None, :], dirs).astype(np.float32)  # (3,ro,sp)
-    return xyz
-
-# Strict traj reader: ALWAYS use $series/traj if present.
-
-def _read_bruker_traj_strict(series_dir: Path, ro: int, sp: int) -> np.ndarray:
-    tpath = Path(series_dir) / "traj"
-    if not tpath.exists():
-        raise FileNotFoundError(f"No trajectory file found at {tpath}")
-    # try binary float32/64, then ASCII
-    for dt in (np.float32, np.float64, None):  # None => ASCII
-        try:
-            if dt is not None:
-                vals = np.fromfile(tpath, dtype=dt).astype(np.float32, copy=False)
-            else:
-                toks = tpath.read_text(errors="ignore").strip().split()
-                vals = np.array([float(x) for x in toks], dtype=np.float32)
-        except Exception:
-            continue
-        if vals.size % 3 != 0:
-            try:
-                data = np.loadtxt(tpath, dtype=np.float32)
-                if data.ndim == 2 and data.shape[1] == 3:
-                    vals = data.reshape(-1).astype(np.float32)
-                else:
-                    continue
-            except Exception:
-                continue
-        nsamp = vals.size // 3
-        need = ro * sp
-        # Prefer traj-implied spokes when cleanly divisible
-        if nsamp % ro == 0 and nsamp != need:
-            sp2 = nsamp // ro
-            print(f"[warn] Trajectory implies spokes={sp2}, but k-space has {sp}. Using {sp2} to match traj.")
-            sp = sp2
-            need = ro * sp
-        if nsamp > need:
-            print(f"[warn] Trajectory has {nsamp} samples; expected {need}. Trimming extras.")
-            vals = vals[: 3 * need]
-        elif nsamp < need:
-            print(f"[warn] Trajectory has only {nsamp} samples; expected {need}. Zero-padding the rest.")
-            vals = np.concatenate([vals, np.zeros(3 * (need - nsamp), dtype=np.float32)], axis=0)
-        return vals.reshape(3, ro, sp, order="F")
-    raise ValueError(f"Could not parse trajectory file at {tpath} in any known format.")
-
-# Probe spokes from traj length so k-space matches traj.
-
-def _probe_traj_spokes(series_dir: Path, ro_hint: Optional[int]) -> Optional[int]:
-    tpath = Path(series_dir) / "traj"
-    if not tpath.exists() or ro_hint is None:
-        return None
-    for dt in (np.float32, np.float64):
-        try:
-            vals = np.fromfile(tpath, dtype=dt)
-            if vals.size % 3 == 0:
-                nsamp = vals.size // 3
-                if nsamp >= ro_hint:
-                    sp = nsamp // ro_hint
-                    return int(sp) if sp > 0 else None
-        except Exception:
-            pass
-    try:
-        toks = tpath.read_text(errors="ignore").strip().split()
-        vals = len(toks)
-        if vals % 3 == 0:
-            nsamp = vals // 3
-            if nsamp >= ro_hint:
-                sp = nsamp // ro_hint
-                return int(sp) if sp > 0 else None
-    except Exception:
-        pass
-    return None
-
-# ---------- FID / k-space ----------
-
-def load_bruker_kspace(
-    series_dir: Path,
-    matrix_ro_hint: Optional[int] = None,
-    spokes: Optional[int] = None,
-    readout: Optional[int] = None,
-    coils: Optional[int] = None,
-    fid_dtype: str = "int32",
-    fid_endian: str = "little",
-) -> np.ndarray:
+        f.write(" ".join(str(d) for d in dims) + "\\n") -> np.ndarray:
     series_dir = Path(series_dir)
     dbg("series_dir:", series_dir)
 
@@ -694,23 +525,34 @@ def main():
     method = _read_text_kv(series_dir / "method")
     acqp = _read_text_kv(series_dir / "acqp")
 
-    # trajectory: STRICT use of $series/traj if present; else golden/arg file
+    # trajectory: STRICT use of $series/traj if present; else method(PVM_TrajKx/Ky/Kz); else golden/arg file
     traj_path = series_dir / "traj"
     if traj_path.exists():
         bruker_traj = _read_bruker_traj_strict(series_dir, ro, sp_total)
     else:
-        if args.traj == "file" and args.traj_file is not None:
-            if args.traj_file.with_suffix(".cfl").exists() and args.traj_file.with_suffix(".hdr").exists():
-                bruker_traj = read_cfl(args.traj_file)
-            elif args.traj_file.suffix == ".npy" and args.traj_file.exists():
-                bruker_traj = np.load(args.traj_file)
-            else:
-                bruker_traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp_total, matrix=(NX, NY, NZ)))
-        elif args.traj == "golden":
-            bruker_traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp_total, matrix=(NX, NY, NZ)))
+        # try from method keys
+        mt = _read_traj_from_method(series_dir, ro)
+        if mt is not None:
+            bruker_traj, sp_from_method = mt
+            if sp_from_method != sp_total:
+                print(f"[warn] Method-derived spokes={sp_from_method} != k-space spokes={sp_total}; trimming to match k-space.")
+                sp_use = min(sp_from_method, sp_total)
+                bruker_traj = bruker_traj[:, :, :sp_use]
+                ksp = ksp[:, :sp_use, :]
+                sp_total = sp_use
         else:
-            raise FileNotFoundError("No trajectory found.")
-    if bruker_traj.shape != (3, ro, sp_total):
+            if args.traj == "file" and args.traj_file is not None:
+                if args.traj_file.with_suffix(".cfl").exists() and args.traj_file.with_suffix(".hdr").exists():
+                    bruker_traj = read_cfl(args.traj_file)
+                elif args.traj_file.suffix == ".npy" and args.traj_file.exists():
+                    bruker_traj = np.load(args.traj_file)
+                else:
+                    bruker_traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp_total, matrix=(NX, NY, NZ)))
+            elif args.traj == "golden":
+                bruker_traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp_total, matrix=(NX, NY, NZ)))
+            else:
+                raise FileNotFoundError("No trajectory found.")
+    if bruker_traj.shape != (3, ro, sp_total): (3, ro, sp_total):
         raise ValueError(f"trajectory must have shape (3,{ro},{sp_total}); got {bruker_traj.shape}")
 
     # temporal binning: compute spokes_per_frame
