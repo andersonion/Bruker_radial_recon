@@ -85,6 +85,91 @@ def _write_cfl(name: Path, array: np.ndarray, dims16: Optional[List[int]] = None
     arrF = np.asarray(array, dtype=np.complex64, order="F")
     arrF.ravel(order="F").view(np.float32).tofile(base.with_suffix(".cfl"))
 
+# ---- Bruker header helpers ----------------------------------------------------
+from typing import Dict
+
+def _read_text_kv(path: Path) -> Dict[str, str]:
+    """
+    Minimal parser for Bruker text headers (acqp/method).
+    Returns a dict mapping BOTH raw keys (e.g. '##$PVM_TrajKx') and
+    normalized keys (e.g. 'PVM_TrajKx') to the value string after '='.
+    """
+    d: Dict[str, str] = {}
+    try:
+        txt = Path(path).read_text(errors="ignore")
+    except FileNotFoundError:
+        return d
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("$$"):
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            d[key] = val
+            if key.startswith("##$"):
+                d[key[3:]] = val  # normalized: drop '##$'
+            elif key.startswith("##"):
+                d[key[2:]] = val  # normalized: drop '##'
+            else:
+                # also store raw key without any leading '$'
+                d[key.lstrip("$")] = val
+    return d
+
+def _parse_list_of_numbers(val: str) -> list:
+    """Parse a Bruker-style list like '( 3 ) 256 256 256' or '{1 2 3}' into floats."""
+    if val is None:
+        return []
+    cleaned = (
+        val.replace("{", " ").replace("}", " ")
+           .replace("(", " ").replace(")", " ")
+           .replace(",", " ").replace("\t", " ")
+    )
+    out = []
+    for tok in cleaned.split():
+        try:
+            out.append(float(tok))
+        except Exception:
+            pass
+    return out
+
+def _get_int_from_headers(keys, dicts) -> int | None:
+    """
+    Search multiple header dicts for the first key that can be parsed as int.
+    Accepts scalar or first token from a list.
+    """
+    for d in dicts:
+        for k in keys:
+            if k in d:
+                nums = _parse_list_of_numbers(d[k])
+                if nums:
+                    try:
+                        return int(round(nums[0]))
+                    except Exception:
+                        pass
+    return None
+
+def _parse_acq_size(method: Dict[str, str], acqp: Dict[str, str]) -> tuple[int, int, int] | None:
+    """
+    Try to recover (RO, ?, ?) from common Bruker fields.
+    Priority: PVM_EncMatrix / PVM_Matrix / ACQ_size.
+    Returns a tuple of up to three ints (missing values may be None).
+    """
+    for key in ("PVM_EncMatrix", "PVM_Matrix", "ACQ_size"):
+        src = method if key.startswith("PVM_") else acqp
+        if key in src:
+            nums = _parse_list_of_numbers(src[key])
+            if nums:
+                ints = [int(round(x)) for x in nums]
+                # ensure length >= 1
+                while len(ints) < 3:
+                    ints.append(ints[-1] if ints else 1)
+                return ints[0], ints[1], ints[2]
+    return None
+# ------------------------------------------------------------------------------
+
+
 # Read BART .cfl/.hdr
 
 def read_cfl(name: Path) -> np.ndarray:
