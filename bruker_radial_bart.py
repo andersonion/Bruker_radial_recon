@@ -70,10 +70,8 @@ BART_GPU_AVAILABLE = None  # sticky cache
 
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
-        f.write("# Dimensions
-")
-        f.write(" ".join(str(d) for d in dims) + "
-")
+        f.write("# Dimensions\n")
+        f.write(" ".join(str(d) for d in dims) + "\n")
 
 # Write complex array to BART .cfl/.hdr (16-dim header). Data saved as complex64 in Fortran order.
 def _write_cfl(name: Path, array: np.ndarray, dims16: Optional[List[int]] = None):
@@ -82,10 +80,8 @@ def _write_cfl(name: Path, array: np.ndarray, dims16: Optional[List[int]] = None
     if dims16 is None:
         dims16 = list(array.shape) + [1] * (16 - array.ndim)
     with open(base.with_suffix(".hdr"), "w") as f:
-        f.write("# Dimensions
-")
-        f.write(" ".join(str(int(d)) for d in dims16) + "
-")
+        f.write("# Dimensions\n")
+        f.write(" ".join(str(d) for d in dims16) + "\n")
     arrF = np.asarray(array, dtype=np.complex64, order="F")
     arrF.ravel(order="F").view(np.float32).tofile(base.with_suffix(".cfl"))
 
