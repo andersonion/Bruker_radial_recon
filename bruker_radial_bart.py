@@ -553,7 +553,7 @@ def main():
                 bruker_traj = golden_angle_3d(TrajSpec(readout=ro, spokes=sp_total, matrix=(NX, NY, NZ)))
             else:
                 raise FileNotFoundError("No trajectory found.")
-    if bruker_traj.shape != (3, ro, sp_total): (3, ro, sp_total):
+    if bruker_traj.shape != (3, ro, sp_total):
         raise ValueError(f"trajectory must have shape (3,{ro},{sp_total}); got {bruker_traj.shape}")
 
     # temporal binning: compute spokes_per_frame
