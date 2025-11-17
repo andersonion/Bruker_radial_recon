@@ -1,252 +1,149 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-bruker_radial_bart.py
-
-Bruker 3D radial reconstruction (BART + NumPy fallback) with:
-- Robust FID loader that infers RO/Spokes/Coils and trims padded RO blocks
-- STRICT trajectory sourcing:
-    (1) $series/traj  -> used as-is
-    (2) method PVM_TrajKx/Ky/Kz arrays
-    (3) method-driven rebuild (Kronecker or classic GA), no arbitrary fallback
-- Sliding-window temporal binning by spokes or time, with --test-volumes limiter
-- DCF (pipe-style) and adjoint recon (BART or pure-NumPy Kaiser–Bessel)
-
-CLI examples:
-  python bruker_radial_bart.py \
-    --series "$path" \
-    --matrix 256 256 256 \
-    --traj file \
-    --spokes-per-frame 800 \
-    --frame-shift 100 \
-    --dcf pipe:10 \
-    --combine sos \
-    --export-nifti \
-    --out "${out%.nii.gz}_SoS"
-
-  python bruker_radial_bart.py \
-    --series "$path" \
-    --matrix 256 256 256 \
-    --traj file \
-    --time-per-frame-ms 200 \
-    --tr-ms 1.2 \
-    --dcf pipe:8 \
-    --combine sos \
-    --force-python-adjoint \
-    --test-volumes 3 \
-    --export-nifti \
-    --out "${out%.nii.gz}_SoS" \
-    --debug
-"""
-
 from __future__ import annotations
-import argparse, math, re, shutil, subprocess, sys
+
+import argparse
+import math
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Iterable
+
 import numpy as np
 
 DEBUG = False
 BART_GPU_AVAILABLE = None  # sticky cache
 
 
-# ------------------------ small utils ------------------------
-
 def dbg(*a):
     if DEBUG:
         print("[debug]", *a)
 
 
-def bart_exists() -> bool:
-    return shutil.which("bart") is not None
-
-
-def _bart_path() -> str:
-    bart = shutil.which("bart")
-    if not bart:
-        raise RuntimeError("BART not found in PATH")
-    return bart
-
-
-def _bart_supports_gpu(tool: str) -> bool:
-    """Detect -g support once and cache (handles 'compiled without GPU' and 'invalid option -g')."""
-    global BART_GPU_AVAILABLE
-    if BART_GPU_AVAILABLE is not None:
-        return BART_GPU_AVAILABLE
-    bart = _bart_path()
-    try:
-        subprocess.run([bart, tool, "-g", "-h"], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, check=True)
-        BART_GPU_AVAILABLE = True
-    except subprocess.CalledProcessError as e:
-        msg = (e.stderr or b"").decode(errors="ignore").lower()
-        if "compiled without gpu" in msg or "invalid option" in msg or "unknown option" in msg:
-            BART_GPU_AVAILABLE = False
-        else:
-            BART_GPU_AVAILABLE = False
-    except Exception:
-        BART_GPU_AVAILABLE = False
-    return BART_GPU_AVAILABLE
-
-
-def _run_bart(tool: str, args: List[str], gpu: bool):
-    """Run a single BART tool with optional -g; sticky CPU fallback if GPU fails."""
-    global BART_GPU_AVAILABLE
-    bart = _bart_path()
-    if gpu and (BART_GPU_AVAILABLE is None or BART_GPU_AVAILABLE):
-        if _bart_supports_gpu(tool):
-            cmd = [bart, tool, "-g"] + args
-            print("[bart]", " ".join(cmd))
-            try:
-                subprocess.run(cmd, check=True)
-                return
-            except Exception:
-                print("[warn] BART GPU attempt failed; using CPU for the rest of this run.")
-                BART_GPU_AVAILABLE = False
-    cmd = [bart, tool] + args
-    print("[bart]", " ".join(cmd))
-    subprocess.run(cmd, check=True)
-
-
-def run_bart(cmd: List[str], gpu: bool = False):
-    if not cmd:
-        raise ValueError("Empty BART command")
-    _run_bart(cmd[0], cmd[1:], gpu=gpu)
-
-
-# ------------------------ CFL I/O (correct newlines!) ------------------------
+# ---------- CFL I/O ----------
 
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
         f.write("# Dimensions\n")
-        f.write(" ".join(str(d) for d in dims) + "\n")
+        f.write(" ".join(str(int(d)) for d in dims) + "\n")
 
 
-def write_cfl(base: Path, arr: np.ndarray, dims16: List[int]) -> None:
-    """Write complex array in BART CFL format with explicit 16 dims in .hdr."""
+def write_cfl(base: Path, arr: np.ndarray, dims: Optional[List[int]] = None):
+    """
+    Write complex array in BART .cfl/.hdr format.
+    """
     base = Path(base)
-    _write_hdr(base.with_suffix(".hdr"), dims16)
-    a = np.asarray(arr, dtype=np.complex64, order="F")
-    a.view(np.float32).tofile(base.with_suffix(".cfl"))
+    if dims is None:
+        shape = list(arr.shape)
+        # BART uses up to 16 dims
+        dims = shape + [1] * (16 - len(shape))
+    else:
+        dims = list(dims) + [1] * (16 - len(dims))
+    _write_hdr(base.with_suffix(".hdr"), dims)
+    # Ensure complex64, Fortran order
+    c = np.asarray(arr, dtype=np.complex64, order="F")
+    c.view(np.float32).tofile(base.with_suffix(".cfl"))
 
 
 def read_cfl(base: Path) -> np.ndarray:
-    """Load CFL as complex64."""
     base = Path(base)
     hdr = base.with_suffix(".hdr")
     cfl = base.with_suffix(".cfl")
-    if not (hdr.exists() and cfl.exists()):
-        raise FileNotFoundError(f"Missing CFL pair: {base}")
     with open(hdr, "r") as f:
-        lines = f.read().strip().split()
-    if len(lines) < 2 or lines[0].lower().startswith("#"):
-        # First token "#", second token "Dimensions", then dims…
-        tokens = []
-        with open(hdr, "r") as f:
-            for line in f:
-                if line.startswith("#"):
-                    continue
-                tokens += line.split()
-        dims = list(map(int, tokens))
-    else:
-        dims = list(map(int, lines))
-    if len(dims) < 1:
-        raise ValueError("Bad CFL header")
-    data = np.fromfile(cfl, dtype=np.float32)
-    if data.size % 2 != 0:
-        data = data[:-1]
-    cpx = data.view(np.complex64)
-    # Build 16-dim shape
-    dims16 = dims + [1] * (16 - len(dims))
-    sz = 1
-    for d in dims16:
-        sz *= d
-    if cpx.size != sz:
-        raise ValueError(f"CFL size mismatch: have {cpx.size}, want {sz}")
-    return cpx.reshape(tuple(dims16), order="F")
+        first = f.readline().strip()
+        if not first.startswith("#"):
+            raise ValueError("Invalid BART hdr: missing # Dimensions")
+        dims = [int(x) for x in f.readline().split()]
+    n_elem = int(np.prod(dims))
+    data = np.fromfile(cfl, dtype=np.complex64, count=n_elem)
+    data = data.reshape(dims, order="F")
+    # squeeze trailing singleton dims
+    while data.ndim > 1 and data.shape[-1] == 1:
+        data = data.squeeze(-1)
+    return data
 
 
-# ------------------------ Bruker text parsing ------------------------
+# ---------- Bruker helpers ----------
 
 def _read_text_kv(path: Path) -> Dict[str, str]:
     d: Dict[str, str] = {}
-    if not Path(path).exists():
+    if not path.exists():
         return d
-    key = None
     with open(path, "r", errors="ignore") as f:
         for line in f:
-            line = line.rstrip("\n")
             if line.startswith("##$"):
-                m = re.match(r"##\$(\S+)\s*=\s*(.*)", line)
-                if m:
-                    key = m.group(1)
-                    d[key] = m.group(2).strip()
-            elif key is not None:
-                d[key] += " " + line.strip()
+                try:
+                    key, val = line[3:].split("=", 1)
+                except ValueError:
+                    continue
+                d[key.strip()] = val.strip()
     return d
 
 
-def _get_int(keys: Iterable[str], srcs: List[Dict[str, str]]) -> Optional[int]:
+def _get_int_from_headers(keys: List[str], headers: List[Dict[str, str]]) -> Optional[int]:
     for k in keys:
-        for s in srcs:
-            if k in s:
-                try:
-                    return int(re.findall(r"-?\d+", s[k])[0])
-                except Exception:
-                    pass
-    return None
-
-
-def _get_float(keys: Iterable[str], srcs: List[Dict[str, str]]) -> Optional[float]:
-    for k in keys:
-        for s in srcs:
-            if k in s:
-                try:
-                    return float(s[k].split()[0])
-                except Exception:
+        for h in headers:
+            if k in h:
+                txt = h[k]
+                # strip leading parentheses etc
+                txt = txt.replace("(", " ").replace(")", " ")
+                parts = txt.split()
+                for p in parts:
                     try:
-                        return float(re.findall(r"[+-]?\d+(\.\d+)?([eE][+-]?\d+)?", s[k])[0][0])
-                    except Exception:
-                        pass
+                        return int(p)
+                    except ValueError:
+                        continue
     return None
 
-
-# ------------------------ FID loader ------------------------
 
 def _parse_acq_size(method: Dict[str, str], acqp: Dict[str, str]) -> Optional[Tuple[int, int, int]]:
-    # VisuCoreSize-like hints or PVM_Matrix if present
-    for k in ("PVM_Matrix", "PVM_EncMatrix", "PVM_Matrix1"):
-        if k in method:
-            try:
-                toks = list(map(int, re.findall(r"\d+", method[k])))
-                if len(toks) >= 3:
-                    return toks[0], toks[1], toks[2]
-                if len(toks) == 2:
-                    return toks[0], toks[1], toks[1]
-            except Exception:
-                pass
+    # Try ACQ_size or PVM_EncMatrix
+    for key in ("ACQ_size", "PVM_EncMatrix"):
+        src = method if key in method else acqp if key in acqp else None
+        if src is None:
+            continue
+        txt = src[key]
+        txt = txt.replace("(", " ").replace(")", " ")
+        parts = [p for p in txt.split() if p.isdigit()]
+        if len(parts) >= 1:
+            ro = int(parts[0])
+            if len(parts) == 1:
+                return ro, 1, 1
+            if len(parts) == 2:
+                return ro, int(parts[1]), 1
+            return ro, int(parts[1]), int(parts[2])
     return None
 
 
-def _probe_traj_spokes(series_dir: Path, ro_hint: Optional[int]) -> Optional[int]:
-    """If a $series/traj exists, infer its spoke count given RO hint; else None."""
-    t = Path(series_dir) / "traj"
-    if not t.exists():
+@dataclass
+class TrajSpec:
+    readout: int
+    spokes: int
+    matrix: Tuple[int, int, int]
+
+
+def _probe_traj_spokes_from_method(series_dir: Path, ro_hint: Optional[int]) -> Optional[int]:
+    """
+    If PVM_TrajKx/Ky/Kz exist in method and have a plausible length,
+    infer spokes = len / ro (or len/(3*ro) depending on layout).
+    """
+    method = _read_text_kv(series_dir / "method")
+    if "PVM_TrajKx" not in method:
         return None
+    txt = method["PVM_TrajKx"]
+    txt = txt.replace("(", " ").replace(")", " ")
+    vals = [v for v in txt.split() if v not in (")", "(", "")]
+    # first value might be vector length, followed by data; Bruker sometimes encodes as "(N) v1 v2 ..."
     try:
-        data = np.fromfile(t, dtype=np.float32)
-        if data.size % 3 == 0 and ro_hint:
-            sp = (data.size // 3) // ro_hint
-            if sp > 0 and 3 * ro_hint * sp == data.size:
-                return sp
-        # try ASCII
-        txt = t.read_text(errors="ignore").strip().split()
-        vals = np.array(list(map(float, txt)), dtype=np.float64)
-        if vals.size % 3 == 0 and ro_hint:
-            sp = (vals.size // 3) // ro_hint
-            if sp > 0 and 3 * ro_hint * sp == vals.size:
-                return sp
-    except Exception:
-        return None
+        n0 = int(vals[0])
+        n = n0
+    except ValueError:
+        n = len(vals)
+    if ro_hint and n % ro_hint == 0:
+        spokes = n // ro_hint
+        if spokes > 0:
+            return spokes
     return None
 
 
@@ -256,33 +153,31 @@ def load_bruker_kspace(
     spokes: Optional[int] = None,
     readout: Optional[int] = None,
     coils: Optional[int] = None,
-    fid_dtype: str = "int32",      # default Bruker int32 FID
-    fid_endian: str = "little",    # default
+    fid_dtype: str = "int32",
+    fid_endian: str = "little",
 ) -> np.ndarray:
-    """Returns k-space shaped (RO, Spokes, Coils)."""
+    """
+    Load Bruker FID and reshape into k-space (RO, Spokes, Coils).
+    Tries to infer dimensions from headers and/or trajectory.
+    """
     series_dir = Path(series_dir)
-    # Pre-existing ksp?
-    for base in ("ksp", ):
-        cflb = series_dir / base
-        if cflb.with_suffix(".cfl").exists() and cflb.with_suffix(".hdr").exists():
-            arr = read_cfl(cflb)
-            # Expect RO at dim10, Sp at dim11, Coils at dim3 (common BART noncart layout)
-            # We'll try to squeeze it back to (RO,Sp,Coils)
-            dims = arr.shape
-            ro = dims[10] if len(dims) >= 12 else None
-            sp = dims[11] if len(dims) >= 12 else None
-            nc = dims[3] if len(dims) >= 4 else None
-            if ro and sp and nc:
-                a = np.asarray(arr, dtype=np.complex64, order="F")
-                a = np.moveaxis(a, (10, 11, 3), (0, 1, 2))
-                return a[:ro, :sp, :nc]
-        npy = series_dir / f"{base}.npy"
-        if npy.exists():
-            arr = np.load(npy)
-            if arr.ndim == 3:
-                return arr.astype(np.complex64, copy=False)
 
-    # FID route
+    # existing k-space files take precedence
+    cfl = series_dir / "ksp"
+    if cfl.with_suffix(".cfl").exists() and cfl.with_suffix(".hdr").exists():
+        arr = read_cfl(cfl)
+        dbg("loaded ksp.cfl:", arr.shape)
+        if arr.ndim != 3:
+            raise ValueError("ksp.cfl must be 3D (RO,Spokes,Coils)")
+        return arr
+    npy = series_dir / "ksp.npy"
+    if npy.exists():
+        arr = np.load(npy)
+        dbg("loaded ksp.npy:", arr.shape)
+        if arr.ndim != 3:
+            raise ValueError("ksp.npy must be 3D (RO,Spokes,Coils)")
+        return arr
+
     fid_path = series_dir / "fid"
     if not fid_path.exists():
         raise FileNotFoundError("No k-space found (no fid, ksp.cfl, or ksp.npy)")
@@ -290,10 +185,9 @@ def load_bruker_kspace(
     method = _read_text_kv(series_dir / "method")
     acqp = _read_text_kv(series_dir / "acqp")
 
-    # endian/dtype from headers if present
-    if "BYTORDA" in acqp:
-        if "big" in acqp["BYTORDA"].lower():
-            fid_endian = "big"
+    # endian / dtype
+    if "BYTORDA" in acqp and "big" in acqp["BYTORDA"].lower():
+        fid_endian = "big"
     if "ACQ_word_size" in acqp:
         if "16" in acqp["ACQ_word_size"]:
             fid_dtype = "int16"
@@ -314,7 +208,6 @@ def load_bruker_kspace(
     total = cpx.size
     dbg("total complex samples:", total, "(dtype:", fid_dtype, ", endian:", fid_endian, ")")
 
-    # hints
     if readout is None:
         acq_size = _parse_acq_size(method, acqp)
         if acq_size:
@@ -324,15 +217,18 @@ def load_bruker_kspace(
     dbg("readout (hdr/matrix hint):", readout)
 
     if coils is None:
-        coils = _get_int(("PVM_EncNReceivers",), [method]) or 1
+        nrec = _get_int_from_headers(["PVM_EncNReceivers"], [method])
+        if nrec and nrec > 0:
+            coils = nrec
+    if coils is None or coils <= 0:
+        coils = 1
     dbg("coils (initial):", coils)
 
-    # other dimension factors (echo/reps/avg/slices)
     extras = {
-        "echoes": _get_int(("NECHOES", "ACQ_n_echo_images", "PVM_NEchoImages"), [method, acqp]) or 1,
-        "reps": _get_int(("PVM_NRepetitions", "NR"), [method, acqp]) or 1,
-        "averages": _get_int(("PVM_NAverages", "NA"), [method, acqp]) or 1,
-        "slices": _get_int(("NSLICES", "PVM_SPackArrNSlices"), [method, acqp]) or 1,
+        "echoes": _get_int_from_headers(["NECHOES", "ACQ_n_echo_images", "PVM_NEchoImages"], [method, acqp]) or 1,
+        "reps": _get_int_from_headers(["PVM_NRepetitions", "NR"], [method, acqp]) or 1,
+        "averages": _get_int_from_headers(["PVM_NAverages", "NA"], [method, acqp]) or 1,
+        "slices": _get_int_from_headers(["NSLICES", "PVM_SPackArrNSlices"], [method, acqp]) or 1,
     }
     other_dims = 1
     for v in extras.values():
@@ -340,35 +236,12 @@ def load_bruker_kspace(
             other_dims *= v
     dbg("other_dims factor:", other_dims, extras)
 
-    # Let traj (if present) inform spokes
+    # If trajectory exists and implies spokes, prefer it
     if spokes is None:
         ro_hint_for_traj = readout if readout is not None else matrix_ro_hint
-        sp_hint = _probe_traj_spokes(series_dir, ro_hint_for_traj)
-        if sp_hint is not None and sp_hint > 0:
+        sp_hint = _probe_traj_spokes_from_method(series_dir, ro_hint_for_traj)
+        if sp_hint is not None:
             spokes = sp_hint
-
-    # factor total -> stored_ro * (spokes * other_dims) * coils
-    def pick_block_and_spokes(per_coil_total: int, readout_hint: Optional[int], spokes_hint: Optional[int]) -> Tuple[int, int]:
-        # 1) honor explicit spokes when divides
-        if spokes_hint and spokes_hint > 0 and per_coil_total % spokes_hint == 0:
-            return per_coil_total // spokes_hint, spokes_hint
-        # 2) prefer readout hint when divides
-        if readout_hint and readout_hint > 0 and per_coil_total % readout_hint == 0:
-            return readout_hint, per_coil_total // readout_hint
-        # 3) common block sizes
-        BLOCKS = [128, 160, 192, 200, 224, 240, 256, 288, 320, 352, 384, 400, 416, 420, 432, 448,
-                  480, 496, 512, 544, 560, 576, 608, 640, 672, 704, 736, 768, 800, 832, 896, 960,
-                  992, 1024, 1152, 1280, 1536, 2048]
-        for b in [x for x in BLOCKS if not readout_hint or x >= readout_hint]:
-            if per_coil_total % b == 0:
-                return b, per_coil_total // b
-        # 4) fallback near-sqrt
-        s = int(round(per_coil_total ** 0.5))
-        for d in range(0, s + 1):
-            for cand in (s + d, s - d):
-                if cand > 0 and per_coil_total % cand == 0:
-                    return cand, per_coil_total // cand
-        raise ValueError("Could not factor per_coil_total into (stored_ro, spokes).")
 
     denom = coils * max(1, other_dims)
     if total % denom != 0:
@@ -377,15 +250,35 @@ def load_bruker_kspace(
         if total % denom != 0:
             dbg("still not divisible; relaxing coils->1")
             coils = 1
-            denom = 1
+            denom = coils
             if total % denom != 0:
                 raise ValueError("Cannot factor FID length with any (coils, other_dims) combo.")
     per_coil_total = total // denom
+
+    def pick_block_and_spokes(per_coil_total: int, readout_hint: Optional[int], spokes_hint: Optional[int]) -> Tuple[int, int]:
+        if spokes_hint and spokes_hint > 0 and per_coil_total % spokes_hint == 0:
+            return per_coil_total // spokes_hint, spokes_hint
+        BLOCKS = [
+            128, 160, 192, 200, 224, 240, 256, 288, 320, 352, 384, 400, 416, 420, 432, 448, 480, 496, 512,
+            544, 560, 576, 608, 640, 672, 704, 736, 768, 800, 832, 896, 960, 992, 1024, 1152, 1280, 1536, 2048,
+        ]
+        if readout_hint and per_coil_total % readout_hint == 0:
+            return readout_hint, per_coil_total // readout_hint
+        for b in [x for x in BLOCKS if not readout_hint or x >= readout_hint]:
+            if per_coil_total % b == 0:
+                return b, per_coil_total // b
+        s = int(round(per_coil_total ** 0.5))
+        for d in range(0, s + 1):
+            for cand in (s + d, s - d):
+                if cand > 0 and per_coil_total % cand == 0:
+                    return cand, per_coil_total // cand
+        raise ValueError("Could not factor per_coil_total into (stored_ro, spokes).")
+
     stored_ro, spokes_inf = pick_block_and_spokes(per_coil_total, readout, spokes)
     dbg("stored_ro (block):", stored_ro, " spokes (per extras-collapsed):", spokes_inf)
     spokes_final = spokes_inf * max(1, other_dims)
     if stored_ro * spokes_final * coils != total:
-        raise ValueError("Internal factoring error (stored_ro*spokes_final*coils != total)")
+        raise ValueError("Internal factoring error: stored_ro*spokes_final*coils != total samples")
 
     ksp_blk = np.reshape(cpx, (stored_ro, spokes_final, coils), order="F")
     if readout is not None and stored_ro >= readout:
@@ -396,164 +289,168 @@ def load_bruker_kspace(
         if readout is None:
             readout = stored_ro
     dbg("final k-space shape:", ksp.shape, "(RO, Spokes, Coils)")
-    return ksp.astype(np.complex64, copy=False)
+    return ksp
 
 
-# ------------------------ Trajectory readers/builders ------------------------
+# ---------- Trajectory helpers ----------
 
-def _read_traj_file(series_dir: Path, ro: int, spokes: int) -> Optional[np.ndarray]:
-    """Read $series/traj as binary float32/64 or ASCII; expect flat xyz with length 3*ro*spokes."""
-    t = Path(series_dir) / "traj"
-    if not t.exists():
+def _read_bruker_traj_file(series_dir: Path, ro: int, sp_total: int) -> Optional[np.ndarray]:
+    """
+    Read $series/traj if present. Accepts binary float32/float64 or ASCII.
+    Expects shape (3, ro, sp_total) after reshape; trims or pads if needed.
+    """
+    path = Path(series_dir) / "traj"
+    if not path.exists():
         return None
-    # try binary float32
-    for dt in (np.float32, np.float64):
-        try:
-            arr = np.fromfile(t, dtype=dt)
-            if arr.size == 3 * ro * spokes:
-                arr = arr.astype(np.float32, copy=False)
-                return arr.reshape(3, ro, spokes, order="F")
-        except Exception:
-            pass
-    # try ASCII
+
+    data = None
     try:
-        vals = list(map(float, t.read_text(errors="ignore").strip().split()))
-        if len(vals) == 3 * ro * spokes:
-            arr = np.array(vals, dtype=np.float32)
-            return arr.reshape(3, ro, spokes, order="F")
+        # try binary float32 then float64
+        for dt in (np.float32, np.float64):
+            raw = np.fromfile(path, dtype=dt)
+            if raw.size == 0:
+                continue
+            data = raw.astype(np.float32)
+            break
     except Exception:
-        pass
-    return None
+        data = None
+
+    if data is None:
+        # try ASCII
+        try:
+            txt = np.loadtxt(path, dtype=np.float32)
+            data = txt.ravel()
+        except Exception:
+            data = None
+
+    if data is None or data.size == 0:
+        return None
+
+    needed = 3 * ro * sp_total
+    if data.size < needed:
+        print(f"[warn] traj file shorter than expected ({data.size} < {needed}); zero-padding.")
+        data = np.pad(data, (0, needed - data.size), mode="constant")
+    elif data.size > needed:
+        print(f"[warn] traj file longer than expected ({data.size} > {needed}); truncating.")
+        data = data[:needed]
+
+    arr = data.reshape((3, ro, sp_total), order="F")
+    return arr
 
 
-def _read_traj_from_method_arrays(series_dir: Path, ro: int) -> Optional[Tuple[np.ndarray, int]]:
-    """Read PVM_TrajKx/Ky/Kz arrays from method if present; return (traj, spokes)."""
-    method = _read_text_kv(Path(series_dir) / "method")
+def _read_traj_from_method(series_dir: Path, ro: int, sp_total: int) -> Optional[np.ndarray]:
+    """
+    Try to parse PVM_TrajKx/Ky/Kz arrays from method file.
+    """
+    method = _read_text_kv(series_dir / "method")
     keys = ["PVM_TrajKx", "PVM_TrajKy", "PVM_TrajKz"]
     if not all(k in method for k in keys):
         return None
-    try:
-        kx = np.array(list(map(float, re.findall(r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", method["PVM_TrajKx"]))), dtype=np.float32)
-        ky = np.array(list(map(float, re.findall(r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", method["PVM_TrajKy"]))), dtype=np.float32)
-        kz = np.array(list(map(float, re.findall(r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", method["PVM_TrajKz"]))), dtype=np.float32)
-        if not (kx.size == ky.size == kz.size):
-            return None
-        if kx.size % (3) == 0 and ro > 0:
-            spokes = kx.size // ro
-            if spokes > 0 and ro * spokes == kx.size:
-                traj = np.stack([kx.reshape(ro, spokes, order="F"),
-                                 ky.reshape(ro, spokes, order="F"),
-                                 kz.reshape(ro, spokes, order="F")], axis=0)
-                return traj, spokes
-    except Exception:
+
+    def parse_vec(txt: str) -> np.ndarray:
+        txt = txt.replace("(", " ").replace(")", " ")
+        vals = []
+        for t in txt.split():
+            try:
+                vals.append(float(t))
+            except ValueError:
+                continue
+        return np.asarray(vals, dtype=np.float32)
+
+    kxs = [parse_vec(method[k]) for k in keys]
+    lengths = [len(v) for v in kxs]
+    if min(lengths) == 0:
         return None
-    return None
+
+    # Bruker often stores as "(N) v1 v2 ..."; if N is present, it is the length.
+    # Use the actual vector length.
+    n = min(lengths)
+    needed = ro * sp_total
+    if n < needed:
+        print(f"[warn] PVM_TrajK* length {n} < ro*sp ({needed}); zero-padding.")
+        kxs = [np.pad(v[:n], (0, needed - n), mode="constant") for v in kxs]
+    elif n > needed:
+        print(f"[warn] PVM_TrajK* length {n} > ro*sp ({needed}); truncating.")
+        kxs = [v[:needed] for v in kxs]
+    else:
+        kxs = [v[:needed] for v in kxs]
+
+    arr = np.stack(kxs, axis=0).reshape(3, ro, sp_total, order="F")
+    return arr
 
 
-def _dirs_fibonacci(spokes: int) -> np.ndarray:
-    phi_inc = 2.39996322972865332  # 2π/φ^2
-    k = np.arange(spokes, dtype=np.float64) + 0.5
-    z = 1.0 - 2.0 * k / spokes
-    r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
-    phi = k * phi_inc
-    x = r * np.cos(phi)
-    y = r * np.sin(phi)
-    return np.stack([x, y, z], axis=1)  # (spokes,3)
+def _traj_from_ga_settings(method: Dict[str, str], spec: TrajSpec) -> np.ndarray:
+    """
+    Fallback builder when we *know* the method is golden-angle / Kronecker,
+    but PVM_TrajK* and $series/traj are unavailable.
+
+    NOTE: This is a placeholder. To exactly match your Bruker sequence,
+    you should port the trajectory math from golden_angle_UTE3D.ppg / C
+    into this function. For now we raise to avoid silently using a
+    'presumed' trajectory.
+    """
+    mode = method.get("GA_Mode", "").strip()
+    raise NotImplementedError(
+        f"Trajectory must be supplied via $series/traj or PVM_TrajK*. "
+        f"Method GA_Mode={mode!r} detected, but _traj_from_ga_settings is not implemented. "
+        f"Please implement this function to match your golden-angle / Kronecker design."
+    )
 
 
-def _dirs_kronecker(spokes: int) -> np.ndarray:
-    invphi = (np.sqrt(5.0) - 1.0) / 2.0
-    inc1, inc2 = invphi, invphi * invphi
-    k = np.arange(spokes, dtype=np.float64)
-    u = (k * inc1) % 1.0
-    v = (k * inc2) % 1.0
-    theta = np.arccos(1.0 - 2.0 * u)
-    phi = 2.0 * np.pi * v
-    x = np.sin(theta) * np.cos(phi)
-    y = np.sin(theta) * np.sin(phi)
-    z = np.cos(theta)
-    return np.stack([x, y, z], axis=1)
+# ---------- BART wrappers ----------
+
+def _bart_path() -> str:
+    bart = shutil.which("bart")
+    if not bart:
+        raise RuntimeError("BART not found in PATH")
+    return bart
 
 
-def _derive_tr_ms(method: dict, acqp: dict) -> Optional[float]:
-    for k in ("PVM_RepetitionTime", "ACQ_repetition_time"):
-        if k in method:
-            try: return float(method[k].split()[0])
-            except: pass
-        if k in acqp:
-            try: return float(acqp[k].split()[0])
-            except: pass
-    return None
+def _bart_supports_gpu(tool: str) -> bool:
+    global BART_GPU_AVAILABLE
+    if BART_GPU_AVAILABLE is not None:
+        return BART_GPU_AVAILABLE
+    bart = _bart_path()
+    try:
+        subprocess.run([bart, tool, "-g", "-h"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        BART_GPU_AVAILABLE = True
+    except subprocess.CalledProcessError as e:
+        msg = (e.stderr or b"").decode(errors="ignore")
+        BART_GPU_AVAILABLE = not (
+            ("compiled without GPU" in msg)
+            or ("invalid option -- 'g'" in msg)
+            or ("unknown option g" in msg)
+        )
+    except Exception:
+        BART_GPU_AVAILABLE = False
+    return BART_GPU_AVAILABLE
 
 
-def probe_spokes_from_method(series_dir: Path) -> Optional[int]:
-    m = _read_text_kv(Path(series_dir) / "method")
-    a = _read_text_kv(Path(series_dir) / "acqp")
-    for k in ("GA_NSpokesEff", "NPro"):
-        v = _get_int((k,), [m, a])
-        if v and v > 0:
-            return v
-    return None
+def _run_bart(tool: str, args: List[str], gpu: bool):
+    global BART_GPU_AVAILABLE
+    bart = _bart_path()
+    if gpu and (BART_GPU_AVAILABLE is None or BART_GPU_AVAILABLE is True):
+        if _bart_supports_gpu(tool):
+            cmd = [bart, tool, "-g"] + args
+            print("[bart]", " ".join(cmd))
+            try:
+                subprocess.run(cmd, check=True)
+                return
+            except Exception:
+                print("[warn] BART GPU attempt failed; using CPU for the rest of this run.")
+                BART_GPU_AVAILABLE = False
+    cmd = [bart, tool] + args
+    print("[bart]", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
 
-def derive_traj_from_method(series_dir: Path, ro: int, spokes: int, matrix: Tuple[int, int, int]) -> np.ndarray:
-    """Rebuild trajectory deterministically from GA/Kronecker flags in method. No arbitrary fallback."""
-    m = _read_text_kv(Path(series_dir) / "method")
-    a = _read_text_kv(Path(series_dir) / "acqp")
-    # Spokes authority
-    npro   = _get_int(("NPro",), [m, a])
-    ga_eff = _get_int(("GA_NSpokesEff",), [m])
-    sp_hdr = ga_eff if (ga_eff and ga_eff > 0) else npro
-    if sp_hdr and sp_hdr > 0 and sp_hdr != spokes:
-        spokes = min(sp_hdr, spokes)
-
-    # GA/Kronecker decision
-    ga_mode = _get_int(("GA_Mode",), [m])    # treat nonzero as Kronecker unless you provide enums
-    use_fib = _get_int(("GA_UseFibonacci",), [m])
-    use_kron = False
-    if ga_mode is not None:
-        use_kron = (ga_mode != 0)
-    elif use_fib is not None:
-        use_kron = (use_fib == 0)
-
-    dirs = _dirs_kronecker(spokes) if use_kron else _dirs_fibonacci(spokes)
-
-    NX, NY, NZ = matrix
-    kmax = 0.5 * float(max(NX, NY, NZ))
-    t = (np.arange(ro, dtype=np.float64) + 0.5) / ro
-    r = t * kmax
-    x = r[:, None] * dirs[:, 0][None, :]
-    y = r[:, None] * dirs[:, 1][None, :]
-    z = r[:, None] * dirs[:, 2][None, :]
-    traj = np.stack([x, y, z], axis=0).astype(np.float32)
-    return traj
+def run_bart(cmd: List[str], gpu: bool = False):
+    if not cmd:
+        raise ValueError("Empty BART command")
+    _run_bart(cmd[0], cmd[1:], gpu=gpu)
 
 
-def get_bruker_traj(series_dir: Path, ro: int, spokes: int, matrix: Tuple[int, int, int]) -> np.ndarray:
-    """STRICT trajectory sourcing order."""
-    # 1) raw file
-    t = _read_traj_file(series_dir, ro, spokes)
-    if t is not None:
-        return t
-    # 2) method arrays
-    mt = _read_traj_from_method_arrays(series_dir, ro)
-    if mt is not None:
-        traj, sp_m = mt
-        if sp_m != spokes:
-            sp_use = min(sp_m, spokes)
-            traj = traj[:, :, :sp_use]
-        return traj
-    # 3) rebuild from method flags (Kronecker/GA)
-    sp_hdr = probe_spokes_from_method(series_dir)
-    if sp_hdr is not None and sp_hdr > 0 and sp_hdr != spokes:
-        spokes = min(sp_hdr, spokes)
-    traj = derive_traj_from_method(series_dir, ro=ro, spokes=spokes, matrix=matrix)
-    if traj.shape != (3, ro, spokes):
-        raise ValueError(f"Derived trajectory has shape {traj.shape}, expected (3,{ro},{spokes})")
-    return traj
-
-
-# ------------------------ DCF (pipe, NumPy) ------------------------
+# ---------- DCF (NumPy Pipe) ----------
 
 def _normalize_traj_to_grid(traj: np.ndarray, grid_shape: Tuple[int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ro, sp = traj.shape[1], traj.shape[2]
@@ -595,41 +492,41 @@ def dcf_pipe_numpy(traj: np.ndarray, iters: int, grid_shape: Tuple[int, int, int
     return w
 
 
-# ------------------------ Layout helpers for BART ------------------------
+# ---------- Layout helpers for BART noncart ----------
 
 def ksp_to_bart_noncart(ksp: np.ndarray) -> Tuple[np.ndarray, List[int]]:
-    """Map (RO,Sp,Coils) -> dims[16] with RO@10, Sp@11, Coils@3."""
     ro, sp, nc = ksp.shape
-    arr = ksp.astype(np.complex64, order="F")
-    arr = arr.reshape(ro, sp, nc, *([1] * 13), order="F")
-    arr = np.transpose(arr, (3, 4, 5, 2, 6, 7, 8, 9, 12, 13, 0, 1, 10, 11, 14, 15))
+    arr = np.asarray(ksp, dtype=np.complex64, order="F")
+    # dims: [1, 1, 1, nc, 1,1,1,1,1,1, ro, sp, 1,1,1,1]
     dims = [1] * 16
     dims[3] = nc
     dims[10] = ro
     dims[11] = sp
+    arr = arr.reshape((1, 1, 1, nc, 1, 1, 1, 1, 1, 1, ro, sp, 1, 1, 1, 1), order="F")
     return arr, dims
 
 
 def traj_to_bart_noncart(traj: np.ndarray) -> Tuple[np.ndarray, List[int]]:
-    """Map (3,RO,Sp) -> dims[16] with 3@0, RO@10, Sp@11."""
     _, ro, sp = traj.shape
-    arr = traj.astype(np.complex64, order="F")
-    arr = arr.reshape(3, ro, sp, *([1] * 13), order="F")
-    arr = np.transpose(arr, (0, 3, 4, 5, 6, 7, 8, 9, 12, 13, 1, 2, 10, 11, 14, 15))
+    arr = np.asarray(traj, dtype=np.complex64, order="F")
+    # dims: [3, 1,1,1, 1,1,1,1,1,1, ro, sp, 1,1,1,1]
     dims = [1] * 16
     dims[0] = 3
     dims[10] = ro
     dims[11] = sp
+    arr = arr.reshape((3, 1, 1, 1, 1, 1, 1, 1, 1, 1, ro, sp, 1, 1, 1, 1), order="F")
     return arr, dims
 
 
-# ------------------------ NumPy adjoint (KB gridder) ------------------------
+# ---------- NumPy adjoint (KB gridding) ----------
 
-def _kb(u: np.ndarray, width: float, beta: float) -> np.ndarray:
+def _kaiser_bessel(u: np.ndarray, width: float, beta: float) -> np.ndarray:
     x = np.abs(u)
     out = np.zeros_like(x, dtype=np.float32)
     half = width / 2.0
     m = x <= half
+    if not np.any(m):
+        return out
     from numpy import i0
     t = np.sqrt(1.0 - (x[m] / half) ** 2)
     out[m] = (i0(beta * t) / i0(beta)).astype(np.float32)
@@ -675,9 +572,9 @@ def adjoint_grid_numpy(
             xr = np.arange(x0 - hw, x0 + hw + 1)
             yr = np.arange(y0 - hw, y0 + hw + 1)
             zr = np.arange(z0 - hw, z0 + hw + 1)
-            wx = _kb(xr - gx[t, s], kb_width, kb_beta)
-            wy = _kb(yr - gy[t, s], kb_width, kb_beta)
-            wz = _kb(zr - gz[t, s], kb_width, kb_beta)
+            wx = _kaiser_bessel(xr - gx[t, s], kb_width, kb_beta)
+            wy = _kaiser_bessel(yr - gy[t, s], kb_width, kb_beta)
+            wz = _kaiser_bessel(zr - gz[t, s], kb_width, kb_beta)
             wxyz = (wx[:, None, None] * wy[None, :, None] * wz[None, None, :]).astype(np.float32) * w[t, s]
             xsel = (xr >= 0) & (xr < NXg)
             ysel = (yr >= 0) & (yr < NYg)
@@ -694,14 +591,14 @@ def adjoint_grid_numpy(
     x0 = (NXg - NX) // 2
     y0 = (NYg - NY) // 2
     z0 = (NZg - NZ) // 2
-    img = img[x0: x0 + NX, y0: y0 + NY, z0: z0 + NZ, :]
+    img = img[x0 : x0 + NX, y0 : y0 + NY, z0 : z0 + NZ, :]
     img *= deapx[:NX, None, None, None]
     img *= deapy[None, :NY, None, None]
     img *= deapz[None, None, :NZ, None]
     return img.astype(np.complex64)
 
 
-# ------------------------ Recon pipelines ------------------------
+# ---------- Recon flows ----------
 
 def estimate_sens_maps(coil_imgs_base: Path, out_base: Path, calib: Optional[int] = None, gpu: bool = False):
     cmd = ["ecalib"]
@@ -735,10 +632,10 @@ def recon_adjoint_python(
     NX, NY, NZ = matrix
     coil_img = adjoint_grid_numpy(traj, ksp, dcf, (NX, NY, NZ))  # (NX,NY,NZ,NC)
     coil_base = out_base.with_name(out_base.name + "_coil_py")
-    write_cfl(coil_base, coil_img, [NX, NY, NZ, coil_img.shape[3]] + [1] * 12)
+    write_cfl(coil_base, coil_img, [NX, NY, NZ, coil_img.shape[3]])
     if combine.lower() == "sos":
         rss = np.sqrt(np.sum(np.abs(coil_img) ** 2, axis=3)).astype(np.complex64)
-        write_cfl(out_base, rss, [NX, NY, NZ] + [1] * 13)
+        write_cfl(out_base, rss, [NX, NY, NZ])
     elif combine.lower() == "sens":
         maps = out_base.with_name(out_base.name + "_maps_py")
         estimate_sens_maps(coil_base, maps, gpu=False)
@@ -747,7 +644,22 @@ def recon_adjoint_python(
         raise ValueError("combine must be sos|sens")
 
 
-# ------------------------ Frame binning ------------------------
+# ---------- Frame binning ----------
+
+def _derive_tr_ms(method: dict, acqp: dict) -> Optional[float]:
+    for k in ("PVM_RepetitionTime", "ACQ_repetition_time"):
+        if k in method:
+            try:
+                return float(method[k].split()[0])
+            except Exception:
+                pass
+        if k in acqp:
+            try:
+                return float(acqp[k].split()[0])
+            except Exception:
+                pass
+    return None
+
 
 def frame_starts(total_spokes: int, spokes_per_frame: int, frame_shift: Optional[int]) -> Iterable[int]:
     step = frame_shift if frame_shift and frame_shift > 0 else spokes_per_frame
@@ -755,21 +667,31 @@ def frame_starts(total_spokes: int, spokes_per_frame: int, frame_shift: Optional
         yield s
 
 
-# ------------------------ main ------------------------
+# ---------- CLI ----------
+
+def bart_exists() -> bool:
+    return shutil.which("bart") is not None
+
 
 def main():
     global DEBUG
-    ap = argparse.ArgumentParser(description="Bruker 3D radial reconstruction using BART/NumPy with strict trajectory sourcing")
+    ap = argparse.ArgumentParser(description="Bruker 3D radial reconstruction using BART (sliding window)")
     ap.add_argument("--series", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--matrix", type=int, nargs=3, required=True, metavar=("NX", "NY", "NZ"))
-    ap.add_argument("--traj", choices=["golden", "file"], default="file")
-    ap.add_argument("--traj-file", type=Path, help="Explicit trajectory file (used only if $series/traj missing)")
+    ap.add_argument(
+        "--traj",
+        choices=["file", "method", "ga"],
+        default="file",
+        help="file: $series/traj; method: PVM_TrajKx/Ky/Kz; ga: GA_Mode-based fallback (requires code)",
+    )
+    ap.add_argument("--traj-file", type=Path, help="Optional external traj file (unused if $series/traj exists)")
     ap.add_argument("--dcf", type=str, default="none", help="none | pipe:N")
     ap.add_argument("--combine", type=str, default="sos", help="sos|sens")
-    ap.add_argument("--iterative", action="store_true", help="(placeholder) iterative recon hook")
+    ap.add_argument("--iterative", action="store_true")
     ap.add_argument("--lambda", dest="lam", type=float, default=0.0)
     ap.add_argument("--iters", type=int, default=40)
+    ap.add_argument("--wavelets", type=int, default=None)
     ap.add_argument("--export-nifti", action="store_true")
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--debug", action="store_true")
@@ -785,31 +707,41 @@ def main():
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--spokes-per-frame", type=int, default=None)
     grp.add_argument("--time-per-frame-ms", type=float, default=None)
-    ap.add_argument("--frame-shift", type=int, default=None)
-    ap.add_argument("--tr-ms", type=float, default=None)
-    ap.add_argument("--test-volumes", type=int, default=None)
+    ap.add_argument(
+        "--frame-shift",
+        type=int,
+        default=None,
+        help="Sliding window shift in spokes (default = spokes-per-frame)",
+    )
+    ap.add_argument(
+        "--tr-ms",
+        type=float,
+        default=None,
+        help="Repetition time per spoke (ms); inferred from headers if possible",
+    )
+    ap.add_argument(
+        "--test-volumes",
+        type=int,
+        default=None,
+        help="If set, reconstruct only this many frames",
+    )
 
     args = ap.parse_args()
     DEBUG = args.debug
 
-    if not bart_exists() and not args.force_python_adjoint:
-        print("ERROR: BART not found on PATH. Use --force-python-adjoint or install BART.", file=sys.stderr)
+    if not bart_exists():
+        print("ERROR: BART not found on PATH.", file=sys.stderr)
         sys.exit(1)
 
     series_dir: Path = args.series
     out_base: Path = args.out
     NX, NY, NZ = args.matrix
 
-    # spokes hint from traj file (if present) to keep k-space alignment
-    sp_hint = _probe_traj_spokes(series_dir, NX)
-    if DEBUG:
-        print(f"[debug] traj-derived spokes hint: {sp_hint}")
-
-    # load k-space
+    # k-space
     ksp = load_bruker_kspace(
         series_dir,
         matrix_ro_hint=NX,
-        spokes=(sp_hint if sp_hint is not None else args.spokes),
+        spokes=args.spokes,
         readout=args.readout,
         coils=args.coils,
         fid_dtype=(args.fid_dtype or "int32"),
@@ -821,41 +753,50 @@ def main():
     method = _read_text_kv(series_dir / "method")
     acqp = _read_text_kv(series_dir / "acqp")
 
-    # trajectory: STRICT order
-    # 1) $series/traj
-    bruker_traj = _read_traj_file(series_dir, ro, sp_total)
-    if bruker_traj is None:
-        # 2) method arrays
-        mt = _read_traj_from_method_arrays(series_dir, ro)
+    # trajectory: strict priority: $series/traj -> PVM_TrajK* -> GA_Mode stub
+    bruker_traj: Optional[np.ndarray] = None
+
+    # 1) series/traj
+    if args.traj in ("file", "ga", "method"):
+        bruker_traj = _read_bruker_traj_file(series_dir, ro, sp_total)
+        if bruker_traj is not None:
+            print("[info] Using trajectory from $series/traj")
+
+    # 2) PVM_TrajK*
+    if bruker_traj is None and args.traj in ("method", "ga"):
+        mt = _read_traj_from_method(series_dir, ro, sp_total)
         if mt is not None:
-            bruker_traj, sp_m = mt
-            if sp_m != sp_total:
-                print(f"[warn] method-derived spokes={sp_m} != k-space spokes={sp_total}; trimming.")
-                sp_use = min(sp_m, sp_total)
-                bruker_traj = bruker_traj[:, :, :sp_use]
-                ksp = ksp[:, :sp_use, :]
-                sp_total = sp_use
-        else:
-            # 3) rebuild from method GA/Kronecker
-            sp_hdr = probe_spokes_from_method(series_dir)
-            if sp_hdr is not None and sp_hdr > 0 and sp_hdr != sp_total:
-                ksp = ksp[:, :min(sp_hdr, sp_total), :]
-                sp_total = ksp.shape[1]
-            bruker_traj = derive_traj_from_method(series_dir, ro=ro, spokes=sp_total, matrix=(NX, NY, NZ))
+            bruker_traj = mt
+            print("[info] Using trajectory from method PVM_TrajK*")
+
+    # 3) GA_Mode stub – only if user explicitly asked for --traj ga
+    if bruker_traj is None and args.traj == "ga":
+        spec = TrajSpec(readout=ro, spokes=sp_total, matrix=(NX, NY, NZ))
+        bruker_traj = _traj_from_ga_settings(method, spec)
+
+    if bruker_traj is None:
+        raise FileNotFoundError(
+            "No trajectory found. Provide $series/traj, valid PVM_TrajKx/Ky/Kz in method, "
+            "or use --traj ga *after* implementing _traj_from_ga_settings()."
+        )
+
     if bruker_traj.shape != (3, ro, sp_total):
         raise ValueError(f"trajectory must have shape (3,{ro},{sp_total}); got {bruker_traj.shape}")
 
-    # temporal binning
+    # temporal binning: compute spokes_per_frame
     spokes_per_frame = args.spokes_per_frame
     if spokes_per_frame is None and args.time_per_frame_ms is not None:
         tr_ms = args.tr_ms if args.tr_ms is not None else _derive_tr_ms(method, acqp)
         if tr_ms is None or tr_ms <= 0:
             raise ValueError("--time-per-frame-ms provided but TR unknown. Pass --tr-ms explicitly.")
         spokes_per_frame = max(1, int(round(args.time_per_frame_ms / tr_ms)))
-        print(f"[info] Using spokes_per_frame={spokes_per_frame} (time_per_frame_ms={args.time_per_frame_ms}, TR={tr_ms} ms)")
+        print(
+            f"[info] Using spokes_per_frame={spokes_per_frame} from time_per_frame_ms={args.time_per_frame_ms} and TR={tr_ms} ms"
+        )
     if spokes_per_frame is None:
-        spokes_per_frame = min(sp_total, 1000)
-        print(f"[warn] No frame binning specified; defaulting spokes_per_frame={spokes_per_frame}")
+        # default: entire dataset as a single frame
+        spokes_per_frame = sp_total
+        print(f"[warn] No frame binning specified; using all {sp_total} spokes as a single frame.")
 
     frame_shift = args.frame_shift if args.frame_shift is not None else spokes_per_frame
     if frame_shift <= 0:
@@ -869,30 +810,30 @@ def main():
         raise ValueError("No frames to reconstruct with the chosen (spokes_per_frame, frame_shift).")
     print(f"[info] Sliding-window frames: {nframes} (spf={spokes_per_frame}, shift={frame_shift})")
 
-    # per-frame loop
+    # per-frame DCF+recon
     for fi, s0 in enumerate(starts, 1):
         s1 = s0 + spokes_per_frame
-        if s1 > sp_total:
-            print(f"[warn] Skipping last partial window {s0}:{s1}")
-            break
         ksp_f = ksp[:, s0:s1, :]
         traj_f = bruker_traj[:, :, s0:s1]
-
-        # DCF
+        if ksp_f.shape[1] < spokes_per_frame:
+            print(f"[warn] Skipping last partial window at spokes {s0}:{s1}")
+            break
+        # DCF (per frame) if requested
         dcf = None
         if args.dcf.lower().startswith("pipe"):
             nit = 10
             if ":" in args.dcf:
-                try: nit = int(args.dcf.split(":", 1)[1])
-                except: pass
+                try:
+                    nit = int(args.dcf.split(":", 1)[1])
+                except Exception:
+                    pass
             dcf = dcf_pipe_numpy(traj_f, iters=nit, grid_shape=(NX, NY, NZ))
-
+        # Recon: python or BART
         vol_base = out_base.with_name(out_base.name + f"_vol{fi:05d}")
         if args.force_python_adjoint:
             ksp_in = ksp_f if dcf is None else (ksp_f * dcf[..., None])
             recon_adjoint_python(traj_f, ksp_in, dcf, (NX, NY, NZ), vol_base, combine=args.combine)
         else:
-            # BART path
             ksp16, kspdims = ksp_to_bart_noncart(ksp_f if dcf is None else (ksp_f * dcf[..., None]))
             traj16, trajdims = traj_to_bart_noncart(traj_f)
             ksp_base = vol_base.with_name(vol_base.name + "_ksp")
@@ -902,10 +843,9 @@ def main():
             try:
                 recon_adjoint_bart(traj_base, ksp_base, vol_base, combine=args.combine, gpu=args.gpu)
             except subprocess.CalledProcessError:
-                print("[warn] BART adjoint failed; falling back to pure-NumPy adjoint for this frame.")
+                print("[warn] BART adjoint failed; falling back to pure-NumPy adjoint gridding for this frame.")
                 ksp_in = ksp_f if dcf is None else (ksp_f * dcf[..., None])
                 recon_adjoint_python(traj_f, ksp_in, dcf, (NX, NY, NZ), vol_base, combine=args.combine)
-
         if args.export_nifti:
             run_bart(["toimg", str(vol_base), str(vol_base)], gpu=False)
         print(f"[info] Frame {fi}/{nframes} done -> {vol_base}")
