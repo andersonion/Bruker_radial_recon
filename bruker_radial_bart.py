@@ -3,28 +3,41 @@
 bruker_radial_bart.py
 
 Bruker 3D radial reconstruction using BART (adjoint NUFFT) with sliding-window
-temporal binning and optional synthetic golden-angle / Kronecker trajectories.
+temporal binning and synthetic golden-angle / Kronecker trajectories.
 
-Mode B:
+Current behavior (Mode B):
 
 - Load Bruker FID, infer RO / Spokes / Coils, trim padded RO blocks.
-- Treat acquisition as one continuous stream of spokes (reps * echoes * averages * slices collapsed).
-- Temporal binning by spokes: --spokes-per-frame, --frame-shift, --test-volumes.
-- Trajectory handling:
-    * If $series/traj exists: (currently not implemented; raises NotImplementedError)
-    * Else: build synthetic trajectory using --traj-mode kron|linear_z
-      using the exact GA / Kronecker math from the Bruker sequence.
-- Reconstruction:
-    * Optional per-frame Pipe-style DCF (NumPy): --dcf pipe:N
-    * Per-frame adjoint NUFFT via BART: nufft -i -t traj ksp coil
-    * Coil combination via BART: rss 8
-    * Always export NIfTI via: bart toimg <cfl_base> <output_nii>
+- Treat acquisition as one continuous stream of spokes
+  (reps * echoes * averages * slices collapsed).
+- Temporal binning by spokes:
+    --spokes-per-frame N
+    --frame-shift M  (sliding window; default = N for non-overlap)
+    --test-volumes K (limit to first K frames)
+- Trajectory:
+    * If $series/traj exists: currently NOT implemented (hard error).
+    * Else: build synthetic 3D radial trajectory via --traj-mode kron|linear_z
+      using GA/Kronecker math from the Bruker sequence.
+- DCF:
+    * Optional pipe-style DCF via NumPy: --dcf pipe:N (N iterations).
+- Reconstruction per frame:
+    * BART adjoint NUFFT: nufft -i -t traj ksp coil
+    * Coil combine: rss 8 -> single complex 3D image
+- Output:
+    * All frames stacked into a single 4D NIfTI: (NX, NY, NZ, T) at --out
+    * One QC 3D NIfTI for a chosen frame: --qc-frame (1-based index)
 """
 
 from __future__ import annotations
-import argparse, math, shutil, subprocess, sys, re
+import argparse
+import math
+import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Iterable
+
 import numpy as np
 
 DEBUG = False
@@ -93,20 +106,30 @@ def _write_hdr(path: Path, dims: List[int]):
 
 
 def _write_cfl(base: Path, arr: np.ndarray, dims: Optional[List[int]] = None):
-    """Write BART .cfl/.hdr pair from a numpy array (complex64)."""
+    """
+    Write BART .cfl/.hdr pair from a numpy array (complex64).
+
+    Fixed to avoid the "last axis must be contiguous" error by explicitly
+    flattening in Fortran order before viewing as float32.
+    """
     base = Path(base)
     cfl = base.with_suffix(".cfl")
     hdr = base.with_suffix(".hdr")
+
     a = np.asarray(arr, dtype=np.complex64, order="F")
+    flat = a.ravel(order="F").view(np.float32)
+
     if dims is None:
         shape = list(a.shape)
         dims = shape + [1] * (16 - len(shape))
     else:
         dims = [int(d) for d in dims] + [1] * (16 - len(dims))
+
     if np.prod(dims) != a.size:
         raise ValueError(f"dims product {np.prod(dims)} != array size {a.size}")
+
     _write_hdr(hdr, dims)
-    a.view(np.float32).tofile(cfl)
+    flat.tofile(cfl)
 
 
 def read_cfl(base: Path) -> np.ndarray:
@@ -191,8 +214,8 @@ def load_bruker_kspace(
     spokes: Optional[int] = None,
     readout: Optional[int] = None,
     coils: Optional[int] = None,
-    fid_dtype: str = "int32",
-    fid_endian: str = "little",
+    fid_dtype: Optional[str] = None,
+    fid_endian: Optional[str] = None,
 ) -> np.ndarray:
     """
     Load Bruker k-space as array (RO, Spokes, Coils).
@@ -232,6 +255,7 @@ def load_bruker_kspace(
         fid_endian = "little"
     if "BYTORDA" in acqp and "big" in acqp["BYTORDA"].lower():
         fid_endian = "big"
+
     if fid_dtype is None:
         fid_dtype = "int32"
     if "ACQ_word_size" in acqp:
@@ -371,7 +395,7 @@ def build_synthetic_traj(ro: int, spokes: int, mode: str) -> np.ndarray:
     """
     Build synthetic 3D radial trajectory of shape (3, RO, Spokes)
     using Bruker GA / Kronecker math. Coordinates are in units of
-    1/FOV and span radius ~[-0.5,0.5] (Nyquist).
+    1/FOV and span radius ~[-0.5,0.5] (Nyquist-ish).
     """
     mode = mode.lower()
     if mode not in ("kron", "linear_z"):
@@ -518,6 +542,28 @@ def bart_recon_frame(
         raise ValueError("Only sos coil combine is implemented right now.")
 
 
+def cfl_to_3d_numpy(img_base: Path, nx: int, ny: int, nz: int) -> np.ndarray:
+    """
+    Load a BART image CFL and reshape to (NX,NY,NZ) if possible.
+    Assumes image is single-volume, single-complex channel.
+    """
+    arr = read_cfl(img_base)  # dims16
+    total = arr.size
+    if total != nx * ny * nz:
+        # Try to infer from dims >1 if exactly 3 such dims
+        shape = list(arr.shape)
+        non1 = [d for d in shape if d > 1]
+        if len(non1) == 3 and np.prod(non1) == total:
+            img = arr.reshape(non1, order="F")
+            return img.astype(np.complex64)
+        raise ValueError(
+            f"BART image size {total} != NX*NY*NZ={nx*ny*nz}. "
+            f"Shape from hdr: {arr.shape}"
+        )
+    img = arr.reshape((nx, ny, nz), order="F")
+    return img.astype(np.complex64)
+
+
 # ---------- Temporal binning ----------
 
 def frame_starts(total_spokes: int, spokes_per_frame: int, frame_shift: Optional[int]) -> Iterable[int]:
@@ -540,7 +586,7 @@ def main():
     ap.add_argument("--series", type=Path, required=True,
                     help="Bruker series directory (contains fid, acqp, method).")
     ap.add_argument("--out", type=Path, required=True,
-                    help="Output base path; per-frame suffix _volXXXXX is added before extension.")
+                    help="Output base path (4D NIfTI written at this stem).")
     ap.add_argument("--matrix", type=int, nargs=3, required=True, metavar=("NX", "NY", "NZ"))
     ap.add_argument("--combine", type=str, default="sos", help="Coil combine: sos (only).")
     ap.add_argument("--gpu", action="store_true", help="Use BART GPU NUFFT if available.")
@@ -563,6 +609,8 @@ def main():
                     help="TR per spoke in ms (for time-per-frame-ms).")
     ap.add_argument("--test-volumes", type=int, default=None,
                     help="If set, reconstruct only first N frames.")
+    ap.add_argument("--qc-frame", type=int, default=1,
+                    help="1-based index of frame to write as separate 3D QC NIfTI.")
 
     # DCF
     ap.add_argument("--dcf", type=str, default="none", help="none | pipe:N (Pipe-style DCF iterations).")
@@ -589,8 +637,8 @@ def main():
         spokes=args.spokes,
         readout=args.readout,
         coils=args.coils,
-        fid_dtype=(args.fid_dtype or "int32"),
-        fid_endian=(args.fid_endian or "little"),
+        fid_dtype=args.fid_dtype,
+        fid_endian=args.fid_endian,
     )
     ro, sp_total, nc = ksp.shape
     print(f"[info] Loaded k-space: RO={ro}, Spokes={sp_total}, Coils={nc}")
@@ -649,7 +697,9 @@ def main():
             except Exception:
                 pass
 
-    # per-frame recon
+    # per-frame recon -> collect into list of 3D images
+    frames_imgs: List[np.ndarray] = []
+
     for fi, s0 in enumerate(starts, 1):
         s1 = s0 + spokes_per_frame
         if s1 > sp_total:
@@ -665,20 +715,59 @@ def main():
         else:
             ksp_w = ksp_f
 
-        # Per-frame base name (before extension)
+        # Per-frame base name (for intermediate CFL)
         vol_base_stem = out_base.stem + f"_vol{fi:05d}"
         vol_cfl_base = out_base.with_name(vol_base_stem)
 
+        # BART adjoint + rss
         bart_recon_frame(traj_f, ksp_w, vol_cfl_base, combine=args.combine, gpu=args.gpu)
 
-        # Always export NIfTI for QA
-        nii_out = vol_cfl_base
-        if nii_out.suffix.lower() not in (".nii", ".nii.gz"):
-            nii_out = vol_cfl_base.with_suffix(".nii")
-        run_bart(["toimg", str(vol_cfl_base), str(nii_out)], gpu=False)
+        # Pull back as a 3D numpy array (NX,NY,NZ)
+        img3 = cfl_to_3d_numpy(vol_cfl_base, NX, NY, NZ)
+        frames_imgs.append(img3)
 
-        print(f"[info] Frame {fi}/{nframes} done -> {nii_out}")
+        print(f"[info] Frame {fi}/{nframes} done -> intermediate {vol_cfl_base}.cfl")
 
+    if not frames_imgs:
+        raise RuntimeError("No frames were reconstructed; nothing to write.")
+
+    # Stack into 4D (NX, NY, NZ, T)
+    img4d = np.stack(frames_imgs, axis=3).astype(np.complex64)
+    nt = img4d.shape[3]
+
+    # Main 4D output CFL
+    main_cfl_base = out_base
+    _write_cfl(main_cfl_base, img4d, [NX, NY, NZ, nt])
+
+    # Choose QC frame (1-based index)
+    qc_frame = args.qc_frame if args.qc_frame is not None else 1
+    if qc_frame < 1:
+        qc_frame = 1
+    if qc_frame > nt:
+        qc_frame = nt
+    qc_idx = qc_frame - 1
+    qc_img3 = img4d[:, :, :, qc_idx]
+    qc_base = out_base.with_name(out_base.stem + f"_QC_vol{qc_frame:05d}")
+    _write_cfl(qc_base, qc_img3, [NX, NY, NZ])
+
+    # Convert CFL(s) to NIfTI via BART toimg
+    # Main 4D NIfTI
+    if main_cfl_base.suffix.lower() in (".nii", ".nii.gz"):
+        main_nii = main_cfl_base
+        main_cfl_for_toimg = main_cfl_base.with_suffix("")  # but we already wrote CFL using out_base directly
+    else:
+        main_cfl_for_toimg = main_cfl_base
+        main_nii = main_cfl_base.with_suffix(".nii.gz")
+
+    # We wrote CFL with base = out_base; so toimg should use that base
+    run_bart(["toimg", str(main_cfl_base), str(main_nii)], gpu=False)
+
+    # QC NIfTI
+    qc_nii = qc_base.with_suffix(".nii.gz")
+    run_bart(["toimg", str(qc_base), str(qc_nii)], gpu=False)
+
+    print(f"[info] 4D NIfTI written to: {main_nii}")
+    print(f"[info] QC frame {qc_frame} written to: {qc_nii}")
     print("[info] All requested frames complete.")
 
 
