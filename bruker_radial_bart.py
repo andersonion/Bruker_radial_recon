@@ -5,7 +5,7 @@ bruker_radial_bart.py
 Bruker 3D radial reconstruction using BART (adjoint NUFFT) with sliding-window
 temporal binning and synthetic golden-angle / Kronecker trajectories.
 
-Current behavior (Mode B):
+Behavior:
 
 - Load Bruker FID, infer RO / Spokes / Coils, trim padded RO blocks.
 - Treat acquisition as one continuous stream of spokes
@@ -17,12 +17,14 @@ Current behavior (Mode B):
 - Trajectory:
     * If $series/traj exists: currently NOT implemented (hard error).
     * Else: build synthetic 3D radial trajectory via --traj-mode kron|linear_z
-      using GA/Kronecker math from the Bruker sequence.
+      using GA/Kronecker math from the Bruker sequence code you provided.
 - DCF:
     * Optional pipe-style DCF via NumPy: --dcf pipe:N (N iterations).
 - Reconstruction per frame:
-    * BART adjoint NUFFT: nufft -i -t traj ksp coil
-    * Coil combine: rss 8 -> single complex 3D image
+    * BART adjoint NUFFT (non-cart):
+        traj dims: [3,1,1,1,1,1,1,1,1,1,RO,Sp,1,1,1,1]
+        ksp  dims: [1,1,1,COILS,1,1,1,1,1,1,RO,Sp,1,1,1,1]
+      then rss 8 for SoS.
 - Output:
     * All frames stacked into a single 4D NIfTI: (NX, NY, NZ, T) at --out
     * One QC 3D NIfTI for a chosen frame: --qc-frame (1-based index)
@@ -395,7 +397,7 @@ def build_synthetic_traj(ro: int, spokes: int, mode: str) -> np.ndarray:
     """
     Build synthetic 3D radial trajectory of shape (3, RO, Spokes)
     using Bruker GA / Kronecker math. Coordinates are in units of
-    1/FOV and span radius ~[-0.5,0.5] (Nyquist-ish).
+    1/FOV and span radius ~[-0.5,0.5].
     """
     mode = mode.lower()
     if mode not in ("kron", "linear_z"):
@@ -455,6 +457,32 @@ def dcf_pipe_numpy(traj: np.ndarray, iters: int, grid_shape: Tuple[int, int, int
         w = w / denom
         w *= (w.size / max(np.sum(w), eps))
     return w
+
+
+# ---------- BART helpers for non-Cart layout ----------
+
+def ksp_to_bart_noncart(ksp: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    """
+    Map ksp (RO, Spokes, Coils) to BART noncart dims:
+    [1,1,1,COILS,1,1,1,1,1,1,RO,Sp,1,1,1,1]
+    """
+    ro, sp, nc = ksp.shape
+    arr = ksp.astype(np.complex64, order="F")
+    arr = arr.reshape(1, 1, 1, nc, 1, 1, 1, 1, 1, 1, ro, sp, 1, 1, 1, 1, order="F")
+    dims = [1, 1, 1, nc, 1, 1, 1, 1, 1, 1, ro, sp, 1, 1, 1, 1]
+    return arr, dims
+
+
+def traj_to_bart_noncart(traj: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    """
+    Map traj (3, RO, Spokes) to BART noncart dims:
+    [3,1,1,1,1,1,1,1,1,1,RO,Sp,1,1,1,1]
+    """
+    _, ro, sp = traj.shape
+    arr = traj.astype(np.complex64, order="F")
+    arr = arr.reshape(3, 1, 1, 1, 1, 1, 1, 1, 1, 1, ro, sp, 1, 1, 1, 1, order="F")
+    dims = [3, 1, 1, 1, 1, 1, 1, 1, 1, 1, ro, sp, 1, 1, 1, 1]
+    return arr, dims
 
 
 # ---------- BART wrappers ----------
@@ -522,15 +550,16 @@ def bart_recon_frame(
     Writes coil and combined image to BART .cfl/.hdr at out_cfl_base.
     """
     ro, sp, nc = ksp_f.shape
-    traj_b = traj_f.astype(np.complex64)
-    ksp_b = np.transpose(ksp_f, (2, 0, 1)).astype(np.complex64)  # (Coils,RO,Spokes)
+
+    traj_b, traj_dims = traj_to_bart_noncart(traj_f)
+    ksp_b, ksp_dims = ksp_to_bart_noncart(ksp_f)
 
     traj_base = out_cfl_base.with_name(out_cfl_base.name + "_traj")
     ksp_base = out_cfl_base.with_name(out_cfl_base.name + "_ksp")
     coil_base = out_cfl_base.with_name(out_cfl_base.name + "_coil")
 
-    _write_cfl(traj_base, traj_b, [3, ro, sp])
-    _write_cfl(ksp_base, ksp_b, [nc, ro, sp])
+    _write_cfl(traj_base, traj_b, traj_dims)
+    _write_cfl(ksp_base, ksp_b, ksp_dims)
 
     # adjoint NUFFT (image from noncart k-space)
     run_bart(["nufft", "-i", "-t", str(traj_base), str(ksp_base), str(coil_base)], gpu=gpu)
@@ -586,7 +615,7 @@ def main():
     ap.add_argument("--series", type=Path, required=True,
                     help="Bruker series directory (contains fid, acqp, method).")
     ap.add_argument("--out", type=Path, required=True,
-                    help="Output base path (4D NIfTI written at this stem).")
+                    help="Output base path; 4D NIfTI written here.")
     ap.add_argument("--matrix", type=int, nargs=3, required=True, metavar=("NX", "NY", "NZ"))
     ap.add_argument("--combine", type=str, default="sos", help="Coil combine: sos (only).")
     ap.add_argument("--gpu", action="store_true", help="Use BART GPU NUFFT if available.")
@@ -646,7 +675,7 @@ def main():
     # Trajectory handling
     traj_path = series_dir / "traj"
     if traj_path.exists():
-        # Not yet wired: we currently rely on synthetic GA/Kronecker.
+        # Not yet wired: we currently rely on synthetic GA/Kronecker only.
         raise NotImplementedError("Reading existing $series/traj file not yet implemented.")
     else:
         if args.traj_mode is None:
@@ -659,7 +688,8 @@ def main():
 
     # Temporal binning
     spokes_per_frame = args.spokes_per_frame
-    if spokes_per_frame is None and args.time_per_frame_ms is not None:
+    if spokes_per_frame is None and args.time_per-frame_ms is not None:
+        # This branch is currently unused in your tests; we can revisit later if needed.
         tr_ms = args.tr_ms
         if tr_ms is None or tr_ms <= 0.0:
             raise ValueError("--time-per-frame-ms provided but TR unknown; please pass --tr-ms explicitly.")
@@ -751,18 +781,9 @@ def main():
     _write_cfl(qc_base, qc_img3, [NX, NY, NZ])
 
     # Convert CFL(s) to NIfTI via BART toimg
-    # Main 4D NIfTI
-    if main_cfl_base.suffix.lower() in (".nii", ".nii.gz"):
-        main_nii = main_cfl_base
-        main_cfl_for_toimg = main_cfl_base.with_suffix("")  # but we already wrote CFL using out_base directly
-    else:
-        main_cfl_for_toimg = main_cfl_base
-        main_nii = main_cfl_base.with_suffix(".nii.gz")
-
-    # We wrote CFL with base = out_base; so toimg should use that base
+    main_nii = out_base.with_suffix(".nii.gz")
     run_bart(["toimg", str(main_cfl_base), str(main_nii)], gpu=False)
 
-    # QC NIfTI
     qc_nii = qc_base.with_suffix(".nii.gz")
     run_bart(["toimg", str(qc_base), str(qc_nii)], gpu=False)
 
