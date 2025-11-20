@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
+"""
+Bruker 3D radial recon using BART (sliding window, GA/Kronecker synthetic traj).
+
+Key points:
+- Load Bruker fid, infer RO / spokes / coils, but NEVER let RO < NX if --matrix is given.
+- If series/traj(.cfl/.hdr or raw) exists, use it.
+- Otherwise, build synthetic trajectory via Kronecker or linear-Z golden-angle math.
+- Sliding-window binning with --spokes-per-frame and --frame-shift.
+- Per-frame BART NUFFT adjoint + RSS (SoS), then:
+  * stack frames into a single 4D array (NX,NY,NZ,Nt)
+  * always write 4D NIfTI
+  * also write a single QC NIfTI for a chosen frame (--qc-frame, default 1)
+"""
+
 import argparse, math, shutil, subprocess, sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Iterable
 import numpy as np
 
 try:
-    import nibabel as nib  # for NIfTI output
+    import nibabel as nib
 except ImportError:
     nib = None
 
@@ -41,8 +54,12 @@ def read_cfl(base: Path) -> np.ndarray:
     cfl = base.with_suffix(".cfl")
     with open(hdr, "r") as f:
         lines = f.read().split()
-    # Grab all integers as dims
-    dims = [int(x) for x in lines if x.isdigit()]
+    dims = []
+    for tok in lines:
+        try:
+            dims.append(int(tok))
+        except ValueError:
+            continue
     if not dims:
         raise ValueError(f"Could not parse dims from {hdr}")
     n = int(np.prod(dims))
@@ -93,7 +110,7 @@ def _parse_acq_size(method: Dict[str,str], acqp: Dict[str,str]) -> Optional[Tupl
     txt = method.get("PVM_EncMatrix", "") or method.get("ACQ_size", "")
     if not txt:
         return None
-    nums = []
+    nums: List[int] = []
     for tok in txt.replace("(", " ").replace(")", " ").replace(",", " ").split():
         try:
             nums.append(int(tok))
@@ -112,6 +129,12 @@ def load_bruker_kspace(
     fid_dtype: str = "int32",
     fid_endian: str = "little",
 ) -> np.ndarray:
+    """
+    Load Bruker radial FID and reshape to (RO, Spokes, Coils).
+
+    IMPORTANT: if matrix_ro_hint is provided (NX from --matrix), we never accept an
+    inferred readout smaller than that. This avoids bogus RO=3 cases.
+    """
     series_dir = Path(series_dir)
     fid_path = series_dir / "fid"
     if not fid_path.exists():
@@ -120,7 +143,7 @@ def load_bruker_kspace(
     method = _read_text_kv(series_dir / "method")
     acqp = _read_text_kv(series_dir / "acqp")
 
-    # dtype / endian from headers if possible
+    # dtype/endian from headers if possible
     if "BYTORDA" in acqp and "big" in acqp["BYTORDA"].lower():
         fid_endian = "big"
     if "ACQ_word_size" in acqp:
@@ -143,13 +166,20 @@ def load_bruker_kspace(
     total = cpx.size
     dbg("total complex samples:", total, "(dtype:", fid_dtype, ", endian:", fid_endian, ")")
 
+    # readout guess from headers
     if readout is None:
         acq_size = _parse_acq_size(method, acqp)
         if acq_size:
+            dbg("PVM_EncMatrix/ACQ_size:", acq_size)
             readout = acq_size[0]
-    if readout is None and matrix_ro_hint is not None:
-        readout = matrix_ro_hint
-    dbg("readout hint:", readout)
+
+    # matrix_ro_hint (NX) is authoritative lower bound
+    if matrix_ro_hint is not None:
+        if readout is None or readout < matrix_ro_hint:
+            dbg("overriding header readout", readout, "to matrix_ro_hint", matrix_ro_hint)
+            readout = matrix_ro_hint
+
+    dbg("readout (final hint):", readout)
 
     if coils is None:
         nrec = _get_int_from_headers(["PVM_EncNReceivers"], [method])
@@ -183,18 +213,29 @@ def load_bruker_kspace(
                 raise ValueError("Cannot factor FID length (coils / extras).")
     per_coil_total = total // denom
 
-    def pick_block_and_spokes(per_coil_total: int, readout_hint: Optional[int], spokes_hint: Optional[int]) -> Tuple[int, int]:
+    def pick_block_and_spokes(
+        per_coil_total: int,
+        readout_hint: Optional[int],
+        spokes_hint: Optional[int],
+    ) -> Tuple[int, int]:
+        # Prefer using spokes_hint if consistent
         if spokes_hint and spokes_hint > 0 and per_coil_total % spokes_hint == 0:
             return per_coil_total // spokes_hint, spokes_hint
         BLOCKS = [
             128,160,192,200,224,240,256,288,320,352,384,400,416,420,432,448,480,496,512,
             544,560,576,608,640,672,704,736,768,800,832,896,960,992,1024,1152,1280,1536,2048,
         ]
-        if readout_hint and per_coil_total % readout_hint == 0:
-            return readout_hint, per_coil_total // readout_hint
-        for b in [x for x in BLOCKS if (readout_hint is None or x >= readout_hint)]:
+        # If we have a readout hint, only consider blocks >= that
+        if readout_hint and readout_hint > 0:
+            if per_coil_total % readout_hint == 0:
+                return readout_hint, per_coil_total // readout_hint
+            candidates = [b for b in BLOCKS if b >= readout_hint]
+        else:
+            candidates = BLOCKS
+        for b in candidates:
             if per_coil_total % b == 0:
                 return b, per_coil_total // b
+        # fall back to generic factor search
         s = int(round(per_coil_total ** 0.5))
         for d in range(0, s+1):
             for cand in (s+d, s-d):
@@ -210,7 +251,7 @@ def load_bruker_kspace(
 
     ksp_blk = np.reshape(cpx, (stored_ro, spokes_final, coils), order="F")
     if readout is not None and stored_ro >= readout:
-        ksp = ksp_blk[:readout,:,:]
+        ksp = ksp_blk[:readout, :, :]
         dbg("trimmed RO from", stored_ro, "to", readout)
     else:
         ksp = ksp_blk
@@ -291,11 +332,11 @@ def build_synthetic_traj(mode: str, ro: int, sp_total: int) -> np.ndarray:
             dx, dy, dz = kron_dir(i, N)
         else:
             dx, dy, dz = linz_ga_dir(i, N)
-        for t in range(ro):
-            r = (t - half) / ro  # roughly [-0.5,0.5]
-            kx[t, i] = r * dx
-            ky[t, i] = r * dy
-            kz[t, i] = r * dz
+        # radius along readout (centered at 0, ~[-0.5,0.5])
+        r = (np.arange(ro) - half) / ro
+        kx[:, i] = r * dx
+        ky[:, i] = r * dy
+        kz[:, i] = r * dz
     traj = np.stack([kx, ky, kz], axis=0)
     return traj
 
@@ -387,7 +428,7 @@ def bart_recon_frame(traj: np.ndarray, ksp: np.ndarray, out_base: Path, combine:
     _write_cfl(ksp_base, ksp_arr, ksp_dims)
     _write_cfl(traj_base, traj_arr, traj_dims)
     coil_base = out_base.with_name(out_base.name + "_coil")
-    # force desired image dims via -d
+    # force image size via -d
     run_bart(["nufft", "-i", "-d", f"{NX}:{NY}:{NZ}", "-t", str(traj_base), str(ksp_base), str(coil_base)])
     if combine.lower() == "sos":
         run_bart(["rss", "8", str(coil_base), str(out_base)])
@@ -427,7 +468,8 @@ def main():
                     help="Synthetic trajectory mode when no traj file: kron or linear_z")
     ap.add_argument("--spokes-per-frame", type=int, default=None)
     ap.add_argument("--frame-shift", type=int, default=None)
-    ap.add_argument("--qc-frame", type=int, default=1, help="Which frame index to write as standalone QC NIfTI (1-based)")
+    ap.add_argument("--qc-frame", type=int, default=1,
+                    help="Which frame index to write as standalone QC NIfTI (1-based)")
     ap.add_argument("--test-volumes", type=int, default=None,
                     help="If set, only reconstruct this many frames (for quick tests)")
     ap.add_argument("--debug", action="store_true")
