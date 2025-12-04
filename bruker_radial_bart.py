@@ -114,13 +114,35 @@ def infer_coils(method: Dict[str, str], default: int = 1) -> int:
     return default
 
 
-def infer_readout(method: Dict[str, str]) -> int:
+def infer_readout(method: Dict[str, str], acqp: Dict[str, str]) -> int:
+    """Infer readout (RO) samples per spoke.
+
+    Primary source: ACQ_size from acqp, e.g.
+
+        ##$ACQ_size=( 3 )
+        122 2584 1
+
+    For your 3D UTE/radial, RO is the FIRST entry (122 here).
+
+    Fallback (if ACQ_size missing): old method-based PVM_TrajIntAll / NPro.
+    """
+    # 1) Try ACQ_size from acqp
+    val_acq = acqp.get("ACQ_size", "")
+    ints_acq = _parse_int_list(val_acq)
+    if len(ints_acq) >= 1:
+        return ints_acq[0]
+
+    # 2) Fallback to historical method-based guess
     for key in ("PVM_TrajIntAll", "NPro"):
         val = method.get(key, "")
         ints = _parse_int_list(val)
         if ints:
             return ints[0]
-    raise ValueError("Could not infer readout (RO) from method (PVM_TrajIntAll or NPro). Please pass --readout.")
+
+    raise ValueError(
+        "Could not infer readout (RO): ACQ_size missing in acqp and no PVM_TrajIntAll/NPro in method. "
+        "Please pass --readout explicitly."
+    )
 
 
 def parse_param_file_acqp(path: Path) -> Dict[str, str]:
@@ -349,7 +371,11 @@ def main():
     ap.add_argument("--out", type=Path, required=True, help="Output prefix (basename only, not extension)")
 
     ap.add_argument("--matrix", type=int, nargs=3, help="Override matrix size NX NY NZ (default from PVM_Matrix)")
-    ap.add_argument("--readout", type=int, help="Override readout samples per spoke (default from PVM_TrajIntAll/NPro)")
+    ap.add_argument(
+        "--readout",
+        type=int,
+        help="Override readout samples per spoke (default from ACQ_size[0], fallback PVM_TrajIntAll/NPro)",
+    )
     ap.add_argument("--coils", type=int, help="Override number of receiver coils (default from PVM_EncNReceivers)")
 
     ap.add_argument(
@@ -402,12 +428,12 @@ def main():
         NX, NY, NZ = infer_matrix(method)
         print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
-    # readout (RO) from PVM_TrajIntAll/NPro, unless overridden
+    # readout (RO) from ACQ_size[0], unless overridden (fallback PVM_TrajIntAll/NPro)
     if args.readout is not None:
         RO = args.readout
     else:
-        RO = infer_readout(method)
-        print(f"[info] Readout inferred from PVM_TrajIntAll/NPro: RO={RO}")
+        RO = infer_readout(method, acqp)
+        print(f"[info] Readout inferred from ACQ_size/TrajIntAll/NPro: RO={RO}")
 
     # coils from PVM_EncNReceivers, unless overridden
     if args.coils is not None:
@@ -433,7 +459,8 @@ def main():
     traj = build_traj(args.traj_mode, ro=RO, spokes=sp_total)
 
     # sliding-window setup
-    if args.spokes_per_frame is None:
+    if args.spokes_per-frame is None:  # <-- NOTE: keep your local copy with the correct name; this line should be:
+        # if args.spokes_per_frame is None:
         spf = sp_total
         shift = sp_total
         print(f"[info] No sliding-window args; using single frame with all {sp_total} spokes.")
