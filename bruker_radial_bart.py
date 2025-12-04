@@ -115,34 +115,42 @@ def infer_coils(method: Dict[str, str], default: int = 1) -> int:
 
 
 def infer_readout(method: Dict[str, str], acqp: Dict[str, str]) -> int:
-    """Infer readout (RO) samples per spoke.
-
-    Primary source: ACQ_size from acqp, e.g.
-
-        ##$ACQ_size=( 3 )
-        122 2584 1
-
-    For your 3D UTE/radial, RO is the FIRST entry (122 here).
-
-    Fallback (if ACQ_size missing): old method-based PVM_TrajIntAll / NPro.
     """
-    # 1) Try ACQ_size from acqp
-    val_acq = acqp.get("ACQ_size", "")
-    ints_acq = _parse_int_list(val_acq)
-    if len(ints_acq) >= 1:
-        return ints_acq[0]
+    Infer *true* readout samples per spoke (RO) from headers.
 
-    # 2) Fallback to historical method-based guess
-    for key in ("PVM_TrajIntAll", "NPro"):
-        val = method.get(key, "")
-        ints = _parse_int_list(val)
-        if ints:
-            return ints[0]
+    For your UTE3D case:
+      ACQ_size = 122 2584 1
+      -> RO = 122 (2nd entry)
 
-    raise ValueError(
-        "Could not infer readout (RO): ACQ_size missing in acqp and no PVM_TrajIntAll/NPro in method. "
-        "Please pass --readout explicitly."
-    )
+    Fallbacks if needed:
+      - PVM_TrajIntAll
+      - NPro
+    """
+    # ACQ_size: e.g. "122 2584 1" where the second entry is RO
+    acq_val = acqp.get("ACQ_size", "")
+    acq_ints = _parse_int_list(acq_val)
+    if len(acq_ints) >= 2:
+        ro = acq_ints[0] if False else acq_ints[1]  # 122 in your example
+        print(f"[info] Readout (true RO) inferred from ACQ_size: RO={ro}")
+        return ro
+
+    # Fallback: PVM_TrajIntAll
+    val = method.get("PVM_TrajIntAll", "")
+    ints = _parse_int_list(val)
+    if ints:
+        ro = ints[0]
+        print(f"[info] Readout inferred from PVM_TrajIntAll: RO={ro}")
+        return ro
+
+    # Fallback: NPro
+    val = method.get("NPro", "")
+    ints = _parse_int_list(val)
+    if ints:
+        ro = ints[0]
+        print(f"[info] Readout inferred from NPro: RO={ro}")
+        return ro
+
+    raise ValueError("Could not infer readout (RO) from ACQ_size / PVM_TrajIntAll / NPro. Please pass --readout.")
 
 
 def parse_param_file_acqp(path: Path) -> Dict[str, str]:
@@ -165,13 +173,49 @@ def infer_fid_endian(acqp: Dict[str, str]) -> str:
     return "little"
 
 
+def infer_extras(method: Dict[str, str], acqp: Dict[str, str]) -> Dict[str, int]:
+    """Infer extra dimensions: echoes, reps, averages, slices."""
+    def get_int(keys, srcs, default=1):
+        for k in keys:
+            for s in srcs:
+                if k in s:
+                    ints = _parse_int_list(s[k])
+                    if ints:
+                        return ints[0]
+        return default
+
+    echoes = get_int(
+        ["NECHOES", "ACQ_n_echo_images", "PVM_NEchoImages"],
+        [method, acqp],
+        default=1,
+    )
+    reps = get_int(["PVM_NRepetitions", "NR"], [method, acqp], default=1)
+    averages = get_int(["PVM_NAverages", "NA"], [method, acqp], default=1)
+    slices = get_int(["NSLICES", "PVM_SPackArrNSlices"], [method, acqp], default=1)
+
+    extras = {
+        "echoes": echoes,
+        "reps": reps,
+        "averages": averages,
+        "slices": slices,
+    }
+    return extras
+
+
 def load_bruker_kspace(
     series_dir: Path,
-    readout: int,
-    coils: int,
+    readout: Optional[int],
+    coils: Optional[int],
     fid_dtype: Optional[str] = None,
     fid_endian: Optional[str] = None,
 ) -> np.ndarray:
+    """
+    Bruker FID loader that understands padded readout blocks and extra dims.
+
+    - Factors FID into (stored_ro, spokes_total, coils) using a BLOCKS table.
+    - Uses `readout` as a *hint* for the true RO (e.g., 122).
+    - Trims from stored_ro down to `readout` if stored_ro >= readout.
+    """
     fid_path = series_dir / "fid"
     if not fid_path.exists():
         raise FileNotFoundError(f"No fid file in series dir: {fid_path}")
@@ -186,7 +230,9 @@ def load_bruker_kspace(
     if coils is None or coils <= 0:
         coils = infer_coils(method, default=1)
 
-    dbg("fid_dtype:", fid_dtype, "fid_endian:", fid_endian, "coils:", coils)
+    readout_hint = readout  # e.g., 122 for your case
+
+    dbg("fid_dtype:", fid_dtype, "fid_endian:", fid_endian, "coils:", coils, "readout_hint:", readout_hint)
 
     dt_map = {
         "int16": np.int16,
@@ -202,25 +248,93 @@ def load_bruker_kspace(
     if fid_endian == "big":
         raw = raw.byteswap().newbyteorder()
 
+    # complex packing
     if raw.size % 2 != 0:
         raw = raw[:-1]
     cpx = raw.astype(np.float32).view(np.complex64)
     total = cpx.size
     dbg("total complex samples:", total)
 
-    denom = readout * coils
-    if total % denom != 0:
-        raise ValueError(
-            f"FID length {total} not divisible by readout*coils={denom}. "
-            "This simple loader assumes a single echo/slice/rep 3D radial series. "
-            "Adjust --readout/--coils or extend loader to factor other dims."
-        )
+    # extras (echoes, reps, averages, slices)
+    extras = infer_extras(method, acqp)
+    other_factor = 1
+    for key, v in extras.items():
+        if isinstance(v, int) and v > 1:
+            other_factor *= v
+    if other_factor < 1:
+        other_factor = 1
+    dbg("extras:", extras, "other_factor:", other_factor)
 
-    spokes = total // denom
-    dbg("computed spokes:", spokes)
+    # First attempt: assume extras are correct
+    def factor_with_extras(total, coils, other_factor, readout_hint):
+        denom = coils * max(1, other_factor)
+        if total % denom != 0:
+            return None
+        per_coil_total = total // denom
 
-    ksp = np.reshape(cpx, (readout, spokes, coils), order="F")
-    print(f"[info] Loaded k-space: RO={readout}, Spokes={spokes}, Coils={coils}")
+        def pick_block_and_spokes(per_coil_total: int, readout_hint: Optional[int]) -> Tuple[int, int]:
+            # Common Bruker stored RO block sizes
+            BLOCKS = [
+                64, 96, 128, 160, 192, 200, 224, 240, 256, 288, 320, 352, 384, 400,
+                416, 420, 432, 448, 480, 496, 512, 544, 560, 576, 608, 640, 672, 704,
+                736, 768, 800, 832, 896, 960, 992, 1024, 1152, 1280, 1536, 2048
+            ]
+
+            # If readout_hint works exactly, use it as stored_ro
+            if readout_hint and readout_hint > 0 and per_coil_total % readout_hint == 0:
+                return readout_hint, per_coil_total // readout_hint
+
+            # Otherwise, search common block sizes >= readout_hint (if present)
+            for b in BLOCKS:
+                if readout_hint is not None and b < readout_hint:
+                    continue
+                if per_coil_total % b == 0:
+                    return b, per_coil_total // b
+
+            # Last resort: generic factor close to sqrt
+            s = int(round(per_coil_total ** 0.5))
+            for d in range(0, s + 1):
+                for cand in (s + d, s - d):
+                    if cand > 0 and per_coil_total % cand == 0:
+                        return cand, per_coil_total // cand
+
+            raise ValueError("Could not factor per_coil_total into (stored_ro, spokes_per_extra).")
+
+        stored_ro, spokes_per_extra = pick_block_and_spokes(per_coil_total, readout_hint)
+        return stored_ro, spokes_per_extra, per_coil_total
+
+    # Try factoring with extras; if that fails, relax extras and/or coils like a degenerate case
+    fact = factor_with_extras(total, coils, other_factor, readout_hint)
+    if fact is None:
+        dbg("total not divisible by coils*other_factor; relaxing extras to 1")
+        other_factor = 1
+        fact = factor_with_extras(total, coils, other_factor, readout_hint)
+        if fact is None:
+            dbg("still not divisible; relaxing coils->1")
+            coils = 1
+            fact = factor_with_extras(total, coils, other_factor, readout_hint)
+            if fact is None:
+                raise ValueError("Cannot factor FID length with any (coils, other_factor) combo.")
+
+    stored_ro, spokes_per_extra, per_coil_total = fact
+    spokes_total = spokes_per_extra * max(1, other_factor)
+    dbg("stored_ro (block):", stored_ro, "spokes_per_extra:", spokes_per_extra, "spokes_total:", spokes_total)
+    if stored_ro * spokes_total * coils != total:
+        raise ValueError("Internal factoring error: stored_ro*spokes_total*coils != total samples")
+
+    # reshape to (stored_ro, spokes_total, coils)
+    ksp_blk = np.reshape(cpx, (stored_ro, spokes_total, coils), order="F")
+
+    # finally trim to the true RO if we have a hint and stored_ro >= readout_hint
+    if readout_hint is not None and stored_ro >= readout_hint:
+        ro = readout_hint
+        ksp = ksp_blk[:ro, :, :]
+        dbg(f"trimmed RO from stored_ro={stored_ro} to ro={ro}")
+    else:
+        ro = stored_ro
+        ksp = ksp_blk
+
+    print(f"[info] Loaded k-space: RO={ro}, Spokes={spokes_total}, Coils={coils}")
     return ksp
 
 
@@ -371,11 +485,7 @@ def main():
     ap.add_argument("--out", type=Path, required=True, help="Output prefix (basename only, not extension)")
 
     ap.add_argument("--matrix", type=int, nargs=3, help="Override matrix size NX NY NZ (default from PVM_Matrix)")
-    ap.add_argument(
-        "--readout",
-        type=int,
-        help="Override readout samples per spoke (default from ACQ_size[0], fallback PVM_TrajIntAll/NPro)",
-    )
+    ap.add_argument("--readout", type=int, help="Override true RO (default from ACQ_size / PVM_TrajIntAll / NPro)")
     ap.add_argument("--coils", type=int, help="Override number of receiver coils (default from PVM_EncNReceivers)")
 
     ap.add_argument(
@@ -428,39 +538,36 @@ def main():
         NX, NY, NZ = infer_matrix(method)
         print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
-    # readout (RO) from ACQ_size[0], unless overridden (fallback PVM_TrajIntAll/NPro)
+    # readout (true RO) from ACQ_size / PVM_TrajIntAll / NPro, unless overridden
     if args.readout is not None:
-        RO = args.readout
+        RO_hint = args.readout
+        print(f"[info] Readout overridden from CLI: RO={RO_hint}")
     else:
-        RO = infer_readout(method, acqp)
-        print(f"[info] Readout inferred from ACQ_size/TrajIntAll/NPro: RO={RO}")
+        RO_hint = infer_readout(method, acqp)
 
     # coils from PVM_EncNReceivers, unless overridden
     if args.coils is not None:
         coils = args.coils
+        print(f"[info] Coils overridden from CLI: {coils}")
     else:
         coils = infer_coils(method, default=1)
         print(f"[info] Coils inferred from PVM_EncNReceivers: {coils}")
 
-    # k-space
+    # k-space (handles padded blocks & extras, trims to RO_hint when possible)
     ksp = load_bruker_kspace(
         series_dir,
-        readout=RO,
+        readout=RO_hint,
         coils=coils,
         fid_dtype=args.fid_dtype,
         fid_endian=args.fid_endian,
     )
     ro, sp_total, nc = ksp.shape
-    if ro != RO:
-        print(f"[warn] Loaded RO={ro} differs from requested/inferred RO={RO}; using RO={ro} from data.")
-        RO = ro
 
-    # synthetic Kronecker / LinZ-GA trajectory
-    traj = build_traj(args.traj_mode, ro=RO, spokes=sp_total)
+    # synthetic Kronecker / LinZ-GA trajectory, matched to trimmed k-space
+    traj = build_traj(args.traj_mode, ro=ro, spokes=sp_total)
 
     # sliding-window setup
-    if args.spokes_per-frame is None:  # <-- NOTE: keep your local copy with the correct name; this line should be:
-        # if args.spokes_per_frame is None:
+    if args.spokes_per_frame is None:
         spf = sp_total
         shift = sp_total
         print(f"[info] No sliding-window args; using single frame with all {sp_total} spokes.")
@@ -488,9 +595,9 @@ def main():
             break
         traj_f = traj[:, :, s0:s1]
 
-        nsamp = RO * spf
+        nsamp = ro * spf
         traj_s = traj_f.reshape(3, nsamp, order="F").astype(np.complex64)
-        ksp_s = ksp_f.reshape(RO * spf, nc, order="F").astype(np.complex64)
+        ksp_s = ksp_f.reshape(ro * spf, nc, order="F").astype(np.complex64)
         ksp_s = ksp_s.reshape(1, nsamp, 1, nc, order="F")
 
         vol_prefix = out_base.with_name(f"{out_base.name}_vol{fi:05d}")
@@ -529,7 +636,6 @@ def main():
 
     # Build 4D volume at out_base: stack along dim=3
     if len(vol_bases) == 1:
-        # Just copy single 3D into out_base
         run_bart(["copy", str(vol_bases[0]), str(out_base)])
     else:
         stack_args = ["stack", "3"] + [str(vb) for vb in vol_bases] + [str(out_base)]
