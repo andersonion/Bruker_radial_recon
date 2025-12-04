@@ -22,19 +22,62 @@ def dbg(*a):
 # ---------- Bruker helpers ----------
 
 def parse_param_file(path: Path) -> Dict[str, str]:
-    """Very simple Bruker param parser: maps 'KEY' -> 'value string'."""
+    """Parse Bruker-style parameter file into KEY -> value string.
+
+    Handles array-valued params like:
+
+        ##$PVM_Matrix=( 3 )
+        96 96 96
+
+    so that d["PVM_Matrix"] == "96 96 96".
+    """
     d: Dict[str, str] = {}
     if not path.exists():
         return d
+
+    current_key: Optional[str] = None
+    collecting_array = False
+
     with open(path, "r") as f:
         for line in f:
-            line = line.strip()
+            raw = line.rstrip("\n")
+            line = raw.strip()
+
+            # New parameter line
             if line.startswith("##$"):
-                try:
-                    key, val = line[3:].split("=", 1)
-                    d[key.strip()] = val.strip()
-                except ValueError:
+                collecting_array = False
+                current_key = None
+
+                body = line[3:]  # drop "##$"
+                if "=" not in body:
                     continue
+                key, val = body.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+
+                # Array-style: values on subsequent line(s)
+                if val.startswith("("):
+                    d[key] = ""
+                    current_key = key
+                    collecting_array = True
+                else:
+                    d[key] = val
+                continue
+
+            # comment/vis lines mark end of array collect
+            if line.startswith("##") or line.startswith("$$"):
+                collecting_array = False
+                current_key = None
+                continue
+
+            # Collect numeric lines for current array param
+            if collecting_array and current_key is not None:
+                if line:
+                    if d[current_key]:
+                        d[current_key] += " " + line
+                    else:
+                        d[current_key] = line
+
     return d
 
 
@@ -42,7 +85,6 @@ def _parse_int_list(val: str) -> List[int]:
     out: List[int] = []
     if not val:
         return out
-    # strip parentheses and commas etc
     cleaned = val.replace("(", " ").replace(")", " ").replace(",", " ")
     for tok in cleaned.split():
         try:
@@ -65,7 +107,6 @@ def infer_coils(method: Dict[str, str], default: int = 1) -> int:
     ints = _parse_int_list(val)
     if ints:
         return ints[0]
-    # fallback: older heuristic
     cleaned = val.replace("(", " ").replace(")", " ")
     for tok in cleaned.split():
         if tok.isdigit():
@@ -74,7 +115,6 @@ def infer_coils(method: Dict[str, str], default: int = 1) -> int:
 
 
 def infer_readout(method: Dict[str, str]) -> int:
-    # Prefer PVM_TrajIntAll, then NPro
     for key in ("PVM_TrajIntAll", "NPro"):
         val = method.get(key, "")
         ints = _parse_int_list(val)
@@ -84,7 +124,6 @@ def infer_readout(method: Dict[str, str]) -> int:
 
 
 def parse_param_file_acqp(path: Path) -> Dict[str, str]:
-    # same as parse_param_file, but separate name for clarity
     return parse_param_file(path)
 
 
@@ -111,12 +150,6 @@ def load_bruker_kspace(
     fid_dtype: Optional[str] = None,
     fid_endian: Optional[str] = None,
 ) -> np.ndarray:
-    """
-    Load Bruker FID and reshape to (RO, Spokes, Coils).
-
-    This version assumes a single echo / slice / rep collapsed series and
-    relies on correct readout and coils.
-    """
     fid_path = series_dir / "fid"
     if not fid_path.exists():
         raise FileNotFoundError(f"No fid file in series dir: {fid_path}")
@@ -193,7 +226,7 @@ def fib_prev2(fk: int) -> int:
     return fib_prev(fib_prev(fk))
 
 
-def uv_to_dir(u: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def uv_to_dir(u: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     z = 1.0 - 2.0 * u
     r2 = 1.0 - z * z
     r2 = np.maximum(r2, 0.0)
@@ -229,12 +262,6 @@ def linz_ga_dirs(N: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def build_traj(mode: str, ro: int, spokes: int) -> np.ndarray:
-    """
-    Build synthetic 3D radial trajectory of shape (3, RO, Spokes),
-    coordinates roughly in [-0.5, 0.5] along each axis.
-
-    mode: 'kron' or 'linz'
-    """
     mode = mode.lower()
     if mode not in ("kron", "linz"):
         raise ValueError("traj-mode must be 'kron' or 'linz'")
@@ -244,7 +271,7 @@ def build_traj(mode: str, ro: int, spokes: int) -> np.ndarray:
     else:
         dx, dy, dz = linz_ga_dirs(spokes)
 
-    # sample along readout from -0.5..0.5
+    # radius goes from -0.5..0.5 in k-space units (BART expects traj in pixel/FOV units)
     r = np.linspace(-0.5, 0.5, ro, endpoint=False, dtype=np.float32)
     traj = np.zeros((3, ro, spokes), dtype=np.float32)
     for s in range(spokes):
@@ -265,22 +292,14 @@ def _write_hdr(path: Path, dims: List[int]):
 
 
 def write_cfl(base: Path, arr: np.ndarray, dims: List[int]):
-    """
-    Write BART-compliant CFL/HDR for a complex64 ndarray.
-
-    dims: BART dimensions list (length <= 16; we pad with 1s).
-    """
     arr = np.asarray(arr, dtype=np.complex64, order="F")
-    # pad dims to 16
     if len(dims) < 16:
         dims = dims + [1] * (16 - len(dims))
-    # sanity check
     if int(np.prod(dims)) != arr.size:
         raise ValueError(f"dims product {np.prod(dims)} != array size {arr.size}")
     hdr = base.with_suffix(".hdr")
     cfl = base.with_suffix(".cfl")
     _write_hdr(hdr, dims)
-    # BART stores complex as [2, prod(dims)] float32
     flat = arr.flatten(order="F")
     out = np.empty((2, flat.size), dtype=np.float32)
     out[0, :] = flat.real.astype(np.float32)
@@ -298,9 +317,6 @@ def bart_path() -> str:
 
 
 def run_bart(args: List[str]):
-    """
-    Run BART with the given arguments list (tool + args).
-    """
     cmd = [bart_path()] + args
     print("[bart]", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -362,18 +378,12 @@ def main():
         default=None,
         help="If set, reconstruct only this many frames for quick testing.",
     )
-    ap.add_argument(
-        "--qc-frame",
-        type=int,
-        default=0,
-        help="Frame index to treat as QC for NIfTI export (only this frame gets toimg).",
-    )
 
     ap.add_argument("--fid-dtype", type=str, default=None, help="Override FID dtype (int16,int32,float32,float64)")
     ap.add_argument("--fid-endian", type=str, default=None, help="Override FID endian (little,big)")
 
     ap.add_argument("--combine", choices=["sos"], default="sos", help="Coil combine mode (currently only sos).")
-    ap.add_argument("--export-nifti", action="store_true", help="Call 'bart toimg' on QC frame only")
+    ap.add_argument("--export-nifti", action="store_true", help="Call 'bart toimg' on final 4D volume")
     ap.add_argument("--debug", action="store_true")
 
     args = ap.parse_args()
@@ -382,32 +392,31 @@ def main():
     series_dir: Path = args.series
     out_base: Path = args.out
 
-    # Parse method/acqp once
     method = parse_param_file(series_dir / "method")
     acqp = parse_param_file_acqp(series_dir / "acqp")
 
-    # Infer matrix if not overridden
+    # matrix from PVM_Matrix, unless overridden
     if args.matrix is not None:
         NX, NY, NZ = args.matrix
     else:
         NX, NY, NZ = infer_matrix(method)
         print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
-    # Infer readout if not overridden
+    # readout (RO) from PVM_TrajIntAll/NPro, unless overridden
     if args.readout is not None:
         RO = args.readout
     else:
         RO = infer_readout(method)
         print(f"[info] Readout inferred from PVM_TrajIntAll/NPro: RO={RO}")
 
-    # Infer coils if not overridden
+    # coils from PVM_EncNReceivers, unless overridden
     if args.coils is not None:
         coils = args.coils
     else:
         coils = infer_coils(method, default=1)
         print(f"[info] Coils inferred from PVM_EncNReceivers: {coils}")
 
-    # Load k-space: (RO, Spokes, Coils)
+    # k-space
     ksp = load_bruker_kspace(
         series_dir,
         readout=RO,
@@ -420,10 +429,10 @@ def main():
         print(f"[warn] Loaded RO={ro} differs from requested/inferred RO={RO}; using RO={ro} from data.")
         RO = ro
 
-    # Trajectory: (3, RO, Spokes), synthetic GA/Kronecker
+    # synthetic Kronecker / LinZ-GA trajectory
     traj = build_traj(args.traj_mode, ro=RO, spokes=sp_total)
 
-    # Frame binning
+    # sliding-window setup
     if args.spokes_per_frame is None:
         spf = sp_total
         shift = sp_total
@@ -441,20 +450,19 @@ def main():
     nframes = len(starts)
     print(f"[info] Will reconstruct {nframes} frame(s).")
 
-    # Loop over frames
+    vol_bases: List[Path] = []
+
+    # per-frame BART NUFFT + RSS
     for fi, s0 in enumerate(starts):
         s1 = s0 + spf
-        ksp_f = ksp[:, s0:s1, :]  # (RO, spf, coils)
+        ksp_f = ksp[:, s0:s1, :]
         if ksp_f.shape[1] < spf:
             print(f"[warn] Skipping partial last frame at spokes {s0}:{s1}")
             break
-        traj_f = traj[:, :, s0:s1]  # (3, RO, spf)
+        traj_f = traj[:, :, s0:s1]
 
-        # Flatten RO*spf -> samples dimension for BART
         nsamp = RO * spf
-        # traj dims: [3, nsamp, 1, 1, 1, ...]
         traj_s = traj_f.reshape(3, nsamp, order="F").astype(np.complex64)
-        # ksp dims: [1, nsamp, 1, coils, 1, ...], coil dim=3
         ksp_s = ksp_f.reshape(RO * spf, nc, order="F").astype(np.complex64)
         ksp_s = ksp_s.reshape(1, nsamp, 1, nc, order="F")
 
@@ -464,11 +472,9 @@ def main():
         coil_base = vol_prefix.with_name(vol_prefix.name + "_coil")
         img_base = vol_prefix
 
-        # Write traj and ksp to CFL
         write_cfl(traj_base, traj_s, [3, nsamp, 1, 1])
         write_cfl(ksp_base, ksp_s, [1, nsamp, 1, nc])
 
-        # BART NUFFT (adjoint) and RSS (coil combine)
         try:
             run_bart(
                 [
@@ -482,23 +488,33 @@ def main():
                     str(coil_base),
                 ]
             )
-            # coil dimension is 3 (0-based indexing: x,y,z,coil)
             run_bart(["rss", "3", str(coil_base), str(img_base)])
         except subprocess.CalledProcessError as e:
             print(f"[error] BART NUFFT/RSS failed for frame {fi} with code {e.returncode}", file=sys.stderr)
             raise
 
-        # Export only QC frame as NIfTI if requested
-        if args.export_nifti and fi == args.qc_frame:
-            try:
-                run_bart(["toimg", str(img_base), str(img_base)])
-            except subprocess.CalledProcessError as e:
-                print(f"[warn] BART toimg failed for QC frame {fi}: {e}", file=sys.stderr)
+        vol_bases.append(img_base)
+        print(f"[info] Frame {fi}/{nframes - 1} done -> {img_base}")
 
-        qc_tag = " (QC frame)" if fi == args.qc_frame else ""
-        print(f"[info] Frame {fi}/{nframes - 1} done -> {img_base}{qc_tag}")
+    if not vol_bases:
+        print("[error] No frames successfully reconstructed.", file=sys.stderr)
+        sys.exit(1)
 
-    print("[info] All requested frames complete.")
+    # Build 4D volume at out_base: stack along dim=3
+    if len(vol_bases) == 1:
+        # Just copy single 3D into out_base
+        run_bart(["copy", str(vol_bases[0]), str(out_base)])
+    else:
+        stack_args = ["stack", "3"] + [str(vb) for vb in vol_bases] + [str(out_base)]
+        run_bart(stack_args)
+
+    if args.export_nifti:
+        try:
+            run_bart(["toimg", str(out_base), str(out_base)])
+        except subprocess.CalledProcessError as e:
+            print(f"[warn] BART toimg failed on 4D volume: {e}", file=sys.stderr)
+
+    print("[info] All requested frames complete; 4D result at", out_base)
 
 
 if __name__ == "__main__":
