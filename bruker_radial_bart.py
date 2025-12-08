@@ -496,7 +496,7 @@ def main():
         print(f"[info] No sliding-window args; using single frame with all {sp_total} spokes.")
     else:
         spf = args.spokes_per_frame
-        shift = args.frame_shi
+        shift = args.frame_shift
         if shift is None or shift <= 0:
             shift = spf
         print(f"[info] Sliding window: spokes-per-frame={spf}, frame-shift={shift}")
