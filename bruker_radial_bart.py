@@ -161,9 +161,8 @@ def find_stored_ro(total_complex: int, coils: int, true_ro: int) -> int:
     We search for the smallest stored_ro >= true_ro such that
     total_complex is divisible by stored_ro * coils.
     """
-    denom_base = coils
     for stored_ro in range(true_ro, true_ro + 2048):
-        if (total_complex % (stored_ro * denom_base)) == 0:
+        if (total_complex % (stored_ro * coils)) == 0:
             return stored_ro
     # Fallback: no padding detected; just use true_ro
     return true_ro
@@ -351,6 +350,59 @@ def write_cfl(base: Path, arr: np.ndarray, dims: List[int]):
     out.tofile(cfl)
 
 
+def read_cfl(base: Path) -> Tuple[np.ndarray, List[int]]:
+    """Read BART-style CFL into complex64 array and dims list."""
+    hdr = base.with_suffix(".hdr")
+    cfl = base.with_suffix(".cfl")
+    if not hdr.exists() or not cfl.exists():
+        raise FileNotFoundError(f"Missing CFL pair: {hdr}, {cfl}")
+
+    with open(hdr, "r") as f:
+        lines = f.readlines()
+    if len(lines) < 2:
+        raise ValueError(f"Malformed hdr file: {hdr}")
+    dims_line = lines[1].strip()
+    dims = [int(x) for x in dims_line.split()]
+    if len(dims) < 16:
+        dims = dims + [1] * (16 - len(dims))
+
+    flat = np.fromfile(cfl, dtype=np.float32)
+    if flat.size % 2 != 0:
+        flat = flat[:-1]
+    flat = flat.view(np.complex64)
+    prod = int(np.prod(dims))
+    if flat.size != prod:
+        raise ValueError(f"CFL size {flat.size} != product of dims {prod}")
+    arr = flat.reshape(dims, order="F")
+    return arr, dims
+
+
+# ---------- NIfTI export ----------
+
+
+def export_cfl_to_nifti_gz(base: Path, out_nii_gz: Path):
+    """Read CFL at 'base' and dump magnitude as NIfTI .nii.gz via nibabel."""
+    try:
+        import nibabel as nib
+    except ImportError as e:
+        print(
+            f"[warn] nibabel not available, cannot write NIfTI for {base}. "
+            f"Install nibabel in this environment.",
+            file=sys.stderr,
+        )
+        return
+
+    arr_cplx, dims = read_cfl(base)
+
+    # Collapse trailing singleton dims and interpret as real magnitude
+    arr = np.abs(arr_cplx.squeeze())
+    # Basic affine; if you want physical spacing, we can later pull FOV/matrix.
+    affine = np.eye(4, dtype=np.float32)
+    img = nib.Nifti1Image(arr.astype(np.float32), affine)
+    nib.save(img, str(out_nii_gz))  # .nii.gz handled automatically
+    print(f"[info] Wrote NIfTI: {out_nii_gz}")
+
+
 # ---------- BART wrappers ----------
 
 
@@ -437,9 +489,9 @@ def main():
         "--qa-first",
         type=int,
         default=0,
-        help="If >0 and --export-nifti set, export first N frames as per-frame NIfTI QA volumes.",
+        help="If >0, also export first N frames as per-frame NIfTI(.nii.gz) QA volumes.",
     )
-    ap.add_argument("--export-nifti", action="store_true", help="Export final 4D volume (and QA frames) as NIfTI.")
+    ap.add_argument("--export-nifti", action="store_true", help="Export final 4D volume (and QA frames) as NIfTI(.gz).")
 
     ap.add_argument("--gpu", action="store_true", help="Use BART GPU mode (bart -g ...).")
     ap.add_argument("--debug", action="store_true")
@@ -546,6 +598,11 @@ def main():
                 f"[info] Frame {fi} already reconstructed -> {coil_base}, skipping NUFFT/RSS."
             )
             vol_bases.append(img_base)
+            # Still optionally export QA NIfTI if requested and missing
+            if args.export_nifti and args.qa_first > 0 and fi < args.qa_first:
+                qa_nii = img_base.with_suffix(".nii.gz")
+                if not qa_nii.exists():
+                    export_cfl_to_nifti_gz(img_base, qa_nii)
             continue
 
         # Write frame-wise traj/ksp
@@ -576,13 +633,10 @@ def main():
         vol_bases.append(img_base)
         print(f"[info] Frame {fi}/{nframes - 1} done -> {img_base}")
 
-        # Optional QA export: per-frame NIfTI for early frames
+        # Optional QA export: per-frame NIfTI(.gz) for early frames
         if args.export_nifti and args.qa_first > 0 and fi < args.qa_first:
-            qa_nifti = img_base.with_suffix(".nii")
-            try:
-                run_bart(["toimg", str(img_base), str(qa_nifti)], gpu=False)
-            except subprocess.CalledProcessError as e:
-                print(f"[warn] BART toimg failed for QA frame {fi}: {e}", file=sys.stderr)
+            qa_nii = img_base.with_suffix(".nii.gz")
+            export_cfl_to_nifti_gz(img_base, qa_nii)
 
     if not vol_bases:
         print("[error] No frames successfully reconstructed.", file=sys.stderr)
@@ -596,13 +650,10 @@ def main():
         print(f"[error] BART join failed: {e}", file=sys.stderr)
         raise
 
-    # Final 4D NIfTI export
+    # Final 4D NIfTI(.gz) export
     if args.export_nifti:
-        nifti_out = out_base.with_suffix(".nii")
-        try:
-            run_bart(["toimg", str(out_base), str(nifti_out)], gpu=False)
-        except subprocess.CalledProcessError as e:
-            print(f"[warn] BART toimg failed on 4D volume: {e}", file=sys.stderr)
+        final_nii = out_base.with_suffix(".nii.gz")
+        export_cfl_to_nifti_gz(out_base, final_nii)
 
     print("[info] All requested frames complete; 4D result at", out_base)
 
