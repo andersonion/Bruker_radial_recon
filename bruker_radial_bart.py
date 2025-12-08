@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -11,7 +12,14 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    import nibabel as nib  # type: ignore
+    HAVE_NIB = True
+except Exception:
+    HAVE_NIB = False
+
 DEBUG = False
+USE_GPU = False
 
 
 def dbg(*a):
@@ -21,17 +29,8 @@ def dbg(*a):
 
 # ---------- Bruker helpers ----------
 
-
 def parse_param_file(path: Path) -> Dict[str, str]:
-    """Parse Bruker-style parameter file into KEY -> value string.
-
-    Handles array-valued params like:
-
-        ##$PVM_Matrix=( 3 )
-        96 96 96
-
-    so that d["PVM_Matrix"] == "96 96 96".
-    """
+    """Parse Bruker-style parameter file into KEY -> value string."""
     d: Dict[str, str] = {}
     if not path.exists():
         return d
@@ -44,19 +43,17 @@ def parse_param_file(path: Path) -> Dict[str, str]:
             raw = line.rstrip("\n")
             line = raw.strip()
 
-            # New parameter line
             if line.startswith("##$"):
                 collecting_array = False
                 current_key = None
 
-                body = line[3:]  # drop "##$"
+                body = line[3:]
                 if "=" not in body:
                     continue
                 key, val = body.split("=", 1)
                 key = key.strip()
                 val = val.strip()
 
-                # Array-style: values on subsequent line(s)
                 if val.startswith("("):
                     d[key] = ""
                     current_key = key
@@ -65,13 +62,11 @@ def parse_param_file(path: Path) -> Dict[str, str]:
                     d[key] = val
                 continue
 
-            # comment/vis lines mark end of array collect
             if line.startswith("##") or line.startswith("$$"):
                 collecting_array = False
                 current_key = None
                 continue
 
-            # Collect numeric lines for current array param
             if collecting_array and current_key is not None:
                 if line:
                     if d[current_key]:
@@ -108,7 +103,6 @@ def infer_coils(method: Dict[str, str], default: int = 1) -> int:
     ints = _parse_int_list(val)
     if ints:
         return ints[0]
-
     cleaned = val.replace("(", " ").replace(")", " ")
     for tok in cleaned.split():
         if tok.isdigit():
@@ -116,27 +110,17 @@ def infer_coils(method: Dict[str, str], default: int = 1) -> int:
     return default
 
 
-def infer_readout_from_method(method: Dict[str, str]) -> Optional[int]:
-    """Fallback: try method params if ACQ_size isn't usable."""
-    for key in ("PVM_TrajIntAll", "NPro"):
-        val = method.get(key, "")
-        ints = _parse_int_list(val)
-        if ints:
-            return ints[0]
-    return None
-
-
-def infer_true_ro_from_acqp(acqp: Dict[str, str]) -> Optional[int]:
-    """True readout samples (non-padded) from ACQ_size[0] if available."""
-    val = acqp.get("ACQ_size", "")
-    ints = _parse_int_list(val)
-    if len(ints) >= 1:
-        return ints[0]
-    return None
-
-
 def parse_param_file_acqp(path: Path) -> Dict[str, str]:
     return parse_param_file(path)
+
+
+def infer_true_ro_from_acqp(acqp: Dict[str, str]) -> int:
+    """Return the *true* number of RO samples (ACQ_size[1])."""
+    val = acqp.get("ACQ_size", "")
+    ints = _parse_int_list(val)
+    if len(ints) >= 2:
+        return ints[1]
+    raise ValueError("Could not infer readout (RO) from ACQ_size. Please pass --readout.")
 
 
 def infer_fid_dtype(acqp: Dict[str, str]) -> str:
@@ -155,34 +139,23 @@ def infer_fid_endian(acqp: Dict[str, str]) -> str:
     return "little"
 
 
-def find_stored_ro(total_complex: int, coils: int, true_ro: int) -> int:
-    """Given total complex samples, coils, and true RO, infer padded stored RO.
-
-    We search for the smallest stored_ro >= true_ro such that
-    total_complex is divisible by stored_ro * coils.
-    """
-    for stored_ro in range(true_ro, true_ro + 2048):
-        if (total_complex % (stored_ro * coils)) == 0:
-            return stored_ro
-    # Fallback: no padding detected; just use true_ro
-    return true_ro
-
-
 def load_bruker_kspace(
     series_dir: Path,
-    readout_true: int,
+    true_ro: int,
     coils: int,
     fid_dtype: Optional[str] = None,
     fid_endian: Optional[str] = None,
 ) -> np.ndarray:
-    """Load Bruker FID as k-space array [RO, Spokes, Coils].
+    """
+    Load Bruker FID and reshape to (true_ro, spokes, coils).
 
-    Handles padded storage blocks in RO (e.g., true RO=122, stored as 128).
+    Handles block-padded storage (e.g., stored_ro=128, true_ro=122).
     """
     fid_path = series_dir / "fid"
     if not fid_path.exists():
         raise FileNotFoundError(f"No fid file in series dir: {fid_path}")
 
+    method = parse_param_file(series_dir / "method")
     acqp = parse_param_file_acqp(series_dir / "acqp")
 
     if fid_dtype is None:
@@ -190,7 +163,7 @@ def load_bruker_kspace(
     if fid_endian is None:
         fid_endian = infer_fid_endian(acqp)
     if coils is None or coils <= 0:
-        raise ValueError("Number of coils must be >0 in load_bruker_kspace.")
+        coils = infer_coils(method, default=1)
 
     dbg("fid_dtype:", fid_dtype, "fid_endian:", fid_endian, "coils:", coils)
 
@@ -210,41 +183,49 @@ def load_bruker_kspace(
 
     if raw.size % 2 != 0:
         raw = raw[:-1]
-
-    # Interpret as complex
     cpx = raw.astype(np.float32).view(np.complex64)
-    total_complex = cpx.size
-    dbg("total complex samples:", total_complex)
+    total = cpx.size
+    dbg("total complex samples:", total)
 
-    # Infer stored_ro (padded block size) from total size and coils
-    stored_ro = find_stored_ro(total_complex, coils, readout_true)
-    spokes = total_complex // (stored_ro * coils)
-    if spokes <= 0:
+    # brute-force search for stored_ro that is a multiple of true_ro
+    stored_ro_candidates = [true_ro]
+    for blk in (128, 96, 64, 384, 512):
+        if blk >= true_ro:
+            stored_ro_candidates.append(blk)
+    stored_ro_candidates = sorted(set(stored_ro_candidates))
+
+    stored_ro = None
+    spokes = None
+    for sro in stored_ro_candidates:
+        if total % (sro * coils) == 0:
+            stored_ro = sro
+            spokes = total // (sro * coils)
+            break
+
+    if stored_ro is None or spokes is None:
         raise ValueError(
-            f"Unable to factor FID into (stored_ro * spokes * coils). "
-            f"total_complex={total_complex}, stored_ro={stored_ro}, coils={coils}"
+            f"Unable to factor FID length {total} as stored_ro*spokes*coils "
+            f"with true_ro={true_ro}, coils={coils} and typical block sizes."
         )
 
     dbg("stored_ro:", stored_ro, "spokes:", spokes)
 
-    # Reshape using stored_ro, then trim back to true RO along readout
+    # reshape with stored_ro, then trim RO down to true_ro
     ksp_full = np.reshape(cpx, (stored_ro, spokes, coils), order="F")
-    if readout_true > stored_ro:
-        raise ValueError(
-            f"True RO={readout_true} > stored_ro={stored_ro}; "
-            f"padding model assumption violated."
+    if stored_ro != true_ro:
+        ksp = ksp_full[:true_ro, :, :]
+        print(
+            f"[info] Loaded k-space with stored_ro={stored_ro}, trimmed to true RO={true_ro}; "
+            f"Spokes={spokes}, Coils={coils}"
         )
+    else:
+        ksp = ksp_full
+        print(f"[info] Loaded k-space: RO={true_ro}, Spokes={spokes}, Coils={coils}")
 
-    ksp = ksp_full[:readout_true, :, :]
-    print(
-        f"[info] Loaded k-space with stored_ro={stored_ro}, trimmed to true RO={readout_true}; "
-        f"Spokes={spokes}, Coils={coils}"
-    )
     return ksp
 
 
 # ---------- Synthetic trajectory: Kronecker / LinZ-GA ----------
-
 
 def fib_closest_ge(n: int) -> int:
     if n <= 1:
@@ -313,9 +294,9 @@ def build_traj(mode: str, ro: int, spokes: int) -> np.ndarray:
     else:
         dx, dy, dz = linz_ga_dirs(spokes)
 
-    # radius goes from -0.5..0.5 in k-space units (BART expects traj in pixel/FOV units)
+    # radius from -0.5..0.5 in k-space units (pixel_size/FOV)
     r = np.linspace(-0.5, 0.5, ro, endpoint=False, dtype=np.float32)
-    traj = np.zeros((3, ro, spokes), dtype=np.float32)
+    traj = np.zeros((3, ro, spokes), dtype=np.complex64)
     for s in range(spokes):
         traj[0, :, s] = r * dx[s]
         traj[1, :, s] = r * dy[s]
@@ -326,7 +307,6 @@ def build_traj(mode: str, ro: int, spokes: int) -> np.ndarray:
 
 
 # ---------- CFL I/O ----------
-
 
 def _write_hdr(path: Path, dims: List[int]):
     with open(path, "w") as f:
@@ -350,61 +330,44 @@ def write_cfl(base: Path, arr: np.ndarray, dims: List[int]):
     out.tofile(cfl)
 
 
-def read_cfl(base: Path) -> Tuple[np.ndarray, List[int]]:
-    """Read BART-style CFL into complex64 array and dims list."""
+def read_cfl(base: Path) -> np.ndarray:
     hdr = base.with_suffix(".hdr")
     cfl = base.with_suffix(".cfl")
     if not hdr.exists() or not cfl.exists():
-        raise FileNotFoundError(f"Missing CFL pair: {hdr}, {cfl}")
-
+        raise FileNotFoundError(f"Missing CFL/HDR for base {base}")
     with open(hdr, "r") as f:
         lines = f.readlines()
     if len(lines) < 2:
         raise ValueError(f"Malformed hdr file: {hdr}")
-    dims_line = lines[1].strip()
-    dims = [int(x) for x in dims_line.split()]
-    if len(dims) < 16:
-        dims = dims + [1] * (16 - len(dims))
-
-    flat = np.fromfile(cfl, dtype=np.float32)
-    if flat.size % 2 != 0:
-        flat = flat[:-1]
-    flat = flat.view(np.complex64)
-    prod = int(np.prod(dims))
-    if flat.size != prod:
-        raise ValueError(f"CFL size {flat.size} != product of dims {prod}")
-    arr = flat.reshape(dims, order="F")
-    return arr, dims
-
-
-# ---------- NIfTI export ----------
+    dims = [int(x) for x in lines[1].split()]
+    dims = dims + [1] * (16 - len(dims))
+    n = int(np.prod(dims))
+    raw = np.fromfile(cfl, dtype=np.float32)
+    if raw.size != 2 * n:
+        raise ValueError(f"CFL size mismatch for {cfl}: expected {2*n}, got {raw.size}")
+    raw = raw.reshape(2, n)
+    cpx = raw[0] + 1j * raw[1]
+    arr = cpx.reshape(dims, order="F")
+    # drop trailing singleton dims
+    while arr.ndim > 1 and arr.shape[-1] == 1:
+        arr = np.squeeze(arr, axis=-1)
+    return arr
 
 
-def export_cfl_to_nifti_gz(base: Path, out_nii_gz: Path):
-    """Read CFL at 'base' and dump magnitude as NIfTI .nii.gz via nibabel."""
-    try:
-        import nibabel as nib
-    except ImportError as e:
-        print(
-            f"[warn] nibabel not available, cannot write NIfTI for {base}. "
-            f"Install nibabel in this environment.",
-            file=sys.stderr,
-        )
+def save_nifti_from_cfl(base: Path, nii_path: Path):
+    if not HAVE_NIB:
+        print("[warn] nibabel not available; skipping NIfTI export.", file=sys.stderr)
         return
-
-    arr_cplx, dims = read_cfl(base)
-
-    # Collapse trailing singleton dims and interpret as real magnitude
-    arr = np.abs(arr_cplx.squeeze())
-    # Basic affine; if you want physical spacing, we can later pull FOV/matrix.
+    arr = read_cfl(base)
+    # If 3D or 4D, assume (x,y,z[,t])
+    data = np.asarray(arr, dtype=np.float32)
     affine = np.eye(4, dtype=np.float32)
-    img = nib.Nifti1Image(arr.astype(np.float32), affine)
-    nib.save(img, str(out_nii_gz))  # .nii.gz handled automatically
-    print(f"[info] Wrote NIfTI: {out_nii_gz}")
+    img = nib.Nifti1Image(data, affine)
+    nib.save(img, str(nii_path))
+    print(f"[info] Wrote NIfTI {nii_path}")
 
 
 # ---------- BART wrappers ----------
-
 
 def bart_path() -> str:
     p = shutil.which("bart")
@@ -413,17 +376,17 @@ def bart_path() -> str:
     return p
 
 
-def run_bart(args: List[str], gpu: bool = False):
-    cmd = [bart_path()]
-    if gpu:
-        cmd.append("-g")
-    cmd += args
+def run_bart(args: List[str]):
+    global USE_GPU
+    cmd = [bart_path()] + args
+    env = os.environ.copy()
+    if USE_GPU:
+        env["BART_USE_GPU"] = "1"
     print("[bart]", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
 # ---------- Frame binning ----------
-
 
 def frame_starts(total_spokes: int, spf: int, shift: int) -> List[int]:
     if spf <= 0:
@@ -440,9 +403,8 @@ def frame_starts(total_spokes: int, spf: int, shift: int) -> List[int]:
 
 # ---------- Main recon driver ----------
 
-
 def main():
-    global DEBUG
+    global DEBUG, USE_GPU
 
     ap = argparse.ArgumentParser(
         description="Bruker 3D radial recon using BART NUFFT (Kronecker/LinZ-GA + sliding window)."
@@ -451,7 +413,7 @@ def main():
     ap.add_argument("--out", type=Path, required=True, help="Output prefix (basename only, not extension)")
 
     ap.add_argument("--matrix", type=int, nargs=3, help="Override matrix size NX NY NZ (default from PVM_Matrix)")
-    ap.add_argument("--readout", type=int, help="Override true readout samples per spoke (default from ACQ_size[0])")
+    ap.add_argument("--readout", type=int, help="Override readout samples per spoke (default from ACQ_size)")
     ap.add_argument("--coils", type=int, help="Override number of receiver coils (default from PVM_EncNReceivers)")
 
     ap.add_argument(
@@ -485,19 +447,21 @@ def main():
     ap.add_argument("--fid-endian", type=str, default=None, help="Override FID endian (little,big)")
 
     ap.add_argument("--combine", choices=["sos"], default="sos", help="Coil combine mode (currently only sos).")
+    ap.add_argument("--export-nifti", action="store_true", help="Write final 4D .nii.gz (and QA vols) via nibabel")
+    ap.add_argument("--qa-first", type=int, default=0, help="Export first N frames as QA NIfTIs.")
     ap.add_argument(
-        "--qa-first",
+        "--qa-indices",
         type=int,
-        default=0,
-        help="If >0, also export first N frames as per-frame NIfTI(.nii.gz) QA volumes.",
+        nargs="*",
+        default=None,
+        help="Explicit frame indices to export as QA NIfTIs (0-based).",
     )
-    ap.add_argument("--export-nifti", action="store_true", help="Export final 4D volume (and QA frames) as NIfTI(.gz).")
-
-    ap.add_argument("--gpu", action="store_true", help="Use BART GPU mode (bart -g ...).")
+    ap.add_argument("--use-gpu", action="store_true", help="Set BART_USE_GPU=1 for NUFFT (if compiled with CUDA).")
     ap.add_argument("--debug", action="store_true")
 
     args = ap.parse_args()
     DEBUG = args.debug
+    USE_GPU = args.use_gpu
 
     series_dir: Path = args.series
     out_base: Path = args.out
@@ -512,26 +476,18 @@ def main():
         NX, NY, NZ = infer_matrix(method)
         print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
-    # true readout (RO) from ACQ_size[0], unless overridden
+    # true readout (RO) from ACQ_size, unless overridden
     if args.readout is not None:
-        true_ro = args.readout
+        RO = args.readout
+        print(f"[info] Readout overridden from CLI: RO={RO}")
     else:
-        true_ro = infer_true_ro_from_acqp(acqp)
-        if true_ro is not None:
-            print(f"[info] Readout (true RO) from ACQ_size: RO={true_ro}")
-        else:
-            fallback_ro = infer_readout_from_method(method)
-            if fallback_ro is None:
-                raise ValueError(
-                    "Could not infer readout (RO). Tried ACQ_size[0] and PVM_TrajIntAll/NPro. "
-                    "Please pass --readout."
-                )
-            true_ro = fallback_ro
-            print(f"[info] Readout (true RO) from method (PVM_TrajIntAll/NPro): RO={true_ro}")
+        RO = infer_true_ro_from_acqp(acqp)
+        print(f"[info] Readout (true RO) from ACQ_size: RO={RO}")
 
     # coils from PVM_EncNReceivers, unless overridden
     if args.coils is not None:
         coils = args.coils
+        print(f"[info] Coils overridden from CLI: {coils}")
     else:
         coils = infer_coils(method, default=1)
         print(f"[info] Coils inferred from PVM_EncNReceivers: {coils}")
@@ -539,14 +495,14 @@ def main():
     # k-space
     ksp = load_bruker_kspace(
         series_dir,
-        readout_true=true_ro,
+        true_ro=RO,
         coils=coils,
         fid_dtype=args.fid_dtype,
         fid_endian=args.fid_endian,
     )
     ro, sp_total, nc = ksp.shape
 
-    # synthetic Kronecker / LinZ-GA trajectory
+    # synthetic Kronecker / LinZ-GA trajectory (same layout as ksp)
     traj = build_traj(args.traj_mode, ro=ro, spokes=sp_total)
 
     # sliding-window setup
@@ -567,93 +523,90 @@ def main():
     nframes = len(starts)
     print(f"[info] Will reconstruct {nframes} frame(s).")
 
+    qa_indices: set[int] = set()
+    if args.qa_first and args.qa_first > 0:
+        qa_indices.update(range(min(args.qa_first, nframes)))
+    if args.qa_indices:
+        for q in args.qa_indices:
+            if 0 <= q < nframes:
+                qa_indices.add(q)
+
     vol_bases: List[Path] = []
 
     # per-frame BART NUFFT + RSS
     for fi, s0 in enumerate(starts):
         s1 = s0 + spf
-        ksp_f = ksp[:, s0:s1, :]
-        if ksp_f.shape[1] < spf:
+        if s1 > sp_total:
             print(f"[warn] Skipping partial last frame at spokes {s0}:{s1}")
             break
-        traj_f = traj[:, :, s0:s1]
-
-        nsamp = ro * spf
-        traj_s = traj_f.reshape(3, nsamp, order="F").astype(np.complex64)
-        # BART expects dims: [1, nsamp, 1, nc] for ksp; [3, nsamp, 1, 1] for traj
-        ksp_s = ksp_f.reshape(ro * spf, nc, order="F").astype(np.complex64)
-        ksp_s = ksp_s.reshape(1, nsamp, 1, nc, order="F")
 
         vol_prefix = out_base.with_name(f"{out_base.name}_vol{fi:05d}")
         traj_base = vol_prefix.with_name(vol_prefix.name + "_traj")
         ksp_base = vol_prefix.with_name(vol_prefix.name + "_ksp")
         coil_base = vol_prefix.with_name(vol_prefix.name + "_coil")
-        img_base = vol_prefix
+        img_base = vol_prefix  # sos image
 
-        # Check if this frame already fully exists (coil + SoS)
         coil_cfl = coil_base.with_suffix(".cfl")
         img_cfl = img_base.with_suffix(".cfl")
-        if coil_cfl.exists() and img_cfl.exists():
-            print(
-                f"[info] Frame {fi} already reconstructed -> {coil_base}, skipping NUFFT/RSS."
-            )
-            vol_bases.append(img_base)
-            # Still optionally export QA NIfTI if requested and missing
-            if args.export_nifti and args.qa_first > 0 and fi < args.qa_first:
-                qa_nii = img_base.with_suffix(".nii.gz")
-                if not qa_nii.exists():
-                    export_cfl_to_nifti_gz(img_base, qa_nii)
-            continue
 
-        # Write frame-wise traj/ksp
-        write_cfl(traj_base, traj_s, [3, nsamp, 1, 1])
-        write_cfl(ksp_base, ksp_s, [1, nsamp, 1, nc])
+        frame_exists = coil_cfl.exists() and img_cfl.exists()
+        if frame_exists:
+            print(f"[info] Frame {fi} already reconstructed -> {coil_base}, skipping NUFFT/RSS.")
+        else:
+            ksp_f = ksp[:, s0:s1, :]
+            traj_f = traj[:, :, s0:s1]
 
-        try:
-            # NUFFT -> coil images
-            run_bart(
-                [
-                    "nufft",
-                    "-i",
-                    "-d",
-                    f"{NX}:{NY}:{NZ}",
-                    "-t",
-                    str(traj_base),
-                    str(ksp_base),
-                    str(coil_base),
-                ],
-                gpu=args.gpu,
-            )
-            # RSS along coil dimension
-            run_bart(["rss", "3", str(coil_base), str(img_base)], gpu=args.gpu)
-        except subprocess.CalledProcessError as e:
-            print(f"[error] BART NUFFT/RSS failed for frame {fi} with code {e.returncode}", file=sys.stderr)
-            raise
+            # write traj and ksp in canonical BART layout
+            write_cfl(traj_base, traj_f, [3, ro, spf])
+            write_cfl(ksp_base, ksp_f, [ro, spf, nc])
+
+            try:
+                run_bart(
+                    [
+                        "nufft",
+                        "-i",
+                        "-d",
+                        f"{NX}:{NY}:{NZ}",
+                        "-t",
+                        str(traj_base),
+                        str(ksp_base),
+                        str(coil_base),
+                    ]
+                )
+                run_bart(["rss", "3", str(coil_base), str(img_base)])
+            except subprocess.CalledProcessError as e:
+                print(f"[error] BART NUFFT/RSS failed for frame {fi} with code {e.returncode}", file=sys.stderr)
+                raise
 
         vol_bases.append(img_base)
         print(f"[info] Frame {fi}/{nframes - 1} done -> {img_base}")
 
-        # Optional QA export: per-frame NIfTI(.gz) for early frames
-        if args.export_nifti and args.qa_first > 0 and fi < args.qa_first:
+        # QA NIfTI export for this frame, if requested
+        if args.export_nifti and fi in qa_indices:
             qa_nii = img_base.with_suffix(".nii.gz")
-            export_cfl_to_nifti_gz(img_base, qa_nii)
+            save_nifti_from_cfl(img_base, qa_nii)
 
     if not vol_bases:
         print("[error] No frames successfully reconstructed.", file=sys.stderr)
         sys.exit(1)
 
-    # Build 4D volume at out_base: join along dim=3
-    join_args = ["join", "3"] + [str(vb) for vb in vol_bases] + [str(out_base)]
-    try:
-        run_bart(join_args, gpu=args.gpu)
-    except subprocess.CalledProcessError as e:
-        print(f"[error] BART join failed: {e}", file=sys.stderr)
-        raise
+    # Build 4D volume at out_base: stack along dim=3 using only frames that exist
+    existing_bases = [vb for vb in vol_bases if vb.with_suffix(".cfl").exists()]
+    if not existing_bases:
+        print("[error] No image CFLs found to stack.", file=sys.stderr)
+        sys.exit(1)
 
-    # Final 4D NIfTI(.gz) export
+    if len(existing_bases) == 1:
+        # Just copy single 3D into out_base
+        run_bart(["copy", str(existing_bases[0]), str(out_base)])
+    else:
+        join_args = ["join", "3"] + [str(vb) for vb in existing_bases] + [str(out_base)]
+        run_bart(join_args)
+
+    # Final NIfTI export of 4D stack
     if args.export_nifti:
-        final_nii = out_base.with_suffix(".nii.gz")
-        export_cfl_to_nifti_gz(out_base, final_nii)
+        out_nii = out_base.with_suffix(".nii.gz")
+        save_nifti_from_cfl(out_base, out_nii)
 
     print("[info] All requested frames complete; 4D result at", out_base)
 
