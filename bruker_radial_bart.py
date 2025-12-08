@@ -461,7 +461,6 @@ def main():
         print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
     # true readout (RO) from ACQ_size[0], unless overridden
-    true_ro: Optional[int]
     if args.readout is not None:
         true_ro = args.readout
     else:
@@ -579,7 +578,7 @@ def main():
 
         # Optional QA export: per-frame NIfTI for early frames
         if args.export_nifti and args.qa_first > 0 and fi < args.qa_first:
-            qa_nifti = img_base.with_suffix(".nii.gz")
+            qa_nifti = img_base.with_suffix(".nii")
             try:
                 run_bart(["toimg", str(img_base), str(qa_nifti)], gpu=False)
             except subprocess.CalledProcessError as e:
@@ -599,7 +598,7 @@ def main():
 
     # Final 4D NIfTI export
     if args.export_nifti:
-        nifti_out = out_base.with_suffix(".nii.gz")
+        nifti_out = out_base.with_suffix(".nii")
         try:
             run_bart(["toimg", str(out_base), str(nifti_out)], gpu=False)
         except subprocess.CalledProcessError as e:
