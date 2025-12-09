@@ -55,28 +55,23 @@ def read_bruker_param(path: Path, key: str, default=None):
 
     for idx, line in enumerate(lines):
         if line.startswith(key_token):
-            # Handle possible dimension declaration
-            # e.g. "##$PVM_Matrix=( 3 )"
             parts = line.strip().split("=")
             if len(parts) < 2:
                 continue
             rhs = parts[1].strip()
 
-            # If it contains "( n )", next line(s) have values
             if rhs.startswith("("):
-                # Next non-comment, non-empty line has values
                 vals = []
                 j = idx + 1
                 while j < len(lines):
                     l2 = lines[j].strip()
-                    if l2.startswith("##"):  # next param
+                    if l2.startswith("##"):
                         break
                     if l2 == "" or l2.startswith("$$"):
                         j += 1
                         continue
                     vals.extend(l2.split())
                     j += 1
-                # Convert to int/float if possible
                 vals_parsed = []
                 for v in vals:
                     try:
@@ -90,9 +85,7 @@ def read_bruker_param(path: Path, key: str, default=None):
                     return vals_parsed[0]
                 return vals_parsed
             else:
-                # Single-line value
                 rhs = rhs.strip()
-                # Strip optional parentheses
                 rhs = rhs.strip("()")
                 tokens = [t for t in rhs.split() if t]
                 vals_parsed = []
@@ -123,7 +116,6 @@ def infer_matrix(method: Path):
 
 def infer_true_ro(acqp: Path):
     acq_size = read_bruker_param(acqp, "ACQ_size", default=None)
-    # ACQ_size is usually ( 2 ) RO PE or ( 3 ) RO PE1 PE2
     if acq_size is None:
         raise ValueError("Could not infer ACQ_size for true RO")
     if isinstance(acq_size, (int, float)):
@@ -134,7 +126,6 @@ def infer_true_ro(acqp: Path):
 
 
 def infer_coils(method: Path):
-    # Prefer PVM_EncNReceivers; fall back to 1
     coils = read_bruker_param(method, "PVM_EncNReceivers", default=None)
     if coils is None:
         coils = 1
@@ -152,9 +143,7 @@ def factor_fid(total_points: int, true_ro: int, coils_hint: int | None = None):
     Factor total complex samples into (stored_ro * spokes * coils).
 
     We allow stored_ro != true_ro (e.g. stored_ro=128, true_ro=122).
-    Try candidate stored_ro values and coil counts, pick a "reasonable" combo.
     """
-    # Candidate stored RO values
     block_candidates = [true_ro]
     for b in (128, 96, 64, 384, 512):
         if b != true_ro:
@@ -163,7 +152,6 @@ def factor_fid(total_points: int, true_ro: int, coils_hint: int | None = None):
     best = None
     best_score = -1
 
-    # Coil candidates: if we have a hint, put it first
     if coils_hint is not None:
         coil_candidates = [coils_hint] + [c for c in range(1, 33) if c != coils_hint]
     else:
@@ -176,10 +164,6 @@ def factor_fid(total_points: int, true_ro: int, coils_hint: int | None = None):
                 continue
             spokes = total_points // denom
 
-            # Scoring heuristic:
-            # - prefer stored_ro >= true_ro
-            # - prefer stored_ro close to true_ro
-            # - prefer more spokes (>100)
             score = 0
             if stored_ro >= true_ro:
                 score += 1
@@ -216,7 +200,6 @@ def load_bruker_kspace(fid_path: Path, true_ro: int, coils_hint: int | None = No
     if not fid_path.exists():
         raise FileNotFoundError(f"FID not found: {fid_path}")
 
-    # Bruker FID is usually float32 pairs (real, imag).
     dtype = np.dtype(f"{endian}f4")
     raw = np.fromfile(fid_path, dtype=dtype)
     if raw.size % 2 != 0:
@@ -239,10 +222,8 @@ def load_bruker_kspace(fid_path: Path, true_ro: int, coils_hint: int | None = No
         f"spokes={spokes}, coils={coils}"
     )
 
-    # Reshape: (stored_ro, spokes, coils)
     ksp = complex_data.reshape(stored_ro, spokes, coils)
 
-    # Trim to true RO if necessary
     if stored_ro != true_ro:
         if stored_ro < true_ro:
             raise ValueError(
@@ -274,22 +255,17 @@ def build_kron_traj(true_ro: int, spokes: int, NX: int, NY: int, NZ: int, traj_s
     else:
         kmax = float(traj_scale)
 
-    # We’ll build directions uniformly on the sphere via a simple scheme
     idx = np.arange(spokes, dtype=np.float64)
-    z = 2.0 * (idx / max(1, spokes - 1)) - 1.0  # in [-1, 1]
-    phi = np.pi * (1 + 5**0.5) * idx  # golden angle-ish
+    z = 2.0 * (idx / max(1, spokes - 1)) - 1.0
+    phi = np.pi * (1 + 5**0.5) * idx
     r_xy = np.sqrt(1.0 - z**2)
     dx = r_xy * np.cos(phi)
     dy = r_xy * np.sin(phi)
     dz = z
 
-    # Radial positions along readout: from center to edge, normalized.
-    # We want max radius ~ 0.5 in BART units.
     s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64)
-    # Re-scale so that physical kmax corresponds to 0.5
-    # (i.e., scale coordinates by 0.5/kmax)
     scale = 0.5 / max(kmax, 1e-6)
-    s_scaled = s * (kmax * scale)  # still max ~0.5
+    s_scaled = s * (kmax * scale)
 
     traj = np.zeros((3, true_ro, spokes), dtype=np.float32)
     for i in range(spokes):
@@ -305,26 +281,18 @@ def build_kron_traj(true_ro: int, spokes: int, NX: int, NY: int, NZ: int, traj_s
 # ---------------------------------------------------------------------------
 
 def writecfl(name: str, arr: np.ndarray):
-    """
-    Write BART CFL/HDR pair.
-
-    `name` should be full path *without* .cfl/.hdr suffix.
-    """
     base = Path(name)
     hdr = base.with_suffix(".hdr")
     cfl = base.with_suffix(".cfl")
 
-    # BART uses column-major (Fortran) order
     arr_f = np.asfortranarray(arr.astype(np.complex64))
 
     with hdr.open("w") as f:
         f.write("# Dimensions\n")
         dims = list(arr_f.shape)
-        # BART always expects 16 dims in header
         dims += [1] * (16 - len(dims))
         f.write(" ".join(str(d) for d in dims) + "\n")
 
-    # Interleave real/imag as float32
     with cfl.open("wb") as f:
         stacked = np.empty(arr_f.size * 2, dtype=np.float32)
         stacked[0::2] = arr_f.real.ravel(order="F")
@@ -333,9 +301,6 @@ def writecfl(name: str, arr: np.ndarray):
 
 
 def readcfl(name: str):
-    """
-    Read BART CFL/HDR pair into a numpy array (complex64).
-    """
     base = Path(name)
     hdr = base.with_suffix(".hdr")
     cfl = base.with_suffix(".cfl")
@@ -344,7 +309,6 @@ def readcfl(name: str):
         _ = f.readline()
         dims_line = f.readline()
     dims = [int(x) for x in dims_line.strip().split()]
-    # Strip trailing 1s
     while len(dims) > 1 and dims[-1] == 1:
         dims.pop()
 
@@ -368,29 +332,19 @@ def bartstack_to_nifti(bart_base: Path, out_nifti: Path):
     Load a coil-combined 4D CFL (BART ordering) and write a 4D NIfTI.
 
     We assume images are stored with dims (X, Y, Z, T) or a transposed variant.
-    For safety, we treat the first 3 non-singleton dims as spatial
-    and the 4th as time.
     """
     img = readcfl(str(bart_base))
-    # img is complex64; we use magnitude
     mag = np.abs(img)
-
-    # Figure out shape
     shape = mag.shape
     non1 = [d for d in shape if d > 1]
 
     if len(non1) < 3:
         raise ValueError(f"Not enough non-singleton dims in {shape} for a 3D+T image.")
 
-    # Heuristic: last non-singleton dim is time
-    # The previous three are spatial, but may not be in XYZ order. We assume they are.
-    # So we ensure the array is at least 4D: (X, Y, Z, T)
     if len(shape) == 4:
         X, Y, Z, T = shape
         vol = mag
     else:
-        # General fallback: just reshape to (X, Y, Z, T) by grouping.
-        # This is conservative and should work if img was originally written as (X,Y,Z,T).
         n_spatial = np.prod(shape[:-1])
         X = int(round(n_spatial ** (1.0 / 3.0)))
         if X ** 3 != n_spatial:
@@ -409,12 +363,7 @@ def bartstack_to_nifti(bart_base: Path, out_nifti: Path):
 # ---------------------------------------------------------------------------
 
 def bart_supports_gpu(bart_bin: str = "bart") -> bool:
-    """
-    Check whether BART was compiled with GPU support by calling a tiny nufft with -g.
-    """
     try:
-        # This will almost certainly fail on dimensions, but if GPU is missing
-        # BART prints a specific message and exits non-zero.
         proc = subprocess.run(
             [bart_bin, "nufft", "-i", "-g"],
             stdout=subprocess.PIPE,
@@ -431,7 +380,6 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
     if "compiled without gpu support" in stderr:
         return False
 
-    # If we didn't see the specific message, but -g was accepted, assume GPU exists.
     return "unknown option" not in stderr
 
 
@@ -457,13 +405,8 @@ def run_bart(
     use_gpu: bool,
     debug: bool,
 ):
-    """
-    Drive BART NUFFT/RSS for each frame with per-frame caching.
-    """
     bart_bin = "bart"
 
-    # Build full trajectory for all spokes
-    # ksp shape: (true_ro, spokes_all, coils)
     ro, spokes_all, coils = ksp.shape
 
     if spokes_per_frame <= 0:
@@ -471,17 +414,13 @@ def run_bart(
     if frame_shift <= 0:
         frame_shift = spokes_per_frame
 
-    # Sliding-window frames
     frame_start_indices = list(range(0, max(1, spokes_all - spokes_per_frame + 1), frame_shift))
     n_frames = len(frame_start_indices)
     print(f"[info] Sliding window: spokes-per-frame={spokes_per_frame}, frame-shift={frame_shift}")
     print(f"[info] Will reconstruct {n_frames} frame(s).")
 
-    # Build full traj
     traj_full = build_kron_traj(true_ro, spokes_all, NX, NY, NZ, traj_scale=traj_scale)
-    # traj_full shape: (3, ro, spokes_all)
 
-    # GPU handling
     have_gpu = False
     if use_gpu:
         have_gpu = bart_supports_gpu(bart_bin)
@@ -494,9 +433,6 @@ def run_bart(
     per_series_dir = out_base.parent
     per_series_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Per-frame loop
-    # ------------------------------------------------------------------
     frame_paths = []
     for i, start in enumerate(frame_start_indices):
         stop = start + spokes_per_frame
@@ -504,37 +440,31 @@ def run_bart(
             stop = spokes_all
         frame_spokes = stop - start
 
-        # Per-frame bases
         frame_tag = f"vol{i:05d}"
         traj_base = per_series_dir / f"{out_base.name}_{frame_tag}_traj"
         ksp_base = per_series_dir / f"{out_base.name}_{frame_tag}_ksp"
-        coil_base = per_series_dir / f"{out_base.name}_{frame_tag}_coil"  # coil image
+        coil_base = per_series_dir / f"{out_base.name}_{frame_tag}_coil"
         sos_base = per_series_dir / f"{out_base.name}_{frame_tag}"
 
         frame_paths.append(sos_base)
 
-        # If coil-combined CFL exists, skip NUFFT/RSS
         if sos_base.with_suffix(".cfl").exists():
             print(f"[info] Frame {i} already reconstructed -> {sos_base}, skipping NUFFT/RSS.")
             continue
 
         print(f"[info] Frame {i} spokes [{start}:{stop}] (n={frame_spokes})")
 
-        # Extract sub-ksp and sub-traj
-        ksp_frame = ksp[:, start:stop, :]  # (ro, frame_spokes, coils)
-        traj_frame = traj_full[:, :, start:stop]  # (3, ro, frame_spokes)
+        ksp_frame = ksp[:, start:stop, :]
+        traj_frame = traj_full[:, :, start:stop]
 
-        # BART expects leading singleton dim for NUFFT in this setup → (1, ro, spokes, coils)
-        ksp_bart = ksp_frame[np.newaxis, ...]
-        # traj stays (3, ro, spokes); BART is fine with that.
+        ksp_bart = ksp_frame[np.newaxis, ...]  # (1, ro, spokes_frame, coils)
 
         writecfl(str(traj_base), traj_frame)
         writecfl(str(ksp_base), ksp_bart)
 
-        # NUFFT
         cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
         if use_gpu and have_gpu:
-            cmd.insert(2, "-g")  # bart nufft -i -g -d ...
+            cmd.insert(2, "-g")
 
         cmd += [str(traj_base), str(ksp_base), str(coil_base)]
         print("[bart]", " ".join(cmd))
@@ -544,7 +474,6 @@ def run_bart(
             print(f"[error] BART NUFFT/RSS failed for frame {i} with code {e.returncode}", file=sys.stderr)
             raise
 
-        # Coil combine
         if combine == "sos":
             cmd2 = [bart_bin, "rss", "3", str(coil_base), str(sos_base)]
             print("[bart]", " ".join(cmd2))
@@ -552,39 +481,27 @@ def run_bart(
         else:
             raise ValueError(f"Unsupported combine mode: {combine}")
 
-    # ------------------------------------------------------------------
-    # QA NIfTI (first N frames)
-    # ------------------------------------------------------------------
     if qa_first is not None and qa_first > 0:
         qa_frames = frame_paths[:qa_first]
         if len(qa_frames) > 0:
-            # Join along time dimension using BART, then convert to NIfTI via nibabel
             qa_join_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
-            # Build join command
-            join_cmd = [bart_bin, "join", "3"]  # join along TIME_DIM
-            join_cmd += [str(base) for base in qa_frames]
-            join_cmd.append(str(qa_join_base))
+            join_cmd = ["bart", "join", "3"] + [str(base) for base in qa_frames] + [str(qa_join_base)]
             print("[bart]", " ".join(join_cmd))
             subprocess.run(join_cmd, check=True)
 
-            # Now convert QA CFL to NIfTI
             qa_nii = qa_join_base.with_suffix(".nii.gz")
             try:
                 bartstack_to_nifti(qa_join_base, qa_nii)
             except Exception as e:
                 print(f"[warn] Failed to convert QA CFL to NIfTI: {e}", file=sys.stderr)
 
-    # ------------------------------------------------------------------
-    # Final 4D join + NIfTI
-    # ------------------------------------------------------------------
-    # Only join frames that actually have coil-combined CFL
     sos_existing = [p for p in frame_paths if p.with_suffix(".cfl").exists()]
     if not sos_existing:
         print("[warn] No per-frame SoS CFLs exist; skipping 4D stack.", file=sys.stderr)
         return
 
     stack_base = per_series_dir / out_base.name
-    join_cmd = [bart_bin, "join", "3"] + [str(p) for p in sos_existing] + [str(stack_base)]
+    join_cmd = ["bart", "join", "3"] + [str(p) for p in sos_existing] + [str(stack_base)]
     print("[bart]", " ".join(join_cmd))
     subprocess.run(join_cmd, check=True)
 
@@ -670,7 +587,6 @@ def main():
             f"Expected method, acqp, fid."
         )
 
-    # Matrix
     if args.matrix is not None:
         NX, NY, NZ = args.matrix
         print(f"[info] Matrix overridden from CLI: {NX}x{NY}x{NZ}")
@@ -678,7 +594,6 @@ def main():
         NX, NY, NZ = infer_matrix(method)
         print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
-    # True RO
     if args.readout is not None:
         true_ro = int(args.readout)
         print(f"[info] Readout (true RO) overridden from CLI: RO={true_ro}")
@@ -686,7 +601,6 @@ def main():
         true_ro = infer_true_ro(acqp)
         print(f"[info] Readout (true RO) from ACQ_size: RO={true_ro}")
 
-    # Coils
     if args.coils is not None:
         coils_hint = int(args.coils)
         print(f"[info] Coils overridden from CLI: {coils_hint}")
@@ -694,18 +608,16 @@ def main():
         coils_hint = infer_coils(method)
         print(f"[info] Coils inferred from PVM_EncNReceivers: {coils_hint}")
 
-    # Load k-space
     ksp, stored_ro, spokes_all, coils = load_bruker_kspace(
         fid, true_ro=true_ro, coils_hint=coils_hint, endian=args.fid_endian
     )
 
-    if args.spokes-per-frame <= 0:
-        # Default: use *all* spokes as single frame
+    if args.spokes_per_frame <= 0:
         spokes_per_frame = spokes_all
     else:
-        spokes_per_frame = args.spokes-per-frame
+        spokes_per_frame = args.spokes_per_frame
 
-    frame_shift = args.frame-shift if args.frame-shift > 0 else spokes_per_frame
+    frame_shift = args.frame_shift if args.frame_shift > 0 else spokes_per_frame
 
     run_bart(
         series_path=series_path,
@@ -720,8 +632,8 @@ def main():
         frame_shift=frame_shift,
         combine=args.combine,
         qa_first=args.qa_first if args.qa_first > 0 else None,
-        export_nifti=args.export-nifti,
-        traj_scale=args.traj-scale if hasattr(args, "traj-scale") else args.traj_scale,
+        export_nifti=args.export_nifti,
+        traj_scale=args.traj_scale,
         use_gpu=args.gpu,
         debug=args.debug,
     )
