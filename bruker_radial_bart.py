@@ -334,7 +334,6 @@ def build_traj(mode: str, ro: int, spokes: int) -> np.ndarray:
         traj[1, :, s] = r * dy[s]
         traj[2, :, s] = r * dz[s]
 
-    print(f"[info] Built synthetic {mode} trajectory: shape={traj.shape}")
     return traj
 
 
@@ -421,7 +420,17 @@ def run_bart_nufft(NX: int, NY: int, NZ: int, traj_base: Path, ksp_base: Path, c
     ]
 
     if GPU_NUFFT:
-        gpu_args = ["nufft", "-i", "-g", "-d", f"{NX}:{NY}:{NZ}", "-t", str(traj_base), str(ksp_base), str(coil_base)]
+        gpu_args = [
+            "nufft",
+            "-i",
+            "-g",
+            "-d",
+            f"{NX}:{NY}:{NZ}",
+            "-t",
+            str(traj_base),
+            str(ksp_base),
+            str(coil_base),
+        ]
         cmd = [bart_path()] + gpu_args
         print("[bart]", " ".join(str(a) for a in cmd))
         try:
@@ -437,7 +446,6 @@ def run_bart_nufft(NX: int, NY: int, NZ: int, traj_base: Path, ksp_base: Path, c
                 )
                 GPU_NUFFT = False
             else:
-                # Some other NUFFT error; re-raise
                 print(stderr, file=sys.stderr)
                 raise
 
@@ -504,6 +512,12 @@ def main():
         choices=["kron", "linz"],
         default="kron",
         help="Synthetic trajectory type (Kronecker or LinZ-GA).",
+    )
+    ap.add_argument(
+        "--traj-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to synthetic trajectory coordinates before NUFFT.",
     )
 
     ap.add_argument(
@@ -593,8 +607,13 @@ def main():
     ro, sp_total, nc = ksp.shape
     assert sp_total == spokes_total
 
-    # synthetic Kronecker / LinZ-GA trajectory
+    # synthetic Kronecker / LinZ-GA trajectory, then scale
     traj = build_traj(args.traj_mode, ro=RO, spokes=sp_total)
+    if args.traj_scale != 1.0:
+        traj *= np.float32(args.traj_scale)
+        print(f"[info] Applied traj-scale={args.traj_scale}; traj shape={traj.shape}")
+    else:
+        print(f"[info] Built synthetic {args.traj_mode} trajectory: shape={traj.shape}")
 
     # sliding-window setup
     if args.spokes_per_frame is None:
@@ -662,7 +681,9 @@ def main():
                 run_bart(["join", "3"] + [str(vb) for vb in vol_bases[: args.qa_first]] + [str(qa_out)])
                 if args.export_nifti:
                     export_nifti_from_cfl(qa_out)
-                print(f"[info] QA 4D volume written at {qa_out}")
+                print(f"[info] QA 4D CFL: {qa_out}")
+                if args.export_nifti:
+                    print(f"[info] QA 4D NIfTI: {qa_out.with_suffix('.nii.gz')}")
             except subprocess.CalledProcessError as e:
                 print(f"[warn] BART join failed for QA volume: {e}", file=sys.stderr)
 
@@ -681,6 +702,8 @@ def main():
         export_nifti_from_cfl(out_base)
 
     print("[info] All requested frames complete; 4D result at", out_base)
+    if args.export_nifti:
+        print("[info] Final 4D NIfTI:", out_base.with_suffix(".nii.gz"))
 
 
 if __name__ == "__main__":
