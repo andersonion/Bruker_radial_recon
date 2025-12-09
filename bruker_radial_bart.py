@@ -203,7 +203,6 @@ def load_bruker_kspace(
     dbg("total complex samples:", total)
 
     # Infer stored_ro (padded block) and spokes from total length.
-    # Use a small set of plausible block sizes including true_ro.
     candidate_blocks = sorted(set([true_ro, 128, 256, 512, 1024]))
     stored_ro = None
     spokes = None
@@ -317,7 +316,8 @@ def linz_ga_dirs(N: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     return dx, dy, z
 
 
-def build_traj(mode: str, ro: int, spokes: int) -> np.ndarray:
+def build_traj(mode: str, ro: int, spokes: int, scale: float = 1.0) -> np.ndarray:
+    """Build 3 x RO x spokes trajectory; optional radial scale factor."""
     mode = mode.lower()
     if mode not in ("kron", "linz"):
         raise ValueError("traj-mode must be 'kron' or 'linz'")
@@ -327,15 +327,15 @@ def build_traj(mode: str, ro: int, spokes: int) -> np.ndarray:
     else:
         dx, dy, dz = linz_ga_dirs(spokes)
 
-    # radius goes from -0.5..0.5 in k-space units (pixel_size/FOV)
-    r = np.linspace(-0.5, 0.5, ro, endpoint=False, dtype=np.float32)
+    # radius base from -0.5..0.5, then scale
+    r = np.linspace(-0.5, 0.5, ro, endpoint=False, dtype=np.float32) * float(scale)
     traj = np.zeros((3, ro, spokes), dtype=np.float32)
     for s in range(spokes):
         traj[0, :, s] = r * dx[s]
         traj[1, :, s] = r * dy[s]
         traj[2, :, s] = r * dz[s]
 
-    print(f"[info] Built synthetic {mode} trajectory: shape={traj.shape}")
+    print(f"[info] Built synthetic {mode} trajectory (scale={scale}): shape={traj.shape}")
     return traj
 
 
@@ -417,14 +417,11 @@ def run_bart(args: List[str], allow_gpu_fallback: bool = False):
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         if use_gpu_here and e.returncode != 0 and GPU_SUPPORTED:
-            # try to detect 'compiled without GPU support'
-            # run once without -g
             print(
                 "[warn] BART compiled without GPU support; "
                 "falling back to CPU NUFFT and disabling --gpu."
             )
             GPU_SUPPORTED = False
-            # re-run without '-g'
             cpu_args = [a for a in args if a != "-g"]
             cmd = cmd_base + cpu_args
             print("[bart]", " ".join(cmd))
@@ -468,6 +465,12 @@ def main():
         choices=["kron", "linz"],
         default="kron",
         help="Synthetic trajectory type (Kronecker or LinZ-GA).",
+    )
+    ap.add_argument(
+        "--traj-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for k-space trajectory radius (multiplies base [-0.5..0.5] radius).",
     )
 
     ap.add_argument(
@@ -552,7 +555,7 @@ def main():
     ro, sp_total, nc = ksp.shape
 
     # synthetic Kronecker / LinZ-GA trajectory with correct dims: 3 x RO x spokes
-    traj = build_traj(args.traj_mode, ro=RO, spokes=sp_total)
+    traj = build_traj(args.traj_mode, ro=RO, spokes=sp_total, scale=args.traj_scale)
 
     # sliding-window setup
     if args.spokes_per_frame is None:
