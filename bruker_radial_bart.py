@@ -179,13 +179,27 @@ def load_bruker_kspace(
     fid_path: Path,
     true_ro: int,
     coils_hint: int | None = None,
-    endian: str = ">",
+    endian: str = "<",
+    base_kind: str = "i4",
 ):
+    """
+    Load Bruker FID as complex data and reshape to (stored_ro, spokes, coils),
+    then trim to (true_ro, spokes, coils).
+
+    endian: '>' or '<'
+    base_kind: 'i4' (int32) or 'f4' (float32)
+    """
     if not fid_path.exists():
         raise FileNotFoundError(f"FID not found: {fid_path}")
 
-    dtype = np.dtype(f"{endian}f4")
-    raw = np.fromfile(fid_path, dtype=dtype)
+    try:
+        np_dtype = np.dtype(endian + base_kind)
+    except TypeError as e:
+        raise ValueError(f"Invalid dtype combination: endian={endian}, kind={base_kind}") from e
+
+    raw = np.fromfile(fid_path, dtype=np_dtype)
+    # Work in float32 for the complex pairing
+    raw = raw.astype(np.float32)
 
     if raw.size % 2 != 0:
         raise ValueError(f"FID raw length {raw.size} not even (real/imag pairs).")
@@ -236,13 +250,15 @@ def build_kron_traj(
     Build a synthetic 3D "kron" golden-angle trajectory for BART.
 
     Output shape: (3, RO, spokes)
+    Coordinates are in approximately [-0.5, 0.5] when traj_scale is None.
     """
-    # Approximate k-space radius (in pixels) – use NX/2 by default, or override.
-    kmax = float(traj_scale) if traj_scale is not None else NX / 2.0
-
     idx = np.arange(spokes, dtype=np.float64)
     # Map index to z in [-1, 1]
-    z = 2.0 * (idx / max(1, spokes - 1)) - 1.0
+    if spokes > 1:
+        z = 2.0 * (idx / (spokes - 1)) - 1.0
+    else:
+        z = np.zeros_like(idx)
+
     phi = np.pi * (1 + 5**0.5) * idx  # golden angle-ish
 
     r_xy = np.sqrt(np.clip(1.0 - z**2, 0.0, 1.0))
@@ -250,18 +266,16 @@ def build_kron_traj(
     dy = r_xy * np.sin(phi)
     dz = z
 
-    # Readout samples mapped to [-0.5, 0.5]
-    s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64)
-
-    # Scale so BART's "estimated image size" isn't tiny.
-    scale = 0.5 / max(kmax, 1e-6)
-    s_scaled = s * (kmax * scale)
+    # Readout samples in [-0.5, 0.5]
+    base_s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64)
+    scale = float(traj_scale) if traj_scale is not None else 1.0
+    s = base_s * scale
 
     traj = np.zeros((3, true_ro, spokes), dtype=np.complex64)
     for i in range(spokes):
-        traj[0, :, i] = s_scaled * dx[i]
-        traj[1, :, i] = s_scaled * dy[i]
-        traj[2, :, i] = s_scaled * dz[i]
+        traj[0, :, i] = s * dx[i]
+        traj[1, :, i] = s * dy[i]
+        traj[2, :, i] = s * dz[i]
 
     return traj
 
@@ -310,7 +324,6 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
 
     if "compiled without gpu support" in stderr:
         return False
-
     if "unknown option" in stderr:
         return False
 
@@ -417,9 +430,9 @@ def run_bart(
         cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
         if use_gpu and have_gpu:
             cmd.insert(2, "-g")
+        print("[bart]", " ".join(cmd + [str(traj_base), str(ksp_base), str(coil_base)]))
         cmd += [str(traj_base), str(ksp_base), str(coil_base)]
 
-        print("[bart]", " ".join(cmd))
         subprocess.run(cmd, check=True)
 
         # Coil combine
@@ -483,7 +496,6 @@ def main():
                 --spokes-per-frame 200 \\
                 --frame-shift 50 \\
                 --traj-mode kron \\
-                --traj-scale 48 \\
                 --combine sos \\
                 --qa-first 2 \\
                 --export-nifti \\
@@ -542,14 +554,16 @@ def main():
 
     ap.add_argument(
         "--fid-dtype",
-        default=">f4",
-        help="FID dtype (ignored; we infer from endian + float32 pairs)",
+        choices=["i4", "f4"],
+        default="i4",
+        help="Base numeric type of FID data (32-bit int or float); "
+             "combined with --fid-endian.",
     )
     ap.add_argument(
         "--fid-endian",
         choices=[">", "<"],
-        default=">",
-        help="FID endianness (default big-endian: '>')",
+        default="<",
+        help="FID endianness: '>' big-endian, '<' little-endian (default).",
     )
 
     ap.add_argument(
@@ -574,7 +588,8 @@ def main():
         "--traj-scale",
         type=float,
         default=None,
-        help="Override k-space radius used to scale trajectory (default ~ NX/2)",
+        help="Scale factor for k-space coordinates (default 1.0). "
+             "Leave unset initially.",
     )
 
     ap.add_argument(
@@ -630,7 +645,11 @@ def main():
 
     # Load k-space
     ksp, stored_ro, spokes_all, coils = load_bruker_kspace(
-        fid, true_ro, coils_hint, args.fid_endian
+        fid,
+        true_ro,
+        coils_hint,
+        endian=args.fid_endian,
+        base_kind=args.fid_dtype,
     )
 
     # Frame config
