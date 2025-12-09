@@ -1,68 +1,50 @@
 #!/usr/bin/env python3
-"""
-bruker_radial_bart.py
-
-Simple Bruker 3D radial → BART NUFFT recon driver.
-
-Features:
-- Infers matrix from PVM_Matrix.
-- Infers true RO from ACQ_size.
-- Robust factoring of FID into (stored_ro * spokes * coils), allows stored_ro=128 etc.
-- Uses true RO by trimming along readout dimension.
-- Sliding-window framing (spokes-per-frame, frame-shift).
-- Per-frame caching: skips frames whose coil-combined CFL already exists.
-- Optional QA: exports first N frames as NIfTI with correct dims (X,Y,Z,T).
-- Final 4D stack export as NIfTI.
-- Optional GPU flag with graceful fallback if BART has no GPU support.
-"""
 
 import argparse
 import os
 import sys
 import subprocess
-from pathlib import Path
 import textwrap
+from pathlib import Path
 
 import numpy as np
-import nibabel as nib
 
 
-# ---------------------------------------------------------------------------
-# Bruker helpers
-# ---------------------------------------------------------------------------
+# ---------------- Bruker helpers ---------------- #
+
 
 def read_bruker_param(path: Path, key: str, default=None):
     """
-    Minimal Bruker parameter reader.
-
-    Looks for lines like:
-      ##$PVM_Matrix=( 3 ) 96 96 96
+    Tiny Bruker text parser for method/acqp.
 
     Returns:
-      - list of values if multiple
-      - single scalar if only one
+      - scalar (int/float/str) if a single value
+      - list if multiple
       - default if not found
     """
     if not path.exists():
         return default
 
-    key_token = f"##${key}="
+    token = f"##${key}="
+
     try:
         with path.open("r") as f:
             lines = f.readlines()
     except Exception:
         return default
 
-    for idx, line in enumerate(lines):
-        if line.startswith(key_token):
+    for i, line in enumerate(lines):
+        if line.startswith(token):
             parts = line.strip().split("=")
             if len(parts) < 2:
                 continue
+
             rhs = parts[1].strip()
 
+            # Multi-line / array style
             if rhs.startswith("("):
                 vals = []
-                j = idx + 1
+                j = i + 1
                 while j < len(lines):
                     l2 = lines[j].strip()
                     if l2.startswith("##"):
@@ -72,34 +54,37 @@ def read_bruker_param(path: Path, key: str, default=None):
                         continue
                     vals.extend(l2.split())
                     j += 1
-                vals_parsed = []
+
+                parsed = []
                 for v in vals:
                     try:
                         if "." in v or "e" in v.lower():
-                            vals_parsed.append(float(v))
+                            parsed.append(float(v))
                         else:
-                            vals_parsed.append(int(v))
+                            parsed.append(int(v))
                     except ValueError:
-                        vals_parsed.append(v)
-                if len(vals_parsed) == 1:
-                    return vals_parsed[0]
-                return vals_parsed
-            else:
-                rhs = rhs.strip()
-                rhs = rhs.strip("()")
-                tokens = [t for t in rhs.split() if t]
-                vals_parsed = []
-                for v in tokens:
-                    try:
-                        if "." in v or "e" in v.lower():
-                            vals_parsed.append(float(v))
-                        else:
-                            vals_parsed.append(int(v))
-                    except ValueError:
-                        vals_parsed.append(v)
-                if len(vals_parsed) == 1:
-                    return vals_parsed[0]
-                return vals_parsed
+                        parsed.append(v)
+                if len(parsed) == 1:
+                    return parsed[0]
+                return parsed
+
+            # Single-line values or tuples on one line
+            rhs = rhs.strip().strip("()")
+            tokens = [t for t in rhs.split() if t]
+
+            parsed = []
+            for v in tokens:
+                try:
+                    if "." in v or "e" in v.lower():
+                        parsed.append(float(v))
+                    else:
+                        parsed.append(int(v))
+                except ValueError:
+                    parsed.append(v)
+
+            if len(parsed) == 1:
+                return parsed[0]
+            return parsed
 
     return default
 
@@ -114,18 +99,20 @@ def infer_matrix(method: Path):
     return NX, NY, NZ
 
 
-def infer_true_ro(acqp: Path):
+def infer_true_ro(acqp: Path) -> int:
     acq_size = read_bruker_param(acqp, "ACQ_size", default=None)
     if acq_size is None:
         raise ValueError("Could not infer ACQ_size for true RO")
+
     if isinstance(acq_size, (int, float)):
         ro = int(acq_size)
     else:
         ro = int(acq_size[0])
+
     return ro
 
 
-def infer_coils(method: Path):
+def infer_coils(method: Path) -> int:
     coils = read_bruker_param(method, "PVM_EncNReceivers", default=None)
     if coils is None:
         coils = 1
@@ -134,15 +121,16 @@ def infer_coils(method: Path):
     return int(coils)
 
 
-# ---------------------------------------------------------------------------
-# FID loading and factoring
-# ---------------------------------------------------------------------------
-
 def factor_fid(total_points: int, true_ro: int, coils_hint: int | None = None):
     """
-    Factor total complex samples into (stored_ro * spokes * coils).
+    Factor total complex points into (stored_ro, spokes, coils).
 
-    We allow stored_ro != true_ro (e.g. stored_ro=128, true_ro=122).
+    We try several candidate stored_ro values and coil counts and pick a
+    "reasonable" combination, preferring:
+      - stored_ro >= true_ro
+      - stored_ro close to true_ro
+      - spokes not ridiculously small
+      - matching the coil hint if possible.
     """
     block_candidates = [true_ro]
     for b in (128, 96, 64, 384, 512):
@@ -171,7 +159,7 @@ def factor_fid(total_points: int, true_ro: int, coils_hint: int | None = None):
                 score += 1
             if spokes > 100:
                 score += 1
-            if c == coils_hint:
+            if coils_hint is not None and c == coils_hint:
                 score += 1
 
             if score > best_score:
@@ -184,31 +172,28 @@ def factor_fid(total_points: int, true_ro: int, coils_hint: int | None = None):
             f"total={total_points}, true_ro={true_ro}, coils_hint={coils_hint}"
         )
 
-    return best  # (stored_ro, coils, spokes)
+    return best
 
 
-def load_bruker_kspace(fid_path: Path, true_ro: int, coils_hint: int | None = None, endian: str = ">"):
-    """
-    Load Bruker FID as complex64.
-
-    Returns:
-        ksp_true: complex array, shape (true_ro, spokes, coils)
-        stored_ro: int
-        spokes: int
-        coils: int
-    """
+def load_bruker_kspace(
+    fid_path: Path,
+    true_ro: int,
+    coils_hint: int | None = None,
+    endian: str = ">",
+):
     if not fid_path.exists():
         raise FileNotFoundError(f"FID not found: {fid_path}")
 
     dtype = np.dtype(f"{endian}f4")
     raw = np.fromfile(fid_path, dtype=dtype)
+
     if raw.size % 2 != 0:
         raise ValueError(f"FID raw length {raw.size} not even (real/imag pairs).")
 
     complex_data = raw[0::2] + 1j * raw[1::2]
     total_points = complex_data.size
 
-    stored_ro, coils, spokes = factor_fid(total_points, true_ro, coils_hint=coils_hint)
+    stored_ro, coils, spokes = factor_fid(total_points, true_ro, coils_hint)
 
     if coils_hint is not None and coils != coils_hint:
         print(
@@ -218,12 +203,13 @@ def load_bruker_kspace(fid_path: Path, true_ro: int, coils_hint: int | None = No
         )
 
     print(
-        f"[info] Loaded k-space with stored_ro={stored_ro}, true_ro={true_ro}, "
-        f"spokes={spokes}, coils={coils}"
+        f"[info] Loaded k-space with stored_ro={stored_ro}, "
+        f"true_ro={true_ro}, spokes={spokes}, coils={coils}"
     )
 
     ksp = complex_data.reshape(stored_ro, spokes, coils)
 
+    # Trim down to true RO if needed
     if stored_ro != true_ro:
         if stored_ro < true_ro:
             raise ValueError(
@@ -235,39 +221,43 @@ def load_bruker_kspace(fid_path: Path, true_ro: int, coils_hint: int | None = No
     return ksp, stored_ro, spokes, coils
 
 
-# ---------------------------------------------------------------------------
-# Trajectory
-# ---------------------------------------------------------------------------
+# ---------------- Trajectory + BART helpers ---------------- #
 
-def build_kron_traj(true_ro: int, spokes: int, NX: int, NY: int, NZ: int, traj_scale: float | None = None):
+
+def build_kron_traj(
+    true_ro: int,
+    spokes: int,
+    NX: int,
+    NY: int,
+    NZ: int,
+    traj_scale: float | None = None,
+) -> np.ndarray:
     """
-    Build a synthetic 3D 'kron' radial trajectory.
+    Build a synthetic 3D "kron" golden-angle trajectory for BART.
 
-    Output shape: (3, true_ro, spokes)
-
-    BART expects traj in units of pixel_size/FOV, roughly [-0.5, 0.5] at edge.
-    We treat `traj_scale` as "k_max" (in pixels), and scale to max radius 0.5.
-
-    If traj_scale is None, we assume k_max ~ NX/2.
+    Output shape: (3, RO, spokes)
     """
-    if traj_scale is None:
-        kmax = NX / 2.0
-    else:
-        kmax = float(traj_scale)
+    # Approximate k-space radius (in pixels) – use NX/2 by default, or override.
+    kmax = float(traj_scale) if traj_scale is not None else NX / 2.0
 
     idx = np.arange(spokes, dtype=np.float64)
+    # Map index to z in [-1, 1]
     z = 2.0 * (idx / max(1, spokes - 1)) - 1.0
-    phi = np.pi * (1 + 5**0.5) * idx
-    r_xy = np.sqrt(1.0 - z**2)
+    phi = np.pi * (1 + 5**0.5) * idx  # golden angle-ish
+
+    r_xy = np.sqrt(np.clip(1.0 - z**2, 0.0, 1.0))
     dx = r_xy * np.cos(phi)
     dy = r_xy * np.sin(phi)
     dz = z
 
+    # Readout samples mapped to [-0.5, 0.5]
     s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64)
+
+    # Scale so BART's "estimated image size" isn't tiny.
     scale = 0.5 / max(kmax, 1e-6)
     s_scaled = s * (kmax * scale)
 
-    traj = np.zeros((3, true_ro, spokes), dtype=np.float32)
+    traj = np.zeros((3, true_ro, spokes), dtype=np.complex64)
     for i in range(spokes):
         traj[0, :, i] = s_scaled * dx[i]
         traj[1, :, i] = s_scaled * dy[i]
@@ -276,11 +266,10 @@ def build_kron_traj(true_ro: int, spokes: int, NX: int, NY: int, NZ: int, traj_s
     return traj
 
 
-# ---------------------------------------------------------------------------
-# BART CFL/HDR helpers
-# ---------------------------------------------------------------------------
-
 def writecfl(name: str, arr: np.ndarray):
+    """
+    Write BART .cfl/.hdr with dims following arr.shape in Fortran order.
+    """
     base = Path(name)
     hdr = base.with_suffix(".hdr")
     cfl = base.with_suffix(".cfl")
@@ -300,69 +289,10 @@ def writecfl(name: str, arr: np.ndarray):
         stacked.tofile(f)
 
 
-def readcfl(name: str):
-    base = Path(name)
-    hdr = base.with_suffix(".hdr")
-    cfl = base.with_suffix(".cfl")
-
-    with hdr.open("r") as f:
-        _ = f.readline()
-        dims_line = f.readline()
-    dims = [int(x) for x in dims_line.strip().split()]
-    while len(dims) > 1 and dims[-1] == 1:
-        dims.pop()
-
-    with cfl.open("rb") as f:
-        data = np.fromfile(f, dtype=np.float32)
-    if data.size % 2 != 0:
-        raise ValueError(f"CFL data size {data.size} not even.")
-
-    cplx = data[0::2] + 1j * data[1::2]
-    arr = cplx.view(np.complex64)
-    arr = arr.reshape(dims, order="F")
-    return arr
-
-
-# ---------------------------------------------------------------------------
-# NIfTI helpers
-# ---------------------------------------------------------------------------
-
-def bartstack_to_nifti(bart_base: Path, out_nifti: Path):
-    """
-    Load a coil-combined 4D CFL (BART ordering) and write a 4D NIfTI.
-
-    We assume images are stored with dims (X, Y, Z, T) or a transposed variant.
-    """
-    img = readcfl(str(bart_base))
-    mag = np.abs(img)
-    shape = mag.shape
-    non1 = [d for d in shape if d > 1]
-
-    if len(non1) < 3:
-        raise ValueError(f"Not enough non-singleton dims in {shape} for a 3D+T image.")
-
-    if len(shape) == 4:
-        X, Y, Z, T = shape
-        vol = mag
-    else:
-        n_spatial = np.prod(shape[:-1])
-        X = int(round(n_spatial ** (1.0 / 3.0)))
-        if X ** 3 != n_spatial:
-            raise ValueError(f"Cannot infer cubic spatial shape from {shape}.")
-        T = shape[-1]
-        vol = mag.reshape((X, X, X, T))
-
-    affine = np.eye(4, dtype=float)
-    nif = nib.Nifti1Image(vol.astype(np.float32), affine)
-    nib.save(nif, str(out_nifti))
-    print(f"[info] Wrote NIfTI -> {out_nifti}")
-
-
-# ---------------------------------------------------------------------------
-# BART GPU probe
-# ---------------------------------------------------------------------------
-
 def bart_supports_gpu(bart_bin: str = "bart") -> bool:
+    """
+    Quick probe: is 'bart nufft -g' a known option, and compiled with GPU support?
+    """
     try:
         proc = subprocess.run(
             [bart_bin, "nufft", "-i", "-g"],
@@ -377,15 +307,18 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
         return True
 
     stderr = proc.stderr.lower()
+
     if "compiled without gpu support" in stderr:
         return False
 
-    return "unknown option" not in stderr
+    if "unknown option" in stderr:
+        return False
+
+    return False
 
 
-# ---------------------------------------------------------------------------
-# Main recon
-# ---------------------------------------------------------------------------
+# ---------------- Core recon ---------------- #
+
 
 def run_bart(
     series_path: Path,
@@ -411,69 +344,85 @@ def run_bart(
 
     if spokes_per_frame <= 0:
         raise ValueError("spokes-per-frame must be > 0")
+
     if frame_shift <= 0:
         frame_shift = spokes_per_frame
 
-    frame_start_indices = list(range(0, max(1, spokes_all - spokes_per_frame + 1), frame_shift))
-    n_frames = len(frame_start_indices)
-    print(f"[info] Sliding window: spokes-per-frame={spokes_per_frame}, frame-shift={frame_shift}")
+    frame_starts = list(
+        range(0, max(1, spokes_all - spokes_per_frame + 1), frame_shift)
+    )
+    n_frames = len(frame_starts)
+
+    print(
+        f"[info] Sliding window: spokes-per-frame={spokes_per_frame}, "
+        f"frame-shift={frame_shift}"
+    )
     print(f"[info] Will reconstruct {n_frames} frame(s).")
 
-    traj_full = build_kron_traj(true_ro, spokes_all, NX, NY, NZ, traj_scale=traj_scale)
+    # Build full trajectory once, then slice per frame.
+    if traj_mode != "kron":
+        raise ValueError(f"Only traj-mode 'kron' is currently implemented.")
+    traj_full = build_kron_traj(true_ro, spokes_all, NX, NY, NZ, traj_scale)
 
+    # GPU probe
     have_gpu = False
     if use_gpu:
         have_gpu = bart_supports_gpu(bart_bin)
         if not have_gpu:
             print(
-                "[warn] BART compiled without GPU support; falling back to CPU NUFFT and disabling --gpu.",
+                "[warn] BART compiled without GPU support; "
+                "falling back to CPU NUFFT and disabling --gpu.",
                 file=sys.stderr,
             )
 
     per_series_dir = out_base.parent
     per_series_dir.mkdir(parents=True, exist_ok=True)
+    frame_paths: list[Path] = []
 
-    frame_paths = []
-    for i, start in enumerate(frame_start_indices):
+    # ---- Per-frame NUFFT/RSS ---- #
+    for i, start in enumerate(frame_starts):
         stop = start + spokes_per_frame
         if stop > spokes_all:
             stop = spokes_all
         frame_spokes = stop - start
 
-        frame_tag = f"vol{i:05d}"
-        traj_base = per_series_dir / f"{out_base.name}_{frame_tag}_traj"
-        ksp_base = per_series_dir / f"{out_base.name}_{frame_tag}_ksp"
-        coil_base = per_series_dir / f"{out_base.name}_{frame_tag}_coil"
-        sos_base = per_series_dir / f"{out_base.name}_{frame_tag}"
+        tag = f"vol{i:05d}"
+        traj_base = per_series_dir / f"{out_base.name}_{tag}_traj"
+        ksp_base = per_series_dir / f"{out_base.name}_{tag}_ksp"
+        coil_base = per_series_dir / f"{out_base.name}_{tag}_coil"
+        sos_base = per_series_dir / f"{out_base.name}_{tag}"
 
         frame_paths.append(sos_base)
 
+        # If SoS exists for this frame, skip redo.
         if sos_base.with_suffix(".cfl").exists():
-            print(f"[info] Frame {i} already reconstructed -> {sos_base}, skipping NUFFT/RSS.")
+            print(
+                f"[info] Frame {i} already reconstructed -> "
+                f"{sos_base}, skipping NUFFT/RSS."
+            )
             continue
 
         print(f"[info] Frame {i} spokes [{start}:{stop}] (n={frame_spokes})")
 
-        ksp_frame = ksp[:, start:stop, :]
-        traj_frame = traj_full[:, :, start:stop]
+        ksp_frame = ksp[:, start:stop, :]  # (ro, spokes_frame, coils)
+        traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes_frame)
 
-        ksp_bart = ksp_frame[np.newaxis, ...]  # (1, ro, spokes_frame, coils)
+        # BART expects first dim == 1 for k-space -> (1, ro, spokes_frame, coils)
+        ksp_bart = ksp_frame[np.newaxis, ...]
 
         writecfl(str(traj_base), traj_frame)
         writecfl(str(ksp_base), ksp_bart)
 
+        # NUFFT: bart nufft [-g] -i -d NX:NY:NZ traj ksp coil
         cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
         if use_gpu and have_gpu:
             cmd.insert(2, "-g")
-
         cmd += [str(traj_base), str(ksp_base), str(coil_base)]
-        print("[bart]", " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"[error] BART NUFFT/RSS failed for frame {i} with code {e.returncode}", file=sys.stderr)
-            raise
 
+        print("[bart]", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+        # Coil combine
         if combine == "sos":
             cmd2 = [bart_bin, "rss", "3", str(coil_base), str(sos_base)]
             print("[bart]", " ".join(cmd2))
@@ -481,23 +430,27 @@ def run_bart(
         else:
             raise ValueError(f"Unsupported combine mode: {combine}")
 
-    if qa_first is not None and qa_first > 0:
+    # ---- QA volumes (first N) ---- #
+    if qa_first is not None and qa_first > 0 and frame_paths:
         qa_frames = frame_paths[:qa_first]
-        if len(qa_frames) > 0:
-            qa_join_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
-            join_cmd = ["bart", "join", "3"] + [str(base) for base in qa_frames] + [str(qa_join_base)]
-            print("[bart]", " ".join(join_cmd))
-            subprocess.run(join_cmd, check=True)
+        qa_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
 
-            qa_nii = qa_join_base.with_suffix(".nii.gz")
-            try:
-                bartstack_to_nifti(qa_join_base, qa_nii)
-            except Exception as e:
-                print(f"[warn] Failed to convert QA CFL to NIfTI: {e}", file=sys.stderr)
+        join_cmd = ["bart", "join", "3"] + [str(p) for p in qa_frames] + [str(qa_base)]
+        print("[bart]", " ".join(join_cmd))
+        subprocess.run(join_cmd, check=True)
 
+        qa_nii = qa_base.with_suffix(".nii")
+        print("[bart]", f"toimg {qa_base} {qa_nii}")
+        subprocess.run([bart_bin, "toimg", str(qa_base), str(qa_nii)], check=True)
+        subprocess.run(["gzip", "-f", str(qa_nii)], check=True)
+
+    # ---- Final 4D stack ---- #
     sos_existing = [p for p in frame_paths if p.with_suffix(".cfl").exists()]
     if not sos_existing:
-        print("[warn] No per-frame SoS CFLs exist; skipping 4D stack.", file=sys.stderr)
+        print(
+            "[warn] No per-frame SoS CFLs exist; skipping 4D stack.",
+            file=sys.stderr,
+        )
         return
 
     stack_base = per_series_dir / out_base.name
@@ -506,67 +459,134 @@ def run_bart(
     subprocess.run(join_cmd, check=True)
 
     if export_nifti:
-        stack_nii = stack_base.with_suffix(".nii.gz")
-        try:
-            bartstack_to_nifti(stack_base, stack_nii)
-        except Exception as e:
-            print(f"[warn] Failed to convert final 4D CFL to NIfTI: {e}", file=sys.stderr)
+        stack_nii = stack_base.with_suffix(".nii")
+        print("[bart]", f"toimg {stack_base} {stack_nii}")
+        subprocess.run([bart_bin, "toimg", str(stack_base), str(stack_nii)], check=True)
+        subprocess.run(["gzip", "-f", str(stack_nii)], check=True)
+
     print(f"[info] All requested frames complete; 4D result at {stack_base}")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ---------------- CLI ---------------- #
+
 
 def main():
     ap = argparse.ArgumentParser(
         description="Bruker 3D radial → BART NUFFT recon driver.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
-            """
-            Example:
-              bruker_radial_bart.py \\
+            """\
+            Typical usage:
+
+              python bruker_radial_bart.py \\
                 --series /path/to/Bruker/29 \\
                 --spokes-per-frame 200 \\
                 --frame-shift 50 \\
                 --traj-mode kron \\
                 --traj-scale 48 \\
                 --combine sos \\
-                --export-nifti \\
                 --qa-first 2 \\
-                --out /some/output/dir/29_bart_recon_SoS
+                --export-nifti \\
+                --out /some/output/prefix
+
             """
         ),
     )
-    ap.add_argument("--series", required=True, help="Bruker series directory (e.g. .../29)")
-    ap.add_argument("--out", required=True, help="Base output path (no extension)")
 
-    ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX", "NY", "NZ"),
-                    help="Override PVM_Matrix")
-    ap.add_argument("--readout", type=int, help="Override true RO (from ACQ_size)")
-    ap.add_argument("--coils", type=int, help="Override number of coils")
+    ap.add_argument("--series", required=True, help="Bruker 3D radial series directory")
+    ap.add_argument("--out", required=True, help="Output base path (no extension)")
 
-    ap.add_argument("--traj-mode", choices=["kron"], default="kron",
-                    help="Trajectory mode (currently only 'kron' supported)")
-    ap.add_argument("--spokes-per-frame", type=int, default=0, help="Spokes per frame (sliding window)")
-    ap.add_argument("--frame-shift", type=int, default=0, help="Frame shift (default = spokes-per-frame)")
+    ap.add_argument(
+        "--matrix",
+        nargs=3,
+        type=int,
+        metavar=("NX", "NY", "NZ"),
+        help="Override PVM_Matrix",
+    )
+    ap.add_argument(
+        "--readout",
+        type=int,
+        help="Override true RO length (ACQ_size[0])",
+    )
+    ap.add_argument(
+        "--coils",
+        type=int,
+        help="Override number of coils (PVM_EncNReceivers)",
+    )
 
-    ap.add_argument("--test-volumes", type=int, nargs="+",
-                    help="(Unused placeholder) specific volumes to test")
+    ap.add_argument(
+        "--traj-mode",
+        choices=["kron"],
+        default="kron",
+        help="Trajectory mode (currently only 'kron')",
+    )
+    ap.add_argument(
+        "--spokes-per-frame",
+        type=int,
+        default=0,
+        help="Spokes per frame for sliding window (0 => all spokes in one frame)",
+    )
+    ap.add_argument(
+        "--frame-shift",
+        type=int,
+        default=0,
+        help="Frame shift (0 => spokes-per-frame)",
+    )
 
-    ap.add_argument("--fid-dtype", default=">f4", help="FID dtype (ignored, fixed to big-endian float32)")
-    ap.add_argument("--fid-endian", choices=[">", "<"], default=">",
-                    help="Endianness for FID floats (default big-endian '>')")
+    ap.add_argument(
+        "--test-volumes",
+        type=int,
+        nargs="+",
+        help="Reserved for future use (subset of volumes). Currently ignored.",
+    )
 
-    ap.add_argument("--combine", choices=["sos"], default="sos", help="Coil combination method")
-    ap.add_argument("--qa-first", type=int, default=0,
-                    help="Write QA NIfTI with first N frames (0 disables)")
-    ap.add_argument("--export-nifti", action="store_true", help="Export final 4D stack as NIfTI")
-    ap.add_argument("--traj-scale", type=float, default=None,
-                    help="Physical k_max in pixels (e.g. NX/2). Internally scaled to BART units (~0.5 at edge).")
+    ap.add_argument(
+        "--fid-dtype",
+        default=">f4",
+        help="FID dtype (ignored; we infer from endian + float32 pairs)",
+    )
+    ap.add_argument(
+        "--fid-endian",
+        choices=[">", "<"],
+        default=">",
+        help="FID endianness (default big-endian: '>')",
+    )
 
-    ap.add_argument("--gpu", action="store_true", help="Use BART GPU NUFFT if available")
-    ap.add_argument("--debug", action="store_true", help="Verbose debug output")
+    ap.add_argument(
+        "--combine",
+        choices=["sos"],
+        default="sos",
+        help="Coil combine mode (only 'sos' implemented)",
+    )
+    ap.add_argument(
+        "--qa-first",
+        type=int,
+        default=0,
+        help="Write QA NIfTI of first N volumes (0 => disable)",
+    )
+    ap.add_argument(
+        "--export-nifti",
+        action="store_true",
+        help="Export final 4D stack as NIfTI (.nii.gz)",
+    )
+
+    ap.add_argument(
+        "--traj-scale",
+        type=float,
+        default=None,
+        help="Override k-space radius used to scale trajectory (default ~ NX/2)",
+    )
+
+    ap.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Try to use BART GPU NUFFT (falls back to CPU if not supported)",
+    )
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="Reserved debug flag",
+    )
 
     args = ap.parse_args()
 
@@ -582,11 +602,9 @@ def main():
     fid = series_path / "fid"
 
     if not method.exists() or not acqp.exists() or not fid.exists():
-        ap.error(
-            f"Could not find Bruker files under {series_path}. "
-            f"Expected method, acqp, fid."
-        )
+        ap.error(f"Could not find method/acqp/fid under {series_path}")
 
+    # Matrix
     if args.matrix is not None:
         NX, NY, NZ = args.matrix
         print(f"[info] Matrix overridden from CLI: {NX}x{NY}x{NZ}")
@@ -594,6 +612,7 @@ def main():
         NX, NY, NZ = infer_matrix(method)
         print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
+    # True RO
     if args.readout is not None:
         true_ro = int(args.readout)
         print(f"[info] Readout (true RO) overridden from CLI: RO={true_ro}")
@@ -601,6 +620,7 @@ def main():
         true_ro = infer_true_ro(acqp)
         print(f"[info] Readout (true RO) from ACQ_size: RO={true_ro}")
 
+    # Coils
     if args.coils is not None:
         coils_hint = int(args.coils)
         print(f"[info] Coils overridden from CLI: {coils_hint}")
@@ -608,17 +628,21 @@ def main():
         coils_hint = infer_coils(method)
         print(f"[info] Coils inferred from PVM_EncNReceivers: {coils_hint}")
 
+    # Load k-space
     ksp, stored_ro, spokes_all, coils = load_bruker_kspace(
-        fid, true_ro=true_ro, coils_hint=coils_hint, endian=args.fid_endian
+        fid, true_ro, coils_hint, args.fid_endian
     )
 
+    # Frame config
     if args.spokes_per_frame <= 0:
         spokes_per_frame = spokes_all
     else:
         spokes_per_frame = args.spokes_per_frame
 
     frame_shift = args.frame_shift if args.frame_shift > 0 else spokes_per_frame
+    qa_first = args.qa_first if args.qa_first > 0 else None
 
+    # Run recon
     run_bart(
         series_path=series_path,
         out_base=out_base,
@@ -631,7 +655,7 @@ def main():
         spokes_per_frame=spokes_per_frame,
         frame_shift=frame_shift,
         combine=args.combine,
-        qa_first=args.qa_first if args.qa_first > 0 else None,
+        qa_first=qa_first,
         export_nifti=args.export_nifti,
         traj_scale=args.traj_scale,
         use_gpu=args.gpu,
