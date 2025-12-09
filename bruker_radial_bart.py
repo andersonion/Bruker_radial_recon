@@ -403,11 +403,15 @@ def run_bart(args: List[str]):
 
 
 def run_bart_nufft(NX: int, NY: int, NZ: int, traj_base: Path, ksp_base: Path, coil_base: Path):
-    args = ["nufft", "-i"]
-    if GPU_NUFFT:
-        # GPU flag goes on the nufft command, not on bart itself
-        args.append("-g")
-    args += [
+    """
+    Run BART NUFFT, optionally trying GPU. If GPU is requested but BART
+    is compiled without GPU support, fall back to CPU and disable GPU_NUFFT.
+    """
+    global GPU_NUFFT
+
+    base_args = [
+        "nufft",
+        "-i",
         "-d",
         f"{NX}:{NY}:{NZ}",
         "-t",
@@ -415,7 +419,32 @@ def run_bart_nufft(NX: int, NY: int, NZ: int, traj_base: Path, ksp_base: Path, c
         str(ksp_base),
         str(coil_base),
     ]
-    run_bart(args)
+
+    if GPU_NUFFT:
+        gpu_args = ["nufft", "-i", "-g", "-d", f"{NX}:{NY}:{NZ}", "-t", str(traj_base), str(ksp_base), str(coil_base)]
+        cmd = [bart_path()] + gpu_args
+        print("[bart]", " ".join(str(a) for a in cmd))
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr or ""
+            stdout = e.stdout or ""
+            if "compiled without GPU support" in stderr or "compiled without GPU support" in stdout:
+                print(
+                    "[warn] BART compiled without GPU support; "
+                    "falling back to CPU NUFFT and disabling --gpu."
+                )
+                GPU_NUFFT = False
+            else:
+                # Some other NUFFT error; re-raise
+                print(stderr, file=sys.stderr)
+                raise
+
+    # CPU path
+    cmd = [bart_path()] + base_args
+    print("[bart]", " ".join(str(a) for a in cmd))
+    subprocess.run(cmd, check=True)
 
 
 # ---------- Frame binning ----------
