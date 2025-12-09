@@ -479,7 +479,6 @@ def export_nifti_from_cfl(base: Path):
         return
 
     arr_cpx, dims = read_cfl(base)
-    # magnitude, drop trailing singleton dims
     mag = np.abs(arr_cpx).astype(np.float32)
     while mag.ndim > 0 and mag.shape[-1] == 1:
         mag = mag[..., 0]
@@ -653,12 +652,23 @@ def main():
         traj_base = vol_prefix.with_name(vol_prefix.name + "_traj")
         ksp_base = vol_prefix.with_name(vol_prefix.name + "_ksp")
         coil_base = vol_prefix.with_name(vol_prefix.name + "_coil")
-        img_base = vol_prefix
+        img_base = vol_prefix  # SoS image prefix
 
-        # If coil image already exists, skip NUFFT/RSS
         coil_cfl = coil_base.with_suffix(".cfl")
+        img_cfl = img_base.with_suffix(".cfl")
+
         if coil_cfl.exists():
-            print(f"[info] Frame {fi} already reconstructed -> {coil_base}, skipping NUFFT/RSS.")
+            if img_cfl.exists():
+                print(
+                    f"[info] Frame {fi} already reconstructed (coil + SoS) -> {img_base}, "
+                    "skipping NUFFT/RSS."
+                )
+            else:
+                print(
+                    f"[info] Frame {fi} has coil data but no SoS image; "
+                    "skipping NUFFT and running RSS only."
+                )
+                run_bart(["rss", "3", str(coil_base), str(img_base)])
             vol_bases.append(img_base)
         else:
             write_cfl(traj_base, traj_s, [3, nsamp, 1, 1])
