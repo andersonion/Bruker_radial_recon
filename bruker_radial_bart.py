@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import os
 import sys
 import subprocess
 import textwrap
@@ -53,52 +52,6 @@ def readcfl(name: str) -> np.ndarray:
     return arr
 
 
-def bart_stack_to_nifti(stack_base: Path, out_nii: Path) -> None:
-    """
-    Convert a BART stack CFL into a 4D float NIfTI:
-      - drops trailing singleton dims
-      - if 3D: adds a time axis
-      - if >4D: flattens extra dims into time
-      - complex -> magnitude float32
-    """
-    stack_base = Path(stack_base)
-    out_nii = Path(out_nii)
-
-    arr = readcfl(stack_base)
-
-    # Drop trailing singleton dims beyond the last non-1
-    dims = list(arr.shape)
-    non1 = [i for i, d in enumerate(dims) if d > 1]
-    if not non1:
-        raise ValueError(f"Stack {stack_base} has only singleton dims {dims}")
-    last = max(non1)
-    arr = np.reshape(arr, dims[: last + 1], order="F")
-
-    # Shapes:
-    #   3D: (X,Y,Z) -> (X,Y,Z,1)
-    #   4D: (X,Y,Z,T) -> as-is
-    #   >4D: collapse extras into time
-    if arr.ndim == 3:
-        arr = arr[..., np.newaxis]
-    elif arr.ndim > 4:
-        extra = int(np.prod(arr.shape[3:]))
-        arr = arr.reshape(arr.shape[0], arr.shape[1], arr.shape[2], extra)
-
-    if np.iscomplexobj(arr):
-        arr = np.abs(arr)
-    data = arr.astype(np.float32)
-
-    affine = np.eye(4, dtype=float)
-    if out_nii.suffix not in (".nii", ".gz"):
-        out_nii = out_nii.with_suffix(".nii.gz")
-    elif out_nii.suffix == ".nii":
-        out_nii = out_nii.with_suffix(".nii.gz")
-
-    img = nib.Nifti1Image(data, affine)
-    nib.save(img, out_nii)
-    print(f"[info] Wrote NIfTI {out_nii} with shape {data.shape}")
-
-
 def writecfl(name: str, arr: np.ndarray):
     """
     Write BART .cfl/.hdr with dims following arr.shape in Fortran order.
@@ -116,10 +69,52 @@ def writecfl(name: str, arr: np.ndarray):
         f.write(" ".join(str(d) for d in dims) + "\n")
 
     with cfl.open("wb") as f:
-        stacked = np.empty(arr_f.size * 2, dtype=np.float32)
-        stacked[0::2] = arr_f.real.ravel(order="F")
-        stacked[1::2] = arr_f.imag.ravel(order="F")
-        stacked.tofile(f)
+        # complex64 is already stored as interleaved float32 (real, imag)
+        arr_f.ravel(order="F").tofile(f)
+
+
+def bart_stack_to_nifti_with_shape(
+    stack_base: Path, out_nii: Path, NX: int, NY: int, NZ: int
+) -> None:
+    """
+    Convert a BART stack CFL into a 4D float NIfTI with shape (NX,NY,NZ,T).
+
+    We completely ignore BART's notion of spatial dims and just:
+      - read complex array,
+      - take magnitude,
+      - flatten in Fortran order,
+      - reshape to (NX,NY,NZ,T).
+    """
+    stack_base = Path(stack_base)
+    out_nii = Path(out_nii)
+
+    arr = readcfl(stack_base)  # complex, arbitrary dims from BART
+
+    if np.iscomplexobj(arr):
+        mag = np.abs(arr).astype(np.float32)
+    else:
+        mag = arr.astype(np.float32)
+
+    flat = mag.ravel(order="F")
+    n_vox = NX * NY * NZ
+    if flat.size % n_vox != 0:
+        raise ValueError(
+            f"Cannot reshape stack {stack_base}: flat={flat.size}, "
+            f"NX*NY*NZ={n_vox} (not a multiple)"
+        )
+
+    T = flat.size // n_vox
+    data = flat.reshape((NX, NY, NZ, T), order="F")
+
+    affine = np.eye(4, dtype=float)
+    if out_nii.suffix not in (".nii", ".gz"):
+        out_nii = out_nii.with_suffix(".nii.gz")
+    elif out_nii.suffix == ".nii":
+        out_nii = out_nii.with_suffix(".nii.gz")
+
+    img = nib.Nifti1Image(data, affine)
+    nib.save(img, out_nii)
+    print(f"[info] Wrote NIfTI {out_nii} with shape {data.shape}")
 
 
 # ---------------- Bruker helpers ---------------- #
@@ -212,9 +207,6 @@ def infer_matrix(method: Path):
 
 
 def infer_true_ro(acqp: Path) -> int:
-    """
-    Use ACQ_size[0] as true RO (this is what was giving RO=122).
-    """
     acq_size = read_bruker_param(acqp, "ACQ_size", default=None)
     if acq_size is None:
         raise ValueError("Could not infer ACQ_size for true RO")
@@ -428,10 +420,13 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
 def write_qa_nifti(
     qa_frames: list[Path],
     qa_base: Path,
+    NX: int,
+    NY: int,
+    NZ: int,
 ):
     """
     Join first N SoS frames and write a gzipped QA NIfTI via nibabel
-    (no bart toimg).
+    (no bart toimg), forcing shape (NX,NY,NZ,N_QA).
     """
     qa_base = Path(qa_base)
     qa_base.parent.mkdir(parents=True, exist_ok=True)
@@ -441,7 +436,7 @@ def write_qa_nifti(
     subprocess.run(join_cmd, check=True)
 
     qa_nii = qa_base.with_suffix(".nii.gz")
-    bart_stack_to_nifti(qa_base, qa_nii)
+    bart_stack_to_nifti_with_shape(qa_base, qa_nii, NX, NY, NZ)
 
 
 # ---------------- Core recon ---------------- #
@@ -532,9 +527,9 @@ def run_bart(
             ksp_frame = ksp[:, start:stop, :]  # (ro, spokes_frame, coils)
             traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes_frame)
 
-            # *** KEY FIX: layout for BART k-space ***
-            # BART expects (readout, spokes, kz(=1), coils)
-            ksp_bart = ksp_frame.reshape(ro, frame_spokes, 1, coils)
+            # Layout BART is okay with: batch dim = 1
+            # (1, ro, spokes_frame, coils)
+            ksp_bart = ksp_frame[np.newaxis, ...]
 
             writecfl(str(traj_base), traj_frame)
             writecfl(str(ksp_base), ksp_bart)
@@ -561,7 +556,7 @@ def run_bart(
         ):
             qa_frames = frame_paths[:qa_first]
             qa_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
-            write_qa_nifti(qa_frames, qa_base)
+            write_qa_nifti(qa_frames, qa_base, NX, NY, NZ)
             qa_written = True
 
     # ---- Final 4D stack ---- #
@@ -580,7 +575,7 @@ def run_bart(
 
     if export_nifti:
         stack_nii = out_base.with_suffix(".nii.gz")
-        bart_stack_to_nifti(stack_base, stack_nii)
+        bart_stack_to_nifti_with_shape(stack_base, stack_nii, NX, NY, NZ)
 
     print(f"[info] All requested frames complete; 4D result at {stack_base}")
 
@@ -605,7 +600,6 @@ def main():
                 --qa-first 2 \\
                 --export-nifti \\
                 --out /some/output/prefix
-
             """
         ),
     )
