@@ -32,7 +32,7 @@ def readcfl(name: str) -> np.ndarray:
         dim_line = f.readline().strip()
 
     dims = [int(x) for x in dim_line.split()]
-    # Trim trailing ones to the last non-1 dim
+    # Trim trailing singleton dims to the last non-1
     non1 = [i for i, d in enumerate(dims) if d > 1]
     if non1:
         last = max(non1)
@@ -213,8 +213,7 @@ def infer_matrix(method: Path):
 
 def infer_true_ro(acqp: Path) -> int:
     """
-    Your original behaviour: use ACQ_size[0] as true RO.
-    (This is what gave RO=122 on the working run, not 2584.)
+    Use ACQ_size[0] as true RO (this is what was giving RO=122).
     """
     acq_size = read_bruker_param(acqp, "ACQ_size", default=None)
     if acq_size is None:
@@ -434,11 +433,9 @@ def write_qa_nifti(
     Join first N SoS frames and write a gzipped QA NIfTI via nibabel
     (no bart toimg).
     """
-    bart_bin = "bart"
     qa_base = Path(qa_base)
     qa_base.parent.mkdir(parents=True, exist_ok=True)
 
-    # Join along dim=3
     join_cmd = ["bart", "join", "3"] + [str(p) for p in qa_frames] + [str(qa_base)]
     print("[bart]", " ".join(join_cmd))
     subprocess.run(join_cmd, check=True)
@@ -493,7 +490,7 @@ def run_bart(
         raise ValueError(f"Only traj-mode 'kron' is currently implemented.")
     traj_full = build_kron_traj(true_ro, spokes_all, NX, NY, NZ, traj_scale)
 
-    have_gpu = False    # we keep your GPU plumbing but won't push it further here
+    have_gpu = False
     if use_gpu:
         have_gpu = bart_supports_gpu(bart_bin)
         if not have_gpu:
@@ -535,7 +532,9 @@ def run_bart(
             ksp_frame = ksp[:, start:stop, :]  # (ro, spokes_frame, coils)
             traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes_frame)
 
-            ksp_bart = ksp_frame[np.newaxis, ...]  # (1, ro, spokes_frame, coils)
+            # *** KEY FIX: layout for BART k-space ***
+            # BART expects (readout, spokes, kz(=1), coils)
+            ksp_bart = ksp_frame.reshape(ro, frame_spokes, 1, coils)
 
             writecfl(str(traj_base), traj_frame)
             writecfl(str(ksp_base), ksp_bart)
@@ -580,7 +579,6 @@ def run_bart(
     subprocess.run(join_cmd, check=True)
 
     if export_nifti:
-        # Use out_base as the root name for the NIfTI
         stack_nii = out_base.with_suffix(".nii.gz")
         bart_stack_to_nifti(stack_base, stack_nii)
 
