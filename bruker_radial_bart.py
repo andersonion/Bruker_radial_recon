@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
+"""
+Bruker 3D radial -> BART NUFFT recon driver.
+
+- Reads Bruker method/acqp/fid
+- Factors FID into (stored_ro, spokes, coils) using your working heuristic
+- Builds synthetic 3D "kron" radial trajectory
+- Runs BART NUFFT + SoS per-frame with sliding window
+- Skips already-reconstructed frames (based on SoS .cfl presence)
+- Writes:
+    * QA NIfTI of first N frames  (via nibabel)
+    * Final 4D NIfTI stack       (via nibabel)
+- Prints BART image dims for first coil & SoS volumes for debugging
+
+Assumes:
+    bart is on PATH as "bart"
+"""
 
 import argparse
+import os
 import sys
 import subprocess
 import textwrap
@@ -8,110 +25,6 @@ from pathlib import Path
 
 import numpy as np
 import nibabel as nib
-
-
-# ---------------- BART CFL/HDR helpers ---------------- #
-
-
-def readcfl(name: str) -> np.ndarray:
-    """
-    Read a BART .cfl/.hdr pair into a numpy complex64 array.
-    """
-    base = Path(name)
-    hdr = base.with_suffix(".hdr")
-    cfl = base.with_suffix(".cfl")
-
-    if not hdr.exists() or not cfl.exists():
-        raise FileNotFoundError(f"Missing BART CFL/HDR pair for {base}")
-
-    with hdr.open("r") as f:
-        first = f.readline().strip()
-        if not first.startswith("#"):
-            raise ValueError(f"Invalid BART header {hdr}")
-        dim_line = f.readline().strip()
-
-    dims = [int(x) for x in dim_line.split()]
-    # Trim trailing singleton dims to the last non-1
-    non1 = [i for i, d in enumerate(dims) if d > 1]
-    if non1:
-        last = max(non1)
-        dims = dims[: last + 1]
-    else:
-        dims = [1]
-
-    with cfl.open("rb") as f:
-        data = np.fromfile(f, dtype=np.complex64)
-
-    n_elem = int(np.prod(dims))
-    if data.size != n_elem:
-        raise ValueError(
-            f"Data size {data.size} does not match header dims {dims} (n={n_elem})"
-        )
-
-    arr = data.reshape(dims, order="F")
-    return arr
-
-
-def writecfl(name: str, arr: np.ndarray):
-    """
-    Write BART .cfl/.hdr with dims following arr.shape in Fortran order.
-    """
-    base = Path(name)
-    hdr = base.with_suffix(".hdr")
-    cfl = base.with_suffix(".cfl")
-
-    arr_f = np.asfortranarray(arr.astype(np.complex64))
-
-    with hdr.open("w") as f:
-        f.write("# Dimensions\n")
-        dims = list(arr_f.shape)
-        dims += [1] * (16 - len(dims))
-        f.write(" ".join(str(d) for d in dims) + "\n")
-
-    with cfl.open("wb") as f:
-        arr_f.ravel(order="F").tofile(f)
-
-
-def bart_stack_to_nifti_native(stack_base: Path, out_nii: Path) -> None:
-    """
-    Convert a BART stack CFL into a float NIfTI, trusting BART's own dims.
-
-    Behavior:
-      - Read CFL
-      - Magnitude
-      - Squeeze singleton dims
-      - If 2D, promote to 3D/4D so NIfTI viewers are happy.
-    """
-    stack_base = Path(stack_base)
-    out_nii = Path(out_nii)
-
-    arr = readcfl(stack_base)  # complex, arbitrary dims from BART
-
-    if np.iscomplexobj(arr):
-        mag = np.abs(arr).astype(np.float32)
-    else:
-        mag = arr.astype(np.float32)
-
-    data = mag.squeeze()
-
-    # Promote to at least 3D (X,Y,Z) for viewers
-    if data.ndim == 1:
-        data = data[:, np.newaxis, np.newaxis]
-    elif data.ndim == 2:
-        data = data[:, :, np.newaxis]
-    # 3D and 4D are fine as-is; >4D is unlikely here
-
-    print(f"[info] Writing NIfTI with native BART dims {data.shape} from {stack_base}")
-
-    affine = np.eye(4, dtype=float)
-    if out_nii.suffix not in (".nii", ".gz"):
-        out_nii = out_nii.with_suffix(".nii.gz")
-    elif out_nii.suffix == ".nii":
-        out_nii = out_nii.with_suffix(".nii.gz")
-
-    img = nib.Nifti1Image(data, affine)
-    nib.save(img, out_nii)
-    print(f"[info] Wrote NIfTI {out_nii} with shape {data.shape}")
 
 
 # ---------------- Bruker helpers ---------------- #
@@ -229,8 +142,8 @@ def factor_fid(total_points: int, true_ro: int, coils_hint: int | None = None):
     """
     Factor total complex points into (stored_ro, spokes, coils).
 
-    We try several candidate stored_ro values and coil counts and pick a
-    "reasonable" combination, preferring:
+    This is your previous "good" heuristic: we try several candidate stored_ro
+    values and coil counts and pick a reasonable combination, preferring:
       - stored_ro >= true_ro
       - stored_ro close to true_ro
       - spokes not ridiculously small
@@ -292,6 +205,8 @@ def load_bruker_kspace(
 
     endian: '>' or '<'
     base_kind: 'i4' (int32) or 'f4' (float32)
+
+    This is essentially your previous working version.
     """
     if not fid_path.exists():
         raise FileNotFoundError(f"FID not found: {fid_path}")
@@ -299,10 +214,11 @@ def load_bruker_kspace(
     try:
         np_dtype = np.dtype(endian + base_kind)
     except TypeError as e:
-        raise ValueError(f"Invalid dtype combination: endian={endian}, kind={base_kind}") from e
+        raise ValueError(
+            f"Invalid dtype combination: endian={endian}, kind={base_kind}"
+        ) from e
 
-    raw = np.fromfile(fid_path, dtype=np_dtype)
-    raw = raw.astype(np.float32)
+    raw = np.fromfile(fid_path, dtype=np_dtype).astype(np.float32)
 
     if raw.size % 2 != 0:
         raise ValueError(f"FID raw length {raw.size} not even (real/imag pairs).")
@@ -337,7 +253,131 @@ def load_bruker_kspace(
     return ksp, stored_ro, spokes, coils
 
 
-# ---------------- Trajectory + BART helpers ---------------- #
+# ---------------- BART CFL helpers ---------------- #
+
+
+def writecfl(name: str, arr: np.ndarray):
+    """
+    Write BART .cfl/.hdr with dims following arr.shape in Fortran order.
+
+    This is the standard writecfl that matched your earlier working runs.
+    """
+    base = Path(name)
+    hdr = base.with_suffix(".hdr")
+    cfl = base.with_suffix(".cfl")
+
+    arr_f = np.asfortranarray(arr.astype(np.complex64))
+
+    with hdr.open("w") as f:
+        f.write("# Dimensions\n")
+        dims = list(arr_f.shape)
+        dims += [1] * (16 - len(dims))
+        f.write(" ".join(str(d) for d in dims) + "\n")
+
+    with cfl.open("wb") as f:
+        stacked = np.empty(arr_f.size * 2, dtype=np.float32)
+        stacked[0::2] = arr_f.real.ravel(order="F")
+        stacked[1::2] = arr_f.imag.ravel(order="F")
+        stacked.tofile(f)
+
+
+def readcfl(name: str) -> np.ndarray:
+    """
+    Read BART .cfl/.hdr into a numpy complex64 array (Fortran order-aware).
+    """
+    base = Path(name)
+    hdr = base.with_suffix(".hdr")
+    cfl = base.with_suffix(".cfl")
+
+    if not hdr.exists() or not cfl.exists():
+        raise FileNotFoundError(f"CFL/HDR not found for base {base}")
+
+    with hdr.open("r") as f:
+        line = f.readline()  # "# Dimensions\n"
+        if not line.startswith("#"):
+            raise ValueError(f"Malformed BART hdr for {base}")
+        dims_line = f.readline().strip()
+        dims = [int(x) for x in dims_line.split()]
+
+    ndim = 0
+    for d in dims:
+        if d > 1 or ndim == 0:
+            ndim += 1
+        else:
+            break
+    dims = dims[:ndim]
+
+    data = np.fromfile(cfl, dtype=np.float32)
+    if data.size % 2 != 0:
+        raise ValueError(f"CFL data length {data.size} not even.")
+
+    cplx = data[0::2] + 1j * data[1::2]
+    arr = cplx.reshape(dims, order="F")
+    return arr
+
+
+def bart_image_dims(bart_bin: str, base: Path) -> list[int] | None:
+    """
+    Use `bart show -d` to query dims of a CFL; purely diagnostic.
+
+    Returns list of ints or None if something fails.
+    """
+    try:
+        proc = subprocess.run(
+            [bart_bin, "show", "-d", str(base)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception as e:
+        print(f"[warn] Failed to run 'bart show -d': {e}", file=sys.stderr)
+        return None
+
+    if proc.returncode != 0:
+        print(
+            f"[warn] 'bart show -d' nonzero exit ({proc.returncode}): "
+            f"{proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+
+    # Expect something like: "Dimensions: 1 96 96 96 1 1 ..."
+    tokens = proc.stdout.strip().replace("Dimensions:", "").split()
+    try:
+        dims = [int(t) for t in tokens]
+    except ValueError:
+        return None
+    return dims
+
+
+def bart_supports_gpu(bart_bin: str = "bart") -> bool:
+    """
+    Quick probe: is 'bart nufft -g' a known option, and compiled with GPU support?
+    """
+    try:
+        proc = subprocess.run(
+            [bart_bin, "nufft", "-i", "-g"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception:
+        return False
+
+    if proc.returncode == 0:
+        return True
+
+    stderr = proc.stderr.lower()
+
+    if "compiled without gpu support" in stderr:
+        return False
+    if "unknown option" in stderr:
+        return False
+
+    return False
+
+
+# ---------------- Trajectory builder ---------------- #
 
 
 def build_kron_traj(
@@ -354,8 +394,9 @@ def build_kron_traj(
     Output shape: (3, RO, spokes)
 
     Coordinates are in units of pixel_size / FOV as BART expects.
-    We set the maximum k-space radius to ~NX/2, so BART's internal
-    "estimated image size" becomes ~NX instead of 2.
+
+    We set the radial coordinate to span ~[-NX/2, NX/2], so the
+    estimated image size should be ~NX (no more 2x2x2 warnings).
     """
     idx = np.arange(spokes, dtype=np.float64)
 
@@ -387,31 +428,47 @@ def build_kron_traj(
     return traj
 
 
-def bart_supports_gpu(bart_bin: str = "bart") -> bool:
+# ---------------- NIfTI writers (via nibabel) ---------------- #
+
+
+def bart_cfl_to_nifti(
+    base: Path,
+    out_nii_gz: Path,
+    assume_abs: bool = True,
+    extra_axes_to_end: bool = True,
+):
     """
-    Quick probe: is 'bart nufft -g' a known option, and compiled with GPU support?
+    Read a BART CFL and write a NIfTI via nibabel.
+
+    - base: path WITHOUT suffix (.cfl/.hdr pair)
+    - out_nii_gz: full path to .nii.gz to write
+
+    We:
+        * load complex array
+        * take abs (magnitude) by default
+        * reorder axes so that singleton batch/coil dims, if present,
+          go to the end, leaving spatial/time axes first.
     """
-    try:
-        proc = subprocess.run(
-            [bart_bin, "nufft", "-i", "-g"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except Exception:
-        return False
+    arr = readcfl(str(base))
 
-    if proc.returncode == 0:
-        return True
+    if assume_abs:
+        arr = np.abs(arr)
 
-    stderr = proc.stderr.lower()
+    # Move leading singleton dim(s) to the end to make shapes nicer
+    if extra_axes_to_end and arr.ndim > 1:
+        leading_singletons = []
+        other_axes = []
+        for ax, size in enumerate(arr.shape):
+            if ax == 0 and size == 1:
+                leading_singletons.append(ax)
+            else:
+                other_axes.append(ax)
+        if leading_singletons:
+            order = other_axes + leading_singletons
+            arr = np.transpose(arr, axes=order)
 
-    if "compiled without gpu support" in stderr:
-        return False
-    if "unknown option" in stderr:
-        return False
-
-    return False
+    img = nib.Nifti1Image(arr.astype(np.float32), np.eye(4))
+    nib.save(img, str(out_nii_gz))
 
 
 def write_qa_nifti(
@@ -419,18 +476,35 @@ def write_qa_nifti(
     qa_base: Path,
 ):
     """
-    Join first N SoS frames and write a QA NIfTI via nibabel,
-    trusting BART's dims (no NX/NY/NZ reshape).
+    Stack first N SoS frames into a QA NIfTI using nibabel.
+
+    IMPORTANT: we *do not* assume any particular BART dim layout;
+    we just load each SoS CFL, ensure they all have the same shape,
+    and stack them along the last axis as "time".
     """
-    qa_base = Path(qa_base)
     qa_base.parent.mkdir(parents=True, exist_ok=True)
 
-    join_cmd = ["bart", "join", "3"] + [str(p) for p in qa_frames] + [str(qa_base)]
-    print("[bart]", " ".join(join_cmd))
-    subprocess.run(join_cmd, check=True)
+    vols = []
+    shape0 = None
+    for p in qa_frames:
+        arr = readcfl(str(p))
+        mag = np.abs(arr)
+        if shape0 is None:
+            shape0 = mag.shape
+        elif mag.shape != shape0:
+            raise ValueError(
+                f"QA frame {p} has shape {mag.shape}, expected {shape0}"
+            )
+        vols.append(mag)
 
-    qa_nii = qa_base.with_suffix(".nii.gz")
-    bart_stack_to_nifti_native(qa_base, qa_nii)
+    qa_stack = np.stack(vols, axis=-1)  # last axis = frame
+
+    qa_img = nib.Nifti1Image(qa_stack.astype(np.float32), np.eye(4))
+    qa_nii_gz = qa_base.with_suffix(".nii.gz")
+    nib.save(qa_img, str(qa_nii_gz))
+    print(
+        f"[info] Wrote QA NIfTI {qa_nii_gz} with shape {qa_stack.shape}"
+    )
 
 
 # ---------------- Core recon ---------------- #
@@ -494,6 +568,7 @@ def run_bart(
     frame_paths: list[Path] = []
 
     qa_written = False
+    first_dims_reported = False
 
     # ---- Per-frame NUFFT/RSS ---- #
     for i, start in enumerate(frame_starts):
@@ -518,12 +593,10 @@ def run_bart(
         else:
             print(f"[info] Frame {i} spokes [{start}:{stop}] (n={frame_spokes})")
 
-            ksp_frame = ksp[:, start:stop, :]  # (ro, spokes_frame, coils)
-            traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes_frame)
+            ksp_frame = ksp[:, start:stop, :]          # (ro, spokes_frame, coils)
+            traj_frame = traj_full[:, :, start:stop]   # (3, ro, spokes_frame)
 
-            # Layout BART is okay with: batch dim = 1
-            # (1, ro, spokes_frame, coils)
-            ksp_bart = ksp_frame[np.newaxis, ...]
+            ksp_bart = ksp_frame[np.newaxis, ...]      # (1, ro, spokes_frame, coils)
 
             writecfl(str(traj_base), traj_frame)
             writecfl(str(ksp_base), ksp_bart)
@@ -531,7 +604,10 @@ def run_bart(
             cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
             if use_gpu and have_gpu:
                 cmd.insert(2, "-g")
-            print("[bart]", " ".join(cmd + [str(traj_base), str(ksp_base), str(coil_base)]))
+            print(
+                "[bart]",
+                " ".join(cmd + [str(traj_base), str(ksp_base), str(coil_base)]),
+            )
             cmd += [str(traj_base), str(ksp_base), str(coil_base)]
             subprocess.run(cmd, check=True)
 
@@ -542,12 +618,18 @@ def run_bart(
             else:
                 raise ValueError(f"Unsupported combine mode: {combine}")
 
+        # After first frame: print BART dims for debugging
+        if not first_dims_reported:
+            dims_coil = bart_image_dims(bart_bin, coil_base)
+            dims_sos = bart_image_dims(bart_bin, sos_base)
+            if dims_coil is not None:
+                print(f"[debug] BART dims coil vol0: {dims_coil}")
+            if dims_sos is not None:
+                print(f"[debug] BART dims SoS vol0: {dims_sos}")
+            first_dims_reported = True
+
         # Write QA as soon as first qa_first frames exist
-        if (
-            qa_first is not None
-            and not qa_written
-            and len(frame_paths) >= qa_first
-        ):
+        if qa_first is not None and not qa_written and len(frame_paths) >= qa_first:
             qa_frames = frame_paths[:qa_first]
             qa_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
             write_qa_nifti(qa_frames, qa_base)
@@ -568,8 +650,9 @@ def run_bart(
     subprocess.run(join_cmd, check=True)
 
     if export_nifti:
-        stack_nii = out_base.with_suffix(".nii.gz")
-        bart_stack_to_nifti_native(stack_base, stack_nii)
+        stack_nii_gz = stack_base.with_suffix(".nii.gz")
+        bart_cfl_to_nifti(stack_base, stack_nii_gz)
+        print(f"[info] Wrote final 4D NIfTI {stack_nii_gz}")
 
     print(f"[info] All requested frames complete; 4D result at {stack_base}")
 
@@ -594,6 +677,7 @@ def main():
                 --qa-first 2 \\
                 --export-nifti \\
                 --out /some/output/prefix
+
             """
         ),
     )
@@ -649,8 +733,10 @@ def main():
         "--fid-dtype",
         choices=["i4", "f4"],
         default="i4",
-        help="Base numeric type of FID data (32-bit int or float); "
-             "combined with --fid-endian.",
+        help=(
+            "Base numeric type of FID data (32-bit int or float); "
+            "combined with --fid-endian."
+        ),
     )
     ap.add_argument(
         "--fid-endian",
@@ -674,15 +760,17 @@ def main():
     ap.add_argument(
         "--export-nifti",
         action="store_true",
-        help="Export final 4D stack as NIfTI (.nii.gz)",
+        help="Export final 4D stack as NIfTI (.nii.gz) via nibabel",
     )
 
     ap.add_argument(
         "--traj-scale",
         type=float,
         default=None,
-        help="Extra scale factor for k-space coordinates. "
-             "Leave unset unless you know you need it.",
+        help=(
+            "Extra scale factor for k-space coordinates. "
+            "Leave unset unless you know you need it."
+        ),
     )
 
     ap.add_argument(
@@ -718,7 +806,10 @@ def main():
         print(f"[info] Matrix overridden from CLI: {NX}x{NY}x{NZ}")
     else:
         NX, NY, NZ = infer_matrix(method)
-        print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
+        print(
+            f"[info] Matrix inferred from PVM_Matrix: "
+            f"{NX}x{NY}x{NZ}"
+        )
 
     # True RO
     if args.readout is not None:
