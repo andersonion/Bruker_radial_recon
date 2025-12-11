@@ -77,13 +77,12 @@ def bart_stack_to_nifti_with_shape(
     stack_base: Path, out_nii: Path, NX: int, NY: int, NZ: int
 ) -> None:
     """
-    Convert a BART stack CFL into a 4D float NIfTI with shape (NX,NY,NZ,T).
+    Convert a BART stack CFL into a 4D float NIfTI.
 
-    We completely ignore BART's notion of spatial dims and just:
-      - read complex array,
-      - take magnitude,
-      - flatten in Fortran order,
-      - reshape to (NX,NY,NZ,T).
+    Preferred behavior:
+      - If total elements is a multiple of NX*NY*NZ, reshape to (NX,NY,NZ,T).
+      - Otherwise, fall back to saving the BART array as-is (after mag+squeeze)
+        so we *always* get a NIfTI instead of crashing.
     """
     stack_base = Path(stack_base)
     out_nii = Path(out_nii)
@@ -97,14 +96,23 @@ def bart_stack_to_nifti_with_shape(
 
     flat = mag.ravel(order="F")
     n_vox = NX * NY * NZ
-    if flat.size % n_vox != 0:
-        raise ValueError(
-            f"Cannot reshape stack {stack_base}: flat={flat.size}, "
-            f"NX*NY*NZ={n_vox} (not a multiple)"
-        )
 
-    T = flat.size // n_vox
-    data = flat.reshape((NX, NY, NZ, T), order="F")
+    if flat.size % n_vox == 0 and flat.size != 0:
+        # Clean case: we can reshape to (NX,NY,NZ,T)
+        T = flat.size // n_vox
+        data = flat.reshape((NX, NY, NZ, T), order="F")
+        print(
+            f"[info] Reshaping BART stack {stack_base} to "
+            f"(NX,NY,NZ,T)=({NX},{NY},{NZ},{T})"
+        )
+    else:
+        # Fallback: just store what BART gave us
+        data = mag.squeeze()
+        print(
+            f"[warn] Cannot reshape stack {stack_base}: flat={flat.size}, "
+            f"NX*NY*NZ={n_vox} (not a clean multiple). "
+            f"Writing NIfTI with native BART dims {data.shape} instead."
+        )
 
     affine = np.eye(4, dtype=float)
     if out_nii.suffix not in (".nii", ".gz"):
@@ -425,8 +433,8 @@ def write_qa_nifti(
     NZ: int,
 ):
     """
-    Join first N SoS frames and write a gzipped QA NIfTI via nibabel
-    (no bart toimg), forcing shape (NX,NY,NZ,N_QA).
+    Join first N SoS frames and write a QA NIfTI via nibabel,
+    using bart_stack_to_nifti_with_shape so we never crash.
     """
     qa_base = Path(qa_base)
     qa_base.parent.mkdir(parents=True, exist_ok=True)
