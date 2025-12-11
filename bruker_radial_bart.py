@@ -250,7 +250,10 @@ def build_kron_traj(
     Build a synthetic 3D "kron" golden-angle trajectory for BART.
 
     Output shape: (3, RO, spokes)
-    Coordinates are in approximately [-0.5, 0.5] when traj_scale is None.
+
+    Coordinates are in units of pixel_size / FOV as BART expects.
+    We set the maximum k-space radius to ~NX/2, so BART's internal
+    "estimated image size" becomes ~NX instead of 2.
     """
     idx = np.arange(spokes, dtype=np.float64)
     # Map index to z in [-1, 1]
@@ -266,8 +269,8 @@ def build_kron_traj(
     dy = r_xy * np.sin(phi)
     dz = z
 
-    # Readout samples in [-0.5, 0.5]
-    base_s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64)
+    # Radial coordinate: base in [-0.5, 0.5], then scale by NX and traj_scale.
+    base_s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64) * NX
     scale = float(traj_scale) if traj_scale is not None else 1.0
     s = base_s * scale
 
@@ -276,6 +279,10 @@ def build_kron_traj(
         traj[0, :, i] = s * dx[i]
         traj[1, :, i] = s * dy[i]
         traj[2, :, i] = s * dz[i]
+
+    # Tiny debug print so we can sanity-check magnitude if needed
+    max_rad = np.abs(traj).max()
+    print(f"[info] Traj built with max |k| ≈ {max_rad:.2f}")
 
     return traj
 
@@ -474,7 +481,7 @@ def run_bart(
     if export_nifti:
         stack_nii = stack_base.with_suffix(".nii")
         print("[bart]", f"toimg {stack_base} {stack_nii}")
-        subprocess.run([bart_bin, "toimg", str(stack_base), str(stack_nii)], check=True)
+        subprocess.run([bart_bin, "toimg", str(stack_nii)], check=True)
         subprocess.run(["gzip", "-f", str(stack_nii)], check=True)
 
     print(f"[info] All requested frames complete; 4D result at {stack_base}")
@@ -588,8 +595,8 @@ def main():
         "--traj-scale",
         type=float,
         default=None,
-        help="Scale factor for k-space coordinates (default 1.0). "
-             "Leave unset initially.",
+        help="Extra scale factor for k-space coordinates. "
+             "Leave unset unless you know you need it.",
     )
 
     ap.add_argument(
