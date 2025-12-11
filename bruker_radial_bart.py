@@ -198,7 +198,6 @@ def load_bruker_kspace(
         raise ValueError(f"Invalid dtype combination: endian={endian}, kind={base_kind}") from e
 
     raw = np.fromfile(fid_path, dtype=np_dtype)
-    # Work in float32 for the complex pairing
     raw = raw.astype(np.float32)
 
     if raw.size % 2 != 0:
@@ -223,7 +222,6 @@ def load_bruker_kspace(
 
     ksp = complex_data.reshape(stored_ro, spokes, coils)
 
-    # Trim down to true RO if needed
     if stored_ro != true_ro:
         if stored_ro < true_ro:
             raise ValueError(
@@ -256,20 +254,19 @@ def build_kron_traj(
     "estimated image size" becomes ~NX instead of 2.
     """
     idx = np.arange(spokes, dtype=np.float64)
-    # Map index to z in [-1, 1]
+
     if spokes > 1:
         z = 2.0 * (idx / (spokes - 1)) - 1.0
     else:
         z = np.zeros_like(idx)
 
-    phi = np.pi * (1 + 5**0.5) * idx  # golden angle-ish
+    phi = np.pi * (1 + 5**0.5) * idx  # golden-ish
 
     r_xy = np.sqrt(np.clip(1.0 - z**2, 0.0, 1.0))
     dx = r_xy * np.cos(phi)
     dy = r_xy * np.sin(phi)
     dz = z
 
-    # Radial coordinate: base in [-0.5, 0.5], then scale by NX and traj_scale.
     base_s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64) * NX
     scale = float(traj_scale) if traj_scale is not None else 1.0
     s = base_s * scale
@@ -280,7 +277,6 @@ def build_kron_traj(
         traj[1, :, i] = s * dy[i]
         traj[2, :, i] = s * dz[i]
 
-    # Tiny debug print so we can sanity-check magnitude if needed
     max_rad = np.abs(traj).max()
     print(f"[info] Traj built with max |k| ≈ {max_rad:.2f}")
 
@@ -337,6 +333,25 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
     return False
 
 
+def write_qa_nifti(
+    bart_bin: str,
+    qa_frames: list[Path],
+    qa_base: Path,
+):
+    """
+    Join first N SoS frames and write a gzipped QA NIfTI.
+    """
+    qa_base.parent.mkdir(parents=True, exist_ok=True)
+    join_cmd = ["bart", "join", "3"] + [str(p) for p in qa_frames] + [str(qa_base)]
+    print("[bart]", " ".join(join_cmd))
+    subprocess.run(join_cmd, check=True)
+
+    qa_nii = qa_base.with_suffix(".nii")
+    print("[bart]", f"toimg {qa_base} {qa_nii}")
+    subprocess.run([bart_bin, "toimg", str(qa_base), str(qa_nii)], check=True)
+    subprocess.run(["gzip", "-f", str(qa_nii)], check=True)
+
+
 # ---------------- Core recon ---------------- #
 
 
@@ -379,12 +394,10 @@ def run_bart(
     )
     print(f"[info] Will reconstruct {n_frames} frame(s).")
 
-    # Build full trajectory once, then slice per frame.
     if traj_mode != "kron":
         raise ValueError(f"Only traj-mode 'kron' is currently implemented.")
     traj_full = build_kron_traj(true_ro, spokes_all, NX, NY, NZ, traj_scale)
 
-    # GPU probe
     have_gpu = False
     if use_gpu:
         have_gpu = bart_supports_gpu(bart_bin)
@@ -398,6 +411,8 @@ def run_bart(
     per_series_dir = out_base.parent
     per_series_dir.mkdir(parents=True, exist_ok=True)
     frame_paths: list[Path] = []
+
+    qa_written = False
 
     # ---- Per-frame NUFFT/RSS ---- #
     for i, start in enumerate(frame_starts):
@@ -414,55 +429,46 @@ def run_bart(
 
         frame_paths.append(sos_base)
 
-        # If SoS exists for this frame, skip redo.
         if sos_base.with_suffix(".cfl").exists():
             print(
                 f"[info] Frame {i} already reconstructed -> "
                 f"{sos_base}, skipping NUFFT/RSS."
             )
-            continue
-
-        print(f"[info] Frame {i} spokes [{start}:{stop}] (n={frame_spokes})")
-
-        ksp_frame = ksp[:, start:stop, :]  # (ro, spokes_frame, coils)
-        traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes_frame)
-
-        # BART expects first dim == 1 for k-space -> (1, ro, spokes_frame, coils)
-        ksp_bart = ksp_frame[np.newaxis, ...]
-
-        writecfl(str(traj_base), traj_frame)
-        writecfl(str(ksp_base), ksp_bart)
-
-        # NUFFT: bart nufft [-g] -i -d NX:NY:NZ traj ksp coil
-        cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
-        if use_gpu and have_gpu:
-            cmd.insert(2, "-g")
-        print("[bart]", " ".join(cmd + [str(traj_base), str(ksp_base), str(coil_base)]))
-        cmd += [str(traj_base), str(ksp_base), str(coil_base)]
-
-        subprocess.run(cmd, check=True)
-
-        # Coil combine
-        if combine == "sos":
-            cmd2 = [bart_bin, "rss", "3", str(coil_base), str(sos_base)]
-            print("[bart]", " ".join(cmd2))
-            subprocess.run(cmd2, check=True)
         else:
-            raise ValueError(f"Unsupported combine mode: {combine}")
+            print(f"[info] Frame {i} spokes [{start}:{stop}] (n={frame_spokes})")
 
-    # ---- QA volumes (first N) ---- #
-    if qa_first is not None and qa_first > 0 and frame_paths:
-        qa_frames = frame_paths[:qa_first]
-        qa_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
+            ksp_frame = ksp[:, start:stop, :]  # (ro, spokes_frame, coils)
+            traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes_frame)
 
-        join_cmd = ["bart", "join", "3"] + [str(p) for p in qa_frames] + [str(qa_base)]
-        print("[bart]", " ".join(join_cmd))
-        subprocess.run(join_cmd, check=True)
+            ksp_bart = ksp_frame[np.newaxis, ...]  # (1, ro, spokes_frame, coils)
 
-        qa_nii = qa_base.with_suffix(".nii")
-        print("[bart]", f"toimg {qa_base} {qa_nii}")
-        subprocess.run([bart_bin, "toimg", str(qa_base), str(qa_nii)], check=True)
-        subprocess.run(["gzip", "-f", str(qa_nii)], check=True)
+            writecfl(str(traj_base), traj_frame)
+            writecfl(str(ksp_base), ksp_bart)
+
+            cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
+            if use_gpu and have_gpu:
+                cmd.insert(2, "-g")
+            print("[bart]", " ".join(cmd + [str(traj_base), str(ksp_base), str(coil_base)]))
+            cmd += [str(traj_base), str(ksp_base), str(coil_base)]
+            subprocess.run(cmd, check=True)
+
+            if combine == "sos":
+                cmd2 = [bart_bin, "rss", "3", str(coil_base), str(sos_base)]
+                print("[bart]", " ".join(cmd2))
+                subprocess.run(cmd2, check=True)
+            else:
+                raise ValueError(f"Unsupported combine mode: {combine}")
+
+        # Write QA as soon as first qa_first frames exist
+        if (
+            qa_first is not None
+            and not qa_written
+            and len(frame_paths) >= qa_first
+        ):
+            qa_frames = frame_paths[:qa_first]
+            qa_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
+            write_qa_nifti(bart_bin, qa_frames, qa_base)
+            qa_written = True
 
     # ---- Final 4D stack ---- #
     sos_existing = [p for p in frame_paths if p.with_suffix(".cfl").exists()]
@@ -481,7 +487,7 @@ def run_bart(
     if export_nifti:
         stack_nii = stack_base.with_suffix(".nii")
         print("[bart]", f"toimg {stack_base} {stack_nii}")
-        subprocess.run([bart_bin, "toimg", str(stack_nii)], check=True)
+        subprocess.run([bart_bin, "toimg", str(stack_base), str(stack_nii)], check=True)
         subprocess.run(["gzip", "-f", str(stack_nii)], check=True)
 
     print(f"[info] All requested frames complete; 4D result at {stack_base}")
@@ -632,7 +638,7 @@ def main():
         print(f"[info] Matrix overridden from CLI: {NX}x{NY}x{NZ}")
     else:
         NX, NY, NZ = infer_matrix(method)
-        print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
+        print(f"[info] Matrix inferred from PVM_Matrix: {NX}xNYxNZ".replace("NY", str(NY)).replace("NZ", str(NZ)))
 
     # True RO
     if args.readout is not None:
@@ -668,7 +674,6 @@ def main():
     frame_shift = args.frame_shift if args.frame_shift > 0 else spokes_per_frame
     qa_first = args.qa_first if args.qa_first > 0 else None
 
-    # Run recon
     run_bart(
         series_path=series_path,
         out_base=out_base,
