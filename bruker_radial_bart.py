@@ -69,20 +69,18 @@ def writecfl(name: str, arr: np.ndarray):
         f.write(" ".join(str(d) for d in dims) + "\n")
 
     with cfl.open("wb") as f:
-        # complex64 is already stored as interleaved float32 (real, imag)
         arr_f.ravel(order="F").tofile(f)
 
 
-def bart_stack_to_nifti_with_shape(
-    stack_base: Path, out_nii: Path, NX: int, NY: int, NZ: int
-) -> None:
+def bart_stack_to_nifti_native(stack_base: Path, out_nii: Path) -> None:
     """
-    Convert a BART stack CFL into a 4D float NIfTI.
+    Convert a BART stack CFL into a float NIfTI, trusting BART's own dims.
 
-    Preferred behavior:
-      - If total elements is a multiple of NX*NY*NZ, reshape to (NX,NY,NZ,T).
-      - Otherwise, fall back to saving the BART array as-is (after mag+squeeze)
-        so we *always* get a NIfTI instead of crashing.
+    Behavior:
+      - Read CFL
+      - Magnitude
+      - Squeeze singleton dims
+      - If 2D, promote to 3D/4D so NIfTI viewers are happy.
     """
     stack_base = Path(stack_base)
     out_nii = Path(out_nii)
@@ -94,25 +92,16 @@ def bart_stack_to_nifti_with_shape(
     else:
         mag = arr.astype(np.float32)
 
-    flat = mag.ravel(order="F")
-    n_vox = NX * NY * NZ
+    data = mag.squeeze()
 
-    if flat.size % n_vox == 0 and flat.size != 0:
-        # Clean case: we can reshape to (NX,NY,NZ,T)
-        T = flat.size // n_vox
-        data = flat.reshape((NX, NY, NZ, T), order="F")
-        print(
-            f"[info] Reshaping BART stack {stack_base} to "
-            f"(NX,NY,NZ,T)=({NX},{NY},{NZ},{T})"
-        )
-    else:
-        # Fallback: just store what BART gave us
-        data = mag.squeeze()
-        print(
-            f"[warn] Cannot reshape stack {stack_base}: flat={flat.size}, "
-            f"NX*NY*NZ={n_vox} (not a clean multiple). "
-            f"Writing NIfTI with native BART dims {data.shape} instead."
-        )
+    # Promote to at least 3D (X,Y,Z) for viewers
+    if data.ndim == 1:
+        data = data[:, np.newaxis, np.newaxis]
+    elif data.ndim == 2:
+        data = data[:, :, np.newaxis]
+    # 3D and 4D are fine as-is; >4D is unlikely here
+
+    print(f"[info] Writing NIfTI with native BART dims {data.shape} from {stack_base}")
 
     affine = np.eye(4, dtype=float)
     if out_nii.suffix not in (".nii", ".gz"):
@@ -428,13 +417,10 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
 def write_qa_nifti(
     qa_frames: list[Path],
     qa_base: Path,
-    NX: int,
-    NY: int,
-    NZ: int,
 ):
     """
     Join first N SoS frames and write a QA NIfTI via nibabel,
-    using bart_stack_to_nifti_with_shape so we never crash.
+    trusting BART's dims (no NX/NY/NZ reshape).
     """
     qa_base = Path(qa_base)
     qa_base.parent.mkdir(parents=True, exist_ok=True)
@@ -444,7 +430,7 @@ def write_qa_nifti(
     subprocess.run(join_cmd, check=True)
 
     qa_nii = qa_base.with_suffix(".nii.gz")
-    bart_stack_to_nifti_with_shape(qa_base, qa_nii, NX, NY, NZ)
+    bart_stack_to_nifti_native(qa_base, qa_nii)
 
 
 # ---------------- Core recon ---------------- #
@@ -564,7 +550,7 @@ def run_bart(
         ):
             qa_frames = frame_paths[:qa_first]
             qa_base = per_series_dir / f"{out_base.name}_QA_first{qa_first}"
-            write_qa_nifti(qa_frames, qa_base, NX, NY, NZ)
+            write_qa_nifti(qa_frames, qa_base)
             qa_written = True
 
     # ---- Final 4D stack ---- #
@@ -583,7 +569,7 @@ def run_bart(
 
     if export_nifti:
         stack_nii = out_base.with_suffix(".nii.gz")
-        bart_stack_to_nifti_with_shape(stack_base, stack_nii, NX, NY, NZ)
+        bart_stack_to_nifti_native(stack_base, stack_nii)
 
     print(f"[info] All requested frames complete; 4D result at {stack_base}")
 
