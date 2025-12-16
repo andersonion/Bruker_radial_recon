@@ -404,11 +404,16 @@ def build_kron_traj(
     NY: int,
     NZ: int,
     traj_scale: float | None = None,
+    readout_origin: str = "centered",   # "centered" or "zero"
 ) -> np.ndarray:
     """
     Build a synthetic 3D "kron" golden-angle trajectory for BART.
 
     Output shape: (3, RO, spokes)
+
+    readout_origin:
+      - "centered": samples run from -kmax..+kmax (full spoke)
+      - "zero":     samples run from 0..kmax (center-out half spoke)
     """
     idx = np.arange(spokes, dtype=np.float64)
 
@@ -417,16 +422,25 @@ def build_kron_traj(
     else:
         z = np.zeros_like(idx)
 
-    phi = np.pi * (1 + 5**0.5) * idx  # golden-ish
+    phi = np.pi * (1 + 5**0.5) * idx  # your golden-ish progression
 
     r_xy = np.sqrt(np.clip(1.0 - z**2, 0.0, 1.0))
     dx = r_xy * np.cos(phi)
     dy = r_xy * np.sin(phi)
     dz = z
 
-    base_s = np.linspace(-0.5, 0.5, true_ro, dtype=np.float64) * NX
+    # BART expects k-space in "grid units" roughly spanning [-N/2, N/2]
+    # We use NX as the reference scale (assuming cubic-ish).
+    kmax = 0.5 * NX
     scale = float(traj_scale) if traj_scale is not None else 1.0
-    s = base_s * scale
+    kmax *= scale
+
+    if readout_origin == "zero":
+        # center-out: 0 .. +kmax
+        s = np.linspace(0.0, kmax, true_ro, dtype=np.float64)
+    else:
+        # full spoke: -kmax .. +kmax
+        s = np.linspace(-kmax, kmax, true_ro, dtype=np.float64)
 
     traj = np.zeros((3, true_ro, spokes), dtype=np.complex64)
     for i in range(spokes):
@@ -435,9 +449,10 @@ def build_kron_traj(
         traj[2, :, i] = s * dz[i]
 
     max_rad = np.abs(traj).max()
-    print(f"[info] Traj built with max |k| ≈ {max_rad:.2f}")
+    print(f"[info] Traj built with max |k| ≈ {max_rad:.2f} (origin={readout_origin})")
 
     return traj
+
 
 
 # ---------------- NIfTI writers (via nibabel) ---------------- #
@@ -523,6 +538,7 @@ def run_bart(
     qa_first: int | None,
     export_nifti: bool,
     traj_scale: float | None,
+    readout_origin: str,
     use_gpu: bool,
     debug: bool,
 ):
@@ -549,7 +565,7 @@ def run_bart(
 
     if traj_mode != "kron":
         raise ValueError(f"Only traj-mode 'kron' is currently implemented.")
-    traj_full = build_kron_traj(true_ro, spokes_all, NX, NY, NZ, traj_scale)
+    traj_full = build_kron_traj(true_ro, spokes_all, NX, NY, NZ, traj_scale, readout_origin)
 
     have_gpu = False
     if use_gpu:
@@ -705,6 +721,14 @@ def main():
         default="kron",
         help="Trajectory mode (currently only 'kron')",
     )
+
+    ap.add_argument(
+       "--readout-origin",
+       choices=["centered", "zero"],
+       default="centered",
+       help="Radial readout coordinate: centered (-k..+k) or zero (0..k).",
+    )
+
     ap.add_argument(
         "--spokes-per-frame",
         type=int,
@@ -848,6 +872,7 @@ def main():
         qa_first=qa_first,
         export_nifti=args.export_nifti,
         traj_scale=args.traj_scale,
+        readout_origin=args.readout_origin,
         use_gpu=args.gpu,
         debug=args.debug,
     )
