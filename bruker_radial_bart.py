@@ -280,6 +280,9 @@ def writecfl(name: str, arr: np.ndarray):
 def readcfl(name: str) -> np.ndarray:
     """
     Read BART .cfl/.hdr into a numpy complex64 array (Fortran order-aware).
+
+    Robustly trims the 16 dims by keeping everything up to the last non-1 dim.
+    This fixes the common case where dim0==1 (leading singleton dims).
     """
     base = Path(name)
     hdr = base.with_suffix(".hdr")
@@ -289,27 +292,33 @@ def readcfl(name: str) -> np.ndarray:
         raise FileNotFoundError(f"CFL/HDR not found for base {base}")
 
     with hdr.open("r") as f:
-        line = f.readline()  # "# Dimensions\n"
-        if not line.startswith("#"):
+        first = f.readline()
+        if not first.startswith("#"):
             raise ValueError(f"Malformed BART hdr for {base}")
         dims_line = f.readline().strip()
-        dims = [int(x) for x in dims_line.split()]
+        dims16 = [int(x) for x in dims_line.split()]
 
-    ndim = 0
-    for d in dims:
-        if d > 1 or ndim == 0:
-            ndim += 1
-        else:
-            break
-    dims = dims[:ndim]
+    # Determine ndim as (last index with dim>1) + 1, but at least 1
+    last_non1 = 0
+    for i, d in enumerate(dims16):
+        if d > 1:
+            last_non1 = i
+    ndim = max(1, last_non1 + 1)
+    dims = dims16[:ndim]
 
     data = np.fromfile(cfl, dtype=np.float32)
     if data.size % 2 != 0:
         raise ValueError(f"CFL data length {data.size} not even.")
 
     cplx = data[0::2] + 1j * data[1::2]
-    arr = cplx.reshape(dims, order="F")
-    return arr
+    expected = int(np.prod(dims))
+    if cplx.size != expected:
+        raise ValueError(
+            f"CFL size mismatch for {base}: have {cplx.size} complex, "
+            f"expected {expected} from dims {dims} (hdr line: {dims16})."
+        )
+
+    return cplx.reshape(dims, order="F")
 
 
 def bart_image_dims(bart_bin: str, base: Path) -> list[int] | None:
@@ -600,7 +609,10 @@ def run_bart(
             subprocess.run(cmd, check=True)
 
             if combine == "sos":
-                cmd2 = [bart_bin, "rss", "3", str(coil_base), str(sos_base)]
+                coil_dim = 3
+                rss_mask = str(1 << coil_dim)   # 8
+                cmd2 = [bart_bin, "rss", rss_mask, str(coil_base), str(sos_base)]
+
                 print("[bart]", " ".join(cmd2))
                 subprocess.run(cmd2, check=True)
             else:
