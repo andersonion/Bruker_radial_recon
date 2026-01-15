@@ -2,26 +2,18 @@
 """
 Bruker 3D radial -> BART NUFFT recon driver.
 
-Fix in this version:
-  - k-space passed to BART NUFFT is written as (RO, spokes, 1, coils),
-    i.e. RO is dim0 and spokes is dim1 (BART convention),
-    NOT (1, RO, spokes, coils).
-
-Also:
-  - Uses <series>/grad.output if present (ProjR/ProjP/ProjS)
-  - Normalizes direction vectors to unit length
-  - Supports spoke expansion tile/repeat when spokes = reps * N_dirs
+Key points:
+  - For BART NUFFT, k-space must be written as (1, RO, spokes, coils)
+    (BART asserts ksp_dims[0] == 1).
+  - Supports trajectory from:
+        * traj file (Bruker writes <series>/traj)  --traj-source trajfile
+        * grad.output directions                   --traj-source gradoutput
+        * auto (prefer traj if parsable else grad) --traj-source auto
+  - Supports FID dtypes i2/i4/f4 and endianness
   - Supports FID layouts:
         ro_spokes_coils (default)
-        ro_coils_spokes (test2)
-  - Supports readout origin centered vs zero, and reverse readout
-  - Uses correct BART rss bitmask for coil dim=3 => 8
-
-NEW (known-good trajfile support):
-  - --traj-source auto|trajfile|gradoutput
-  - Parses Bruker <series>/traj as float32 with shape (NPro, RO, 3)
-    where NPro comes from method/acqp: ##$NPro
-  - Expands traj spokes to match FID spokes if spokes_all % NPro == 0
+        ro_coils_spokes
+  - Supports spoke expansion tile/repeat when spokes_all is a multiple of NPro or N_dirs
 """
 
 import argparse
@@ -106,10 +98,6 @@ def infer_coils(method: Path) -> int:
 
 
 def infer_npro(method: Path, acqp: Path) -> Optional[int]:
-    """
-    Try to read ##$NPro from method first, then acqp.
-    Returns None if not found.
-    """
     v = read_bruker_param(method, "NPro", None)
     if v is None:
         v = read_bruker_param(acqp, "NPro", None)
@@ -402,7 +390,7 @@ def build_traj_from_dirs(
     return traj
 
 
-# ---------------- traj file support (known-good detour datasets) ---------------- #
+# ---------------- traj file support ---------------- #
 
 def find_traj_candidates(series_path: Path) -> List[Path]:
     cands: List[Path] = []
@@ -417,7 +405,6 @@ def find_traj_candidates(series_path: Path) -> List[Path]:
             if p.exists() and p.is_file():
                 cands.append(p)
 
-    # unique preserve order
     seen = set()
     out = []
     for p in cands:
@@ -428,16 +415,29 @@ def find_traj_candidates(series_path: Path) -> List[Path]:
     return out
 
 
-def parse_trajfile_bruker_float32_npro_ro3(
+def _trajfile_stats(arr: np.ndarray) -> Tuple[float, float, float]:
+    # returns (finite_frac, max_abs, median_abs)
+    finite = np.isfinite(arr)
+    finite_frac = float(finite.mean())
+    if finite_frac == 0.0:
+        return 0.0, float("inf"), float("inf")
+    a = np.abs(arr[finite])
+    return finite_frac, float(a.max()), float(np.median(a))
+
+
+def parse_trajfile_bruker_npro_ro3_float32_autobytes(
     traj_path: Path,
     npro: int,
     true_ro: int,
-    endian: str = "<",
-) -> np.ndarray:
+) -> Tuple[np.ndarray, str]:
     """
-    Parse Bruker <series>/traj as float32 storing x,y,z per RO sample per spoke:
-      bytes == npro * true_ro * 3 * 4
-    Returns traj in BART shape (3, true_ro, npro) complex64.
+    Parse Bruker <series>/traj as float32, shape (NPro, RO, 3) -> (3, RO, NPro).
+
+    Automatically tries little and big endian float32 and chooses the one with:
+      - mostly finite values
+      - max |k| in a reasonable range (heuristic), otherwise picks the "less insane" one.
+
+    Returns (traj, endian_string)
     """
     nbytes = traj_path.stat().st_size
     expect = npro * true_ro * 3 * 4
@@ -447,13 +447,45 @@ def parse_trajfile_bruker_float32_npro_ro3(
             f"(npro={npro}, ro={true_ro}, 3 dirs, float32)."
         )
 
-    dt = np.dtype(endian + "f4")
-    arr = np.fromfile(traj_path, dtype=dt)
+    raw_le = np.fromfile(traj_path, dtype=np.dtype("<f4"))
+    raw_be = raw_le.byteswap().newbyteorder()  # equivalent to reading as >f4
 
-    # Prefer (npro, ro, 3) then transpose -> (3, ro, npro)
-    arr = arr.reshape(npro, true_ro, 3)
+    fin_le, max_le, med_le = _trajfile_stats(raw_le)
+    fin_be, max_be, med_be = _trajfile_stats(raw_be)
+
+    print(f"[info] traj endian probe: LE finite={fin_le:.3f} max|k|={max_le:.6g} med|k|={med_le:.6g}")
+    print(f"[info] traj endian probe: BE finite={fin_be:.3f} max|k|={max_be:.6g} med|k|={med_be:.6g}")
+
+    # Heuristic target: k should not be all ~0 and not astronomically huge.
+    def score(finite_frac: float, max_abs: float, med_abs: float) -> float:
+        if finite_frac < 0.99:
+            return -1e9
+        if max_abs == 0.0:
+            return -1e9
+        # prefer max_abs near tens/hundreds (typical pixel/FOV units), penalize extremes
+        # log-penalty centered around 50
+        target = 50.0
+        return -abs(np.log((max_abs + 1e-12) / target)) + 0.1 * np.log(med_abs + 1e-12)
+
+    s_le = score(fin_le, max_le, med_le)
+    s_be = score(fin_be, max_be, med_be)
+
+    if s_be > s_le:
+        raw = raw_be
+        endian = ">"
+    else:
+        raw = raw_le
+        endian = "<"
+
+    arr = raw.reshape(npro, true_ro, 3)
     traj = arr.transpose(2, 1, 0)  # (3, ro, npro)
-    return np.asfortranarray(traj.astype(np.complex64))
+
+    traj = np.asfortranarray(traj.astype(np.float32)).astype(np.complex64)
+    if not np.isfinite(traj.real).all():
+        raise RuntimeError("Parsed traj contains non-finite values even after endian selection.")
+
+    print(f"[info] Parsed trajfile {traj_path} as float32 endian='{endian}' with max |k|={np.abs(traj).max():.6g}")
+    return traj, endian
 
 
 def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.ndarray:
@@ -506,9 +538,9 @@ def load_traj_auto(
         if npro is None:
             raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
 
-        traj = parse_trajfile_bruker_float32_npro_ro3(p, npro=npro, true_ro=true_ro, endian="<")
+        traj, endian = parse_trajfile_bruker_npro_ro3_float32_autobytes(p, npro=npro, true_ro=true_ro)
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
-        return traj, f"trajfile:f4:(NPro={npro},RO={true_ro},3)"
+        return traj, f"trajfile:f4(endian={endian}):(NPro={npro},RO={true_ro},3)"
 
     if traj_source == "gradoutput":
         return _from_gradoutput(), "gradoutput"
@@ -652,10 +684,9 @@ def run_bart(
         ksp_frame = ksp[:, start:stop, :]          # (ro, spokes, coils)
         traj_frame = traj_full[:, :, start:stop]   # (3, ro, spokes)
 
-        # BART NUFFT expects k-space with RO in dim0 and spokes in dim1.
-        # Put a singleton dim2 (slice) and coils in dim3:
-        #   (RO, spokes, 1, coils)
-        ksp_bart = ksp_frame[:, :, np.newaxis, :]  # (ro, spokes, 1, coils)
+        # IMPORTANT: BART NUFFT expects k-space dims[0] == 1
+        # => k-space should be (1, RO, spokes, coils)
+        ksp_bart = ksp_frame[np.newaxis, :, :, :]  # (1, ro, spokes, coils)
 
         writecfl(str(traj_base), traj_frame)
         writecfl(str(ksp_base), ksp_bart)
@@ -720,10 +751,10 @@ def main():
             Examples:
 
               Use trajectory file (Bruker writes <series>/traj):
-                python bruker_radial_bart.py --series /path/to/8 --traj-source trajfile --export-nifti --out /tmp/out
+                python bruker_radial_bart.py --series /path/to/8 --traj-source trajfile --fid-dtype i2 --export-nifti --out /tmp/out
 
               Use grad.output:
-                python bruker_radial_bart.py --series /path/to/29 --traj-source gradoutput --export-nifti --out /tmp/out
+                python bruker_radial_bart.py --series /path/to/29 --traj-source gradoutput --fid-dtype i4 --export-nifti --out /tmp/out
             """
         ),
     )
