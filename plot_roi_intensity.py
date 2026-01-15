@@ -347,16 +347,28 @@ def main():
         if data2.shape[:3] != (nx, ny, nz):
             raise ValueError(f"Spatial shapes differ: img_2 {data2.shape[:3]} vs img_1 {(nx, ny, nz)}")
 
-    # Load baseline (optional)
+    # Load baseline (optional) - allow 3D or 4D
     baseline_path = Path(args.img2_baseline) if args.img2_baseline else None
     datab = None
+    bimg = None
+    baseline_is_3d = False
+
     if baseline_path is not None:
         bimg = nib.load(str(baseline_path))
         datab = bimg.get_fdata()
-        if datab.ndim != 4:
-            raise ValueError(f"--img2-baseline must be 4D, got shape {datab.shape}")
+
+        if datab.ndim == 3:
+            # Promote 3D baseline to single-timepoint 4D
+            datab = datab[..., np.newaxis]
+            baseline_is_3d = True
+        elif datab.ndim != 4:
+            raise ValueError(f"--img2-baseline must be 3D or 4D, got shape {datab.shape}")
+
         if datab.shape[:3] != (nx, ny, nz):
-            raise ValueError(f"--img2-baseline spatial shape differs: {datab.shape[:3]} vs {(nx, ny, nz)}")
+            raise ValueError(
+                f"--img2-baseline spatial shape differs: {datab.shape[:3]} vs {(nx, ny, nz)}"
+            )
+
 
     # ROI center
     if args.center is None:
@@ -457,7 +469,8 @@ def main():
     if datab is not None:
         yb_roi = mean_roi_timeseries(datab, roi_mask)
         yb_glob = global_timeseries(datab, global_mask, args.global_mode)
-        trb = get_tr_seconds(baseline_path, args.trb)
+        trb = get_tr_seconds(baseline_path, args.trb) if not baseline_is_3d else tr1
+
 
         if args.stable_n < 1 or args.stable_n > len(y1_glob):
             raise ValueError(f"--stable-n must be in [1..len(img1)] = [1..{len(y1_glob)}], got {args.stable_n}")
@@ -530,12 +543,12 @@ def main():
         plt.axvline((segments_t[-1][0]) / x_scale, linestyle="--")  # img1->img2
 
     # slope debug overlays (img1->img2)
-	if data2 is not None and args.norm_method in ("slope", "both") and dbg is not None:
-		# img1 tail fit (reference)
-		plt.plot(dbg["t1_tail"] / x_scale, dbg["y1_fit_tail"], linestyle="--", alpha=0.7)
-	
-		# img2 post-normalization fit ONLY (for continuity QA)
-		plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
+    if data2 is not None and args.norm_method in ("slope", "both") and dbg is not None:
+    	# img1 tail fit (reference)
+    	plt.plot(dbg["t1_tail"] / x_scale, dbg["y1_fit_tail"], linestyle="--", alpha=0.7)
+    
+    	# img2 post-normalization fit ONLY (for continuity QA)
+    	plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
 
     plt.xlabel(x_label)
     plt.ylabel("Mean ROI intensity")
