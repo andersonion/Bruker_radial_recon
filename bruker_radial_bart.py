@@ -425,67 +425,110 @@ def _trajfile_stats(arr: np.ndarray) -> Tuple[float, float, float]:
     return finite_frac, float(a.max()), float(np.median(a))
 
 
-def parse_trajfile_bruker_npro_ro3_float32_autobytes(
+def parse_trajfile_bruker_traj_autofmt(
     traj_path: Path,
     npro: int,
     true_ro: int,
 ) -> Tuple[np.ndarray, str]:
     """
-    Parse Bruker <series>/traj as float32, shape (NPro, RO, 3) -> (3, RO, NPro).
+    Parse Bruker <series>/traj for 3D radial as shape (NPro, RO, 3) and return
+    BART-style (3, RO, NPro) complex64 trajectory.
 
-    Automatically tries little and big endian float32 and chooses the one with:
-      - mostly finite values
-      - max |k| in a reasonable range (heuristic), otherwise picks the "less insane" one.
+    We auto-try common encodings:
+      - float32 (LE/BE)
+      - int32 fixed-point (LE/BE), scaled by 2^30
+      - int16 fixed-point (LE/BE), scaled by 2^15
 
-    Returns (traj, endian_string)
+    We pick the candidate with:
+      - 100% finite values
+      - a reasonable max(|k|) (not tiny, not astronomical)
+      - and nontrivial median magnitude
+
+    Returns (traj, description_string).
     """
     nbytes = traj_path.stat().st_size
-    expect = npro * true_ro * 3 * 4
-    if nbytes != expect:
+    expect = npro * true_ro * 3
+
+    # Helpers
+    def _as_traj_from_float(arr_f: np.ndarray) -> np.ndarray:
+        arr = arr_f.reshape(npro, true_ro, 3).transpose(2, 1, 0)  # (3, ro, npro)
+        traj = np.asfortranarray(arr.astype(np.float32)).astype(np.complex64)
+        return traj
+
+    def _stats_real(x: np.ndarray) -> Tuple[float, float, float]:
+        finite = np.isfinite(x)
+        finite_frac = float(finite.mean())
+        if finite_frac == 0.0:
+            return 0.0, float("inf"), float("inf")
+        a = np.abs(x[finite])
+        return finite_frac, float(a.max()), float(np.median(a))
+
+    def _score(finite_frac: float, max_abs: float, med_abs: float) -> float:
+        # Must be fully finite to be trusted
+        if finite_frac < 1.0:
+            return -1e12
+        # Reject obviously wrong scales
+        if max_abs <= 1e-6:
+            return -1e12
+        if max_abs >= 1e10:
+            return -1e12
+        # Prefer max_abs in a "BART-ish" range; keep this loose
+        target = 50.0
+        return -abs(np.log((max_abs + 1e-12) / target)) + 0.05 * np.log(med_abs + 1e-12)
+
+    # Build candidates: (name, float_array)
+    candidates: List[Tuple[str, np.ndarray]] = []
+
+    # float32
+    if nbytes == expect * 4:
+        raw_le = np.fromfile(traj_path, dtype=np.dtype("<f4"))
+        raw_be = raw_le.byteswap().newbyteorder()
+        candidates.append(("f4_le", raw_le))
+        candidates.append(("f4_be", raw_be))
+
+    # int32 fixed-point (common Bruker style)
+    if nbytes == expect * 4:
+        raw_le_i4 = np.fromfile(traj_path, dtype=np.dtype("<i4")).astype(np.float64) / float(1 << 30)
+        raw_be_i4 = raw_le_i4.byteswap().newbyteorder()
+        candidates.append(("i4_le_q30", raw_le_i4.astype(np.float32)))
+        candidates.append(("i4_be_q30", raw_be_i4.astype(np.float32)))
+
+    # int16 fixed-point
+    if nbytes == expect * 2:
+        raw_le_i2 = np.fromfile(traj_path, dtype=np.dtype("<i2")).astype(np.float64) / float(1 << 15)
+        raw_be_i2 = raw_le_i2.byteswap().newbyteorder()
+        candidates.append(("i2_le_q15", raw_le_i2.astype(np.float32)))
+        candidates.append(("i2_be_q15", raw_be_i2.astype(np.float32)))
+
+    if not candidates:
         raise RuntimeError(
-            f"traj size mismatch: bytes={nbytes}, expected={expect} "
-            f"(npro={npro}, ro={true_ro}, 3 dirs, float32)."
+            f"traj size {nbytes} bytes does not match expected encodings for "
+            f"(NPro={npro}, RO={true_ro}, 3): "
+            f"expected {expect*4} (f4/i4) or {expect*2} (i2)."
         )
 
-    raw_le = np.fromfile(traj_path, dtype=np.dtype("<f4"))
-    raw_be = raw_le.byteswap().newbyteorder()  # equivalent to reading as >f4
+    best_name = None
+    best_score = -1e18
+    best_traj = None
 
-    fin_le, max_le, med_le = _trajfile_stats(raw_le)
-    fin_be, max_be, med_be = _trajfile_stats(raw_be)
+    for name, raw in candidates:
+        fin, mx, med = _stats_real(raw)
+        print(f"[info] traj probe {name}: finite={fin:.3f} max|k|={mx:.6g} med|k|={med:.6g}")
+        sc = _score(fin, mx, med)
+        if sc > best_score:
+            best_score = sc
+            best_name = name
+            best_traj = _as_traj_from_float(raw)
 
-    print(f"[info] traj endian probe: LE finite={fin_le:.3f} max|k|={max_le:.6g} med|k|={med_le:.6g}")
-    print(f"[info] traj endian probe: BE finite={fin_be:.3f} max|k|={max_be:.6g} med|k|={med_be:.6g}")
+    if best_traj is None or best_name is None:
+        raise RuntimeError("Failed to select a valid traj interpretation (all candidates rejected).")
 
-    # Heuristic target: k should not be all ~0 and not astronomically huge.
-    def score(finite_frac: float, max_abs: float, med_abs: float) -> float:
-        if finite_frac < 0.99:
-            return -1e9
-        if max_abs == 0.0:
-            return -1e9
-        # prefer max_abs near tens/hundreds (typical pixel/FOV units), penalize extremes
-        # log-penalty centered around 50
-        target = 50.0
-        return -abs(np.log((max_abs + 1e-12) / target)) + 0.1 * np.log(med_abs + 1e-12)
+    # Final sanity
+    if not np.isfinite(best_traj.real).all():
+        raise RuntimeError("Parsed traj contains non-finite values after candidate selection.")
 
-    s_le = score(fin_le, max_le, med_le)
-    s_be = score(fin_be, max_be, med_be)
-
-    if s_be > s_le:
-        raw = raw_be
-        endian = ">"
-    else:
-        raw = raw_le
-        endian = "<"
-
-    arr = raw.reshape(npro, true_ro, 3)
-    traj = arr.transpose(2, 1, 0)  # (3, ro, npro)
-
-    traj = np.asfortranarray(traj.astype(np.float32)).astype(np.complex64)
-    if not np.isfinite(traj.real).all():
-        raise RuntimeError("Parsed traj contains non-finite values even after endian selection.")
-
-    print(f"[info] Parsed trajfile {traj_path} as float32 endian='{endian}' with max |k|={np.abs(traj).max():.6g}")
-    return traj, endian
+    print(f"[info] Parsed trajfile {traj_path} using {best_name} with max |k|={np.abs(best_traj).max():.6g}")
+    return best_traj, best_name
 
 
 def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.ndarray:
@@ -538,9 +581,9 @@ def load_traj_auto(
         if npro is None:
             raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
 
-        traj, endian = parse_trajfile_bruker_npro_ro3_float32_autobytes(p, npro=npro, true_ro=true_ro)
+        traj, fmt = parse_trajfile_bruker_traj_autofmt(p, npro=npro, true_ro=true_ro)
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
-        return traj, f"trajfile:f4(endian={endian}):(NPro={npro},RO={true_ro},3)"
+        return traj, f"trajfile:{fmt}:(NPro={npro},RO={true_ro},3)"
 
     if traj_source == "gradoutput":
         return _from_gradoutput(), "gradoutput"
