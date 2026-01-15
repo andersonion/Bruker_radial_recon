@@ -738,7 +738,7 @@ def main():
     ap.add_argument("--spokes-per-frame", type=int, default=0)
     ap.add_argument("--frame-shift", type=int, default=0)
 
-    ap.add_argument("--fid-dtype", choices=["i4", "f4"], default="i4")
+    ap.add_argument("--fid-dtype", choices=["i2", "i4", "f4"], default="i2")
     ap.add_argument("--fid-endian", choices=[">", "<"], default="<")
     ap.add_argument("--fid-layout", choices=["ro_spokes_coils", "ro_coils_spokes"], default="ro_spokes_coils")
 
