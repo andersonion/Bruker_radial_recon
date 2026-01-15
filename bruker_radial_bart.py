@@ -2,12 +2,11 @@
 """
 Bruker 3D radial -> BART NUFFT recon driver.
 
-Fix in this version:
+This version:
   - k-space passed to BART NUFFT is written as (RO, spokes, 1, coils),
     i.e. RO is dim0 and spokes is dim1 (BART convention),
     NOT (1, RO, spokes, coils).
 
-Also:
   - Automatically uses <series>/grad.output if present (ProjR/ProjP/ProjS)
   - Normalizes direction vectors to unit length
   - Supports spoke expansion tile/repeat when spokes = reps * N_dirs
@@ -16,6 +15,20 @@ Also:
         ro_coils_spokes (test2)
   - Supports readout origin centered vs zero, and reverse readout
   - Uses correct BART rss bitmask for coil dim=3 => 8
+
+NEW (detour support):
+  - Can use a *known-good trajectory file* when present in the dataset, as an option:
+        --traj-source auto        (default): prefer traj file if found+parsable; else grad.output
+        --traj-source trajfile    : require a traj file (error if missing)
+        --traj-source gradoutput  : require grad.output (error if missing)
+    You can also force a specific traj file via:
+        --traj-file /path/to/traj_or_traj.cfl (base path ok)
+
+  - Robust traj parsing:
+        * If traj is a BART .cfl/.hdr pair => readcfl() and adapt dims to (3, RO, spokes)
+        * Else try raw binary float32/float64 with length 3*RO*spokes (interleaved or blocked)
+        * Else if file encodes per-spoke directions (spokes,3) or (3,spokes), expand along RO
+          using kmax = 0.5*NX and your readout-origin/reverse settings
 """
 
 import argparse
@@ -24,6 +37,7 @@ import subprocess
 import textwrap
 import re
 from pathlib import Path
+from typing import Optional, Tuple, List
 
 import numpy as np
 import nibabel as nib
@@ -166,9 +180,15 @@ def load_bruker_kspace(
     stored_ro, coils, spokes = factor_fid(total_points, true_ro, coils_hint)
 
     if coils_hint is not None and coils != coils_hint:
-        print(f"[warn] FID suggests coils={coils}, header said {coils_hint}; using {coils}.", file=sys.stderr)
+        print(
+            f"[warn] FID suggests coils={coils}, header said {coils_hint}; using {coils}.",
+            file=sys.stderr,
+        )
 
-    print(f"[info] Loaded k-space with stored_ro={stored_ro}, true_ro={true_ro}, spokes={spokes}, coils={coils}")
+    print(
+        f"[info] Loaded k-space with stored_ro={stored_ro}, "
+        f"true_ro={true_ro}, spokes={spokes}, coils={coils}"
+    )
 
     if fid_layout == "ro_spokes_coils":
         ksp = cplx.reshape(stored_ro, spokes, coils)
@@ -232,7 +252,10 @@ def readcfl(name: str) -> np.ndarray:
     cplx = data[0::2] + 1j * data[1::2]
     expected = int(np.prod(dims))
     if cplx.size != expected:
-        raise ValueError(f"CFL size mismatch: have {cplx.size} complex, expected {expected} from dims {dims} for {base}")
+        raise ValueError(
+            f"CFL size mismatch: have {cplx.size} complex, expected {expected} "
+            f"from dims {dims} for {base}"
+        )
 
     return cplx.reshape(dims, order="F")
 
@@ -254,7 +277,12 @@ def bart_image_dims(bart_bin: str, base: Path) -> list[int] | None:
 
 
 def bart_supports_gpu(bart_bin: str = "bart") -> bool:
-    proc = subprocess.run([bart_bin, "nufft", "-i", "-g"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(
+        [bart_bin, "nufft", "-i", "-g"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     if proc.returncode == 0:
         return True
     s = (proc.stderr or "").lower()
@@ -266,7 +294,9 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
 # ---------------- grad.output trajectory ---------------- #
 
 def _extract_grad_block(lines: list[str], name: str) -> np.ndarray:
-    hdr_pat = re.compile(rf"^\s*\d+:{re.escape(name)}:\s+index\s*=\s*\d+,\s+size\s*=\s*(\d+)\s*$")
+    hdr_pat = re.compile(
+        rf"^\s*\d+:{re.escape(name)}:\s+index\s*=\s*\d+,\s+size\s*=\s*(\d+)\s*$"
+    )
 
     start = None
     size = None
@@ -310,12 +340,22 @@ def load_grad_output_dirs(grad_output_path: Path, normalize: bool = True) -> np.
 
     norms = np.linalg.norm(dirs, axis=1)
     print(f"[info] Parsed {dirs.shape[0]} spoke directions from {grad_output_path}")
-    print(f"[info] Direction norms BEFORE normalize: min={norms.min():.4f} median={np.median(norms):.4f} max={norms.max():.4f}")
+    print(
+        f"[info] Direction norms BEFORE normalize: "
+        f"min={norms.min():.4f} median={np.median(norms):.4f} max={norms.max():.4f}"
+    )
 
     if normalize:
+        # Avoid divide-by-zero if any weird entry appears
+        bad = norms == 0
+        if np.any(bad):
+            raise ValueError(f"Found {bad.sum()} zero-norm direction(s) in {grad_output_path}")
         dirs = dirs / norms[:, None]
         norms2 = np.linalg.norm(dirs, axis=1)
-        print(f"[info] Direction norms AFTER  normalize: min={norms2.min():.4f} median={np.median(norms2):.4f} max={norms2.max():.4f}")
+        print(
+            f"[info] Direction norms AFTER  normalize: "
+            f"min={norms2.min():.4f} median={np.median(norms2):.4f} max={norms2.max():.4f}"
+        )
 
     return dirs
 
@@ -335,16 +375,13 @@ def expand_spoke_dirs(dirs: np.ndarray, target_spokes: int, order: str) -> np.nd
     raise ValueError(f"Unknown spoke-order: {order}")
 
 
-def build_traj_from_dirs(
+def _build_readout_s(
     true_ro: int,
-    dirs_xyz: np.ndarray,   # (spokes,3)
     NX: int,
     traj_scale: float | None,
     readout_origin: str,
     reverse_readout: bool,
 ) -> np.ndarray:
-    spokes = dirs_xyz.shape[0]
-
     kmax = 0.5 * NX
     if traj_scale is not None:
         kmax *= float(traj_scale)
@@ -357,6 +394,20 @@ def build_traj_from_dirs(
     if reverse_readout:
         s = s[::-1].copy()
 
+    return s
+
+
+def build_traj_from_dirs(
+    true_ro: int,
+    dirs_xyz: np.ndarray,   # (spokes,3)
+    NX: int,
+    traj_scale: float | None,
+    readout_origin: str,
+    reverse_readout: bool,
+) -> np.ndarray:
+    spokes = dirs_xyz.shape[0]
+    s = _build_readout_s(true_ro, NX, traj_scale, readout_origin, reverse_readout)
+
     traj = np.zeros((3, true_ro, spokes), dtype=np.complex64)
     dx, dy, dz = dirs_xyz[:, 0], dirs_xyz[:, 1], dirs_xyz[:, 2]
     for i in range(spokes):
@@ -364,8 +415,251 @@ def build_traj_from_dirs(
         traj[1, :, i] = s * dy[i]
         traj[2, :, i] = s * dz[i]
 
-    print(f"[info] Traj built with max |k| ≈ {np.abs(traj).max():.2f} (origin={readout_origin}, reverse={reverse_readout})")
+    print(
+        f"[info] Traj built with max |k| ≈ {np.abs(traj).max():.2f} "
+        f"(origin={readout_origin}, reverse={reverse_readout})"
+    )
     return traj
+
+
+# ---------------- traj file support (detour) ---------------- #
+
+def _normalize_traj_shape_to_3_ro_spokes(
+    arr: np.ndarray,
+    true_ro: int,
+    spokes_all: int,
+) -> np.ndarray:
+    """
+    Accept many plausible traj shapes and normalize to (3, RO, spokes) complex64.
+    """
+    a = np.asarray(arr)
+
+    # If complex, keep; if real, convert to complex (BART wants complex for CFL)
+    if not np.iscomplexobj(a):
+        a = a.astype(np.float32)
+
+    # Drop singleton axes
+    a = np.squeeze(a)
+
+    # Common cases:
+    #  - (3, RO, spokes)
+    #  - (RO, spokes, 3)
+    #  - (3, spokes, RO)
+    #  - (spokes, 3) directions only
+    #  - (3, spokes) directions only
+
+    if a.ndim == 3:
+        if a.shape == (3, true_ro, spokes_all):
+            out = a
+        elif a.shape == (true_ro, spokes_all, 3):
+            out = np.transpose(a, (2, 0, 1))
+        elif a.shape == (3, spokes_all, true_ro):
+            out = np.transpose(a, (0, 2, 1))
+        else:
+            raise ValueError(f"Unrecognized traj 3D shape {a.shape}, expected variants of (3,{true_ro},{spokes_all})")
+        return np.asfortranarray(out.astype(np.complex64))
+
+    if a.ndim == 2:
+        if a.shape == (spokes_all, 3):
+            # directions only (spokes,3) => expand later
+            return a
+        if a.shape == (3, spokes_all):
+            return a.T
+        raise ValueError(f"Unrecognized traj 2D shape {a.shape}, expected ({spokes_all},3) directions")
+
+    raise ValueError(f"Unrecognized traj ndim={a.ndim} shape={a.shape}")
+
+
+def find_traj_candidates(series_path: Path) -> List[Path]:
+    """
+    Heuristic search for trajectory candidates under series/ and series/pdata/.
+    We include both BART-style base names and raw files.
+    """
+    patterns = [
+        "*traj*.hdr",
+        "*traj*.cfl",
+        "*trajectory*.hdr",
+        "*trajectory*.cfl",
+        "*traj*",
+        "*trajectory*",
+    ]
+
+    roots = [series_path]
+    pdata = series_path / "pdata"
+    if pdata.exists():
+        roots.append(pdata)
+
+    cands: List[Path] = []
+    for root in roots:
+        for pat in patterns:
+            for p in root.rglob(pat):
+                if not p.is_file():
+                    continue
+                # exclude obvious non-traj heavy hitters
+                if p.name in ("fid", "2dseq", "rawdata.job0"):
+                    continue
+                cands.append(p)
+
+    # de-duplicate and sort by size asc (small first, but we'll validate)
+    uniq = sorted(set(cands), key=lambda x: (x.stat().st_size, str(x)))
+    return uniq
+
+
+def read_traj_from_file_or_base(path_or_base: Path) -> np.ndarray:
+    """
+    If given a BART base (or .cfl/.hdr), read via readcfl.
+    Else return raw bytes decoded as float arrays by the caller.
+    """
+    p = path_or_base
+    if p.suffix in (".cfl", ".hdr"):
+        base = p.with_suffix("")
+        return readcfl(str(base))
+    # base given directly?
+    if p.with_suffix(".cfl").exists() and p.with_suffix(".hdr").exists():
+        return readcfl(str(p))
+    raise FileNotFoundError(f"Not a BART CFL base or .cfl/.hdr: {p}")
+
+
+def try_parse_raw_binary_traj(
+    traj_path: Path,
+    true_ro: int,
+    spokes_all: int,
+) -> Optional[np.ndarray]:
+    """
+    Attempt raw binary parsing as float32/float64:
+      - interleaved xyz per sample (RO*spokes,3)
+      - blocked x then y then z (each RO*spokes)
+    Returns traj (3,RO,spokes) complex64 or None.
+    """
+    raw = traj_path.read_bytes()
+    nbytes = len(raw)
+    target32 = 3 * true_ro * spokes_all * 4
+    target64 = 3 * true_ro * spokes_all * 8
+
+    def _build_from_arr(arr: np.ndarray, mode: str) -> np.ndarray:
+        if mode == "interleaved_xyz":
+            xyz = arr.reshape(true_ro * spokes_all, 3)
+            x = xyz[:, 0].reshape(true_ro, spokes_all)
+            y = xyz[:, 1].reshape(true_ro, spokes_all)
+            z = xyz[:, 2].reshape(true_ro, spokes_all)
+        elif mode == "blocked_x_y_z":
+            n = true_ro * spokes_all
+            x = arr[0:n].reshape(true_ro, spokes_all)
+            y = arr[n:2*n].reshape(true_ro, spokes_all)
+            z = arr[2*n:3*n].reshape(true_ro, spokes_all)
+        else:
+            raise ValueError("bad mode")
+
+        traj = np.zeros((3, true_ro, spokes_all), dtype=np.complex64)
+        traj[0] = x
+        traj[1] = y
+        traj[2] = z
+        return np.asfortranarray(traj)
+
+    for dt, tgt in ((np.float32, target32), (np.float64, target64)):
+        if nbytes != tgt:
+            continue
+        arr = np.frombuffer(raw, dtype=dt)
+        for mode in ("interleaved_xyz", "blocked_x_y_z"):
+            try:
+                traj = _build_from_arr(arr, mode)
+                print(f"[info] Parsed raw binary traj {traj_path} as {dt} ({mode}), shape={traj.shape}")
+                return traj
+            except Exception:
+                pass
+
+    return None
+
+
+def load_traj_auto(
+    series_path: Path,
+    true_ro: int,
+    spokes_all: int,
+    NX: int,
+    traj_scale: float | None,
+    spoke_order: str,
+    readout_origin: str,
+    reverse_readout: bool,
+    traj_source: str,
+    traj_file: Optional[Path],
+) -> Tuple[np.ndarray, str]:
+    """
+    Return traj_full (3,RO,spokes) and a short string describing the source used.
+    """
+    # Helper for gradoutput
+    def _from_gradoutput() -> np.ndarray:
+        grad_path = series_path / "grad.output"
+        if not grad_path.exists():
+            raise RuntimeError(f"grad.output not found in {series_path}")
+        dirs = load_grad_output_dirs(grad_path, normalize=True)
+        dirs_full = expand_spoke_dirs(dirs, spokes_all, spoke_order)
+        return build_traj_from_dirs(true_ro, dirs_full, NX, traj_scale, readout_origin, reverse_readout)
+
+    # Helper for trajfile
+    def _from_trajfile(p: Path) -> np.ndarray:
+        # 1) If BART CFL base: read and normalize dims
+        try:
+            arr = read_traj_from_file_or_base(p)
+            normed = _normalize_traj_shape_to_3_ro_spokes(arr, true_ro, spokes_all)
+            if normed.ndim == 2 and normed.shape == (spokes_all, 3):
+                # directions only -> expand
+                s = _build_readout_s(true_ro, NX, traj_scale, readout_origin, reverse_readout)
+                traj = np.zeros((3, true_ro, spokes_all), dtype=np.complex64)
+                for i in range(spokes_all):
+                    traj[0, :, i] = s * normed[i, 0]
+                    traj[1, :, i] = s * normed[i, 1]
+                    traj[2, :, i] = s * normed[i, 2]
+                print(f"[info] Expanded direction-only traj to full RO using kmax=0.5*NX (NX={NX})")
+                return traj
+            return normed
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            # if it's a CFL but wrong dims, we want to report and fall through to raw attempt
+            print(f"[warn] Failed to parse as BART CFL traj: {p} ({e})", file=sys.stderr)
+
+        # 2) Try raw binary float32/64
+        t = try_parse_raw_binary_traj(p, true_ro, spokes_all)
+        if t is not None:
+            return t
+
+        raise RuntimeError(
+            f"Could not parse trajectory file {p}.\n"
+            f"  Tried: BART .cfl/.hdr, raw float32/float64 binary (3*RO*spokes).\n"
+            f"  You may need to point --traj-file at the correct file/base."
+        )
+
+    # Resolve explicit override first
+    if traj_file is not None:
+        traj = _from_trajfile(traj_file)
+        return traj, f"trajfile:{traj_file}"
+
+    if traj_source == "gradoutput":
+        return _from_gradoutput(), "gradoutput"
+
+    if traj_source in ("trajfile", "auto"):
+        # search for candidates
+        cands = find_traj_candidates(series_path)
+        if traj_source == "trajfile" and not cands:
+            raise RuntimeError(f"--traj-source trajfile requested, but no traj candidate found under {series_path} or pdata/*")
+
+        # Try candidates until one parses
+        for p in cands:
+            # Prefer bases (hdr/cfl) when seen
+            base = p.with_suffix("") if p.suffix in (".cfl", ".hdr") else p
+            try:
+                traj = _from_trajfile(base)
+                return traj, f"trajfile:auto:{base}"
+            except Exception:
+                continue
+
+        if traj_source == "trajfile":
+            raise RuntimeError(f"--traj-source trajfile requested, but no candidate trajectory could be parsed under {series_path} or pdata/*")
+
+        # auto fallback
+        return _from_gradoutput(), "gradoutput(fallback)"
+
+    raise ValueError(f"Unknown traj-source: {traj_source}")
 
 
 # ---------------- NIfTI writers ---------------- #
@@ -409,16 +703,24 @@ def run_bart(
     spoke_order: str,
     readout_origin: str,
     reverse_readout: bool,
+    traj_source: str,
+    traj_file: Optional[Path],
 ):
     bart_bin = "bart"
 
-    grad_path = series_path / "grad.output"
-    if grad_path.exists():
-        dirs = load_grad_output_dirs(grad_path, normalize=True)
-        dirs_full = expand_spoke_dirs(dirs, spokes_all, spoke_order)
-        traj_full = build_traj_from_dirs(true_ro, dirs_full, NX, traj_scale, readout_origin, reverse_readout)
-    else:
-        raise RuntimeError(f"grad.output not found in {series_path} (this run requires it).")
+    traj_full, traj_used = load_traj_auto(
+        series_path=series_path,
+        true_ro=true_ro,
+        spokes_all=spokes_all,
+        NX=NX,
+        traj_scale=traj_scale,
+        spoke_order=spoke_order,
+        readout_origin=readout_origin,
+        reverse_readout=reverse_readout,
+        traj_source=traj_source,
+        traj_file=traj_file,
+    )
+    print(f"[info] Trajectory source used: {traj_used}")
 
     have_gpu = False
     if use_gpu:
@@ -442,7 +744,7 @@ def run_bart(
     qa_written = False
     first_dims_reported = False
 
-    rss_mask = str(1 << 3)  # coil dim=3
+    rss_mask = str(1 << 3)  # coil dim=3 => 8
 
     for i, start in enumerate(frame_starts):
         stop = min(spokes_all, start + spokes_per_frame)
@@ -462,10 +764,9 @@ def run_bart(
 
         print(f"[info] Frame {i} spokes [{start}:{stop}] (n={nsp})")
 
-        ksp_frame = ksp[:, start:stop, :]        # (ro, spokes, coils)
-        traj_frame = traj_full[:, :, start:stop] # (3, ro, spokes)
+        ksp_frame = ksp[:, start:stop, :]         # (ro, spokes, coils)
+        traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes)
 
-        # *** CRITICAL FIX ***
         # BART NUFFT expects k-space with RO in dim0 and spokes in dim1.
         # Put a singleton dim2 (slice) and coils in dim3:
         #   (RO, spokes, 1, coils)
@@ -525,23 +826,46 @@ def run_bart(
 
 # ---------------- CLI ---------------- #
 
+def _validate_out_path(out_base: Path):
+    s = str(out_base)
+    if " --" in s or "\n" in s or "\t" in s:
+        raise SystemExit(
+            "[fatal] Your --out contains what looks like an embedded flag (e.g. ' --reverse-readout').\n"
+            "        You likely did: --out \"... --reverse-readout\" by accident.\n"
+            "        Fix: move --reverse-readout outside the --out quotes.\n"
+            f"        Got --out: {s}"
+        )
+    if " " in s:
+        raise SystemExit(
+            "[fatal] Your --out contains spaces. That will break path tokenization and BART commands.\n"
+            "        Use underscores instead, or quote carefully. Recommended: no spaces.\n"
+            f"        Got --out: {s}"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Bruker 3D radial → BART NUFFT recon driver (auto grad.output).",
+        description="Bruker 3D radial → BART NUFFT recon driver (grad.output or traj file).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\
-            Example:
-              python bruker_radial_bart.py \
-                --series /path/to/29 \
-                --spokes-per-frame 800 \
-                --frame-shift 200 \
-                --spoke-order repeat \
-                --fid-layout ro_coils_spokes \
-                --readout-origin zero \
-                --qa-first 2 \
-                --export-nifti \
-                --out /path/to/outprefix
+            Examples:
+
+              # Default (auto): prefer a traj file if found; else use grad.output
+              python bruker_radial_bart.py --series /path/to/29 --export-nifti --out /tmp/outprefix
+
+              # Force using dataset traj file (error if none parsable)
+              python bruker_radial_bart.py --series /path/to/29 --traj-source trajfile --export-nifti --out /tmp/outprefix
+
+              # Force grad.output
+              python bruker_radial_bart.py --series /path/to/29 --traj-source gradoutput --export-nifti --out /tmp/outprefix
+
+              # Force a specific traj file/base
+              python bruker_radial_bart.py --series /path/to/29 --traj-source trajfile --traj-file /path/to/traj_base --export-nifti --out /tmp/outprefix
+
+            Notes:
+              - grad.output is still automatic when used; no --grad-output option.
+              - If your traj file is direction-only, we expand along RO using kmax=0.5*NX.
             """
         ),
     )
@@ -565,6 +889,18 @@ def main():
     ap.add_argument("--reverse-readout", action="store_true")
     ap.add_argument("--traj-scale", type=float, default=None)
 
+    ap.add_argument(
+        "--traj-source",
+        choices=["auto", "trajfile", "gradoutput"],
+        default="auto",
+        help="Trajectory source: auto (prefer traj file), trajfile (require traj file), gradoutput (require grad.output).",
+    )
+    ap.add_argument(
+        "--traj-file",
+        default=None,
+        help="Optional explicit trajectory file/base to use (BART base or raw binary).",
+    )
+
     ap.add_argument("--qa-first", type=int, default=0)
     ap.add_argument("--export-nifti", action="store_true")
 
@@ -574,6 +910,8 @@ def main():
 
     series_path = Path(args.series).resolve()
     out_base = Path(args.out).resolve()
+    _validate_out_path(out_base)
+
     out_base.parent.mkdir(parents=True, exist_ok=True)
 
     method = series_path / "method"
@@ -616,6 +954,8 @@ def main():
     shift = spf if args.frame_shift <= 0 else args.frame_shift
     qa_first = args.qa_first if args.qa_first > 0 else None
 
+    traj_file = Path(args.traj_file).resolve() if args.traj_file else None
+
     run_bart(
         series_path=series_path,
         out_base=out_base,
@@ -632,6 +972,8 @@ def main():
         spoke_order=args.spoke_order,
         readout_origin=args.readout_origin,
         reverse_readout=args.reverse_readout,
+        traj_source=args.traj_source,
+        traj_file=traj_file,
     )
 
 
