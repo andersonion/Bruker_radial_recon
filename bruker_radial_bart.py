@@ -8,7 +8,7 @@ Fix in this version:
     NOT (1, RO, spokes, coils).
 
 Also:
-  - Automatically uses <series>/grad.output if present (ProjR/ProjP/ProjS)
+  - Uses <series>/grad.output if present (ProjR/ProjP/ProjS)
   - Normalizes direction vectors to unit length
   - Supports spoke expansion tile/repeat when spokes = reps * N_dirs
   - Supports FID layouts:
@@ -17,12 +17,11 @@ Also:
   - Supports readout origin centered vs zero, and reverse readout
   - Uses correct BART rss bitmask for coil dim=3 => 8
 
-NEW:
-  - Optional traj-file mode for "known-good" datasets:
-        --traj-source auto|trajfile|gradoutput
-        --traj-file <path> (optional; default tries <series>/traj then pdata/**/traj)
-        --traj-dtype f4|f8|i4|i2 (default f4)
-        --traj-endian <|> (default <)
+NEW (known-good trajfile support):
+  - --traj-source auto|trajfile|gradoutput
+  - Parses Bruker <series>/traj as float32 with shape (NPro, RO, 3)
+    where NPro comes from method/acqp: ##$NPro
+  - Expands traj spokes to match FID spokes if spokes_all % NPro == 0
 """
 
 import argparse
@@ -104,6 +103,24 @@ def infer_true_ro(acqp: Path) -> int:
 def infer_coils(method: Path) -> int:
     v = read_bruker_param(method, "PVM_EncNReceivers", 1)
     return int(v if not isinstance(v, (list, tuple)) else v[0])
+
+
+def infer_npro(method: Path, acqp: Path) -> Optional[int]:
+    """
+    Try to read ##$NPro from method first, then acqp.
+    Returns None if not found.
+    """
+    v = read_bruker_param(method, "NPro", None)
+    if v is None:
+        v = read_bruker_param(acqp, "NPro", None)
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return int(v[0])
+    try:
+        return int(v)
+    except Exception:
+        return None
 
 
 # ---------------- FID / k-space loading ---------------- #
@@ -353,19 +370,6 @@ def expand_spoke_dirs(dirs: np.ndarray, target_spokes: int, order: str) -> np.nd
     raise ValueError(f"Unknown spoke-order: {order}")
 
 
-def _build_readout_s(true_ro: int, NX: int, traj_scale: float | None, readout_origin: str, reverse_readout: bool) -> np.ndarray:
-    kmax = 0.5 * NX
-    if traj_scale is not None:
-        kmax *= float(traj_scale)
-    if readout_origin == "zero":
-        s = np.linspace(0.0, kmax, true_ro, dtype=np.float64)
-    else:
-        s = np.linspace(-kmax, kmax, true_ro, dtype=np.float64)
-    if reverse_readout:
-        s = s[::-1].copy()
-    return s
-
-
 def build_traj_from_dirs(
     true_ro: int,
     dirs_xyz: np.ndarray,   # (spokes,3)
@@ -375,7 +379,17 @@ def build_traj_from_dirs(
     reverse_readout: bool,
 ) -> np.ndarray:
     spokes = dirs_xyz.shape[0]
-    s = _build_readout_s(true_ro, NX, traj_scale, readout_origin, reverse_readout)
+    kmax = 0.5 * NX
+    if traj_scale is not None:
+        kmax *= float(traj_scale)
+
+    if readout_origin == "zero":
+        s = np.linspace(0.0, kmax, true_ro, dtype=np.float64)
+    else:
+        s = np.linspace(-kmax, kmax, true_ro, dtype=np.float64)
+
+    if reverse_readout:
+        s = s[::-1].copy()
 
     traj = np.zeros((3, true_ro, spokes), dtype=np.complex64)
     dx, dy, dz = dirs_xyz[:, 0], dirs_xyz[:, 1], dirs_xyz[:, 2]
@@ -391,12 +405,6 @@ def build_traj_from_dirs(
 # ---------------- traj file support (known-good detour datasets) ---------------- #
 
 def find_traj_candidates(series_path: Path) -> List[Path]:
-    """
-    Prefer explicit Bruker traj locations first:
-      - <series>/traj
-      - <series>/pdata/*/traj
-    Then fall back to globbing anything with traj in the name.
-    """
     cands: List[Path] = []
 
     p0 = series_path / "traj"
@@ -409,15 +417,6 @@ def find_traj_candidates(series_path: Path) -> List[Path]:
             if p.exists() and p.is_file():
                 cands.append(p)
 
-    # fallback search
-    for p in series_path.rglob("*traj*"):
-        if not p.is_file():
-            continue
-        if p.name in ("fid", "2dseq", "rawdata.job0"):
-            continue
-        if p not in cands:
-            cands.append(p)
-
     # unique preserve order
     seen = set()
     out = []
@@ -426,103 +425,60 @@ def find_traj_candidates(series_path: Path) -> List[Path]:
             continue
         seen.add(p)
         out.append(p)
-
     return out
 
 
-def _dtype_from_flag(flag: str) -> np.dtype:
-    m = {"f4": np.float32, "f8": np.float64, "i4": np.int32, "i2": np.int16}
-    if flag not in m:
-        raise ValueError(f"Unknown traj dtype flag {flag}")
-    return np.dtype(m[flag])
-
-
-def try_parse_bruker_traj_file(
+def parse_trajfile_bruker_float32_npro_ro3(
     traj_path: Path,
+    npro: int,
     true_ro: int,
-    spokes_all: int,
-    dtype: np.dtype,
-    endian: str,
-) -> Optional[np.ndarray]:
+    endian: str = "<",
+) -> np.ndarray:
     """
-    Try common Bruker-style raw traj encodings with user-controllable dtype/endian.
-
-    Successful output must be (3, RO, spokes) complex64.
+    Parse Bruker <series>/traj as float32 storing x,y,z per RO sample per spoke:
+      bytes == npro * true_ro * 3 * 4
+    Returns traj in BART shape (3, true_ro, npro) complex64.
     """
-    dt = np.dtype(endian + dtype.str[1:])  # e.g. '<f4'
-    data = np.fromfile(traj_path, dtype=dt)
-    n = data.size
     nbytes = traj_path.stat().st_size
+    expect = npro * true_ro * 3 * 4
+    if nbytes != expect:
+        raise RuntimeError(
+            f"traj size mismatch: bytes={nbytes}, expected={expect} "
+            f"(npro={npro}, ro={true_ro}, 3 dirs, float32)."
+        )
 
-    # Hypotheses and their expected element counts:
-    # full per-sample (3,RO,spokes) => 3*RO*spokes
-    # direction-only (spokes,3) => 3*spokes
-    expect_full = 3 * true_ro * spokes_all
-    expect_dirs = 3 * spokes_all
+    dt = np.dtype(endian + "f4")
+    arr = np.fromfile(traj_path, dtype=dt)
 
-    def as_traj_from_full(arr: np.ndarray, mode: str) -> np.ndarray:
-        # Build (3,RO,spokes)
-        if mode == "blocked_3_ro_spokes":
-            t = arr.reshape(3, true_ro, spokes_all)
-        elif mode == "ro_spokes_3":
-            t = arr.reshape(true_ro, spokes_all, 3).transpose(2, 0, 1)
-        elif mode == "3_spokes_ro":
-            t = arr.reshape(3, spokes_all, true_ro).transpose(0, 2, 1)
-        elif mode == "spokes_ro_3":
-            t = arr.reshape(spokes_all, true_ro, 3).transpose(2, 1, 0)
-        else:
-            raise ValueError("bad mode")
-        return np.asfortranarray(t.astype(np.complex64))
+    # Prefer (npro, ro, 3) then transpose -> (3, ro, npro)
+    arr = arr.reshape(npro, true_ro, 3)
+    traj = arr.transpose(2, 1, 0)  # (3, ro, npro)
+    return np.asfortranarray(traj.astype(np.complex64))
 
-    def as_dirs(arr: np.ndarray, mode: str) -> np.ndarray:
-        if mode == "spokes_3":
-            d = arr.reshape(spokes_all, 3)
-        elif mode == "3_spokes":
-            d = arr.reshape(3, spokes_all).T
-        else:
-            raise ValueError("bad dirs mode")
-        return d.astype(np.float64)
 
-    # Try full traj shapes
-    if n == expect_full:
-        for mode in ("blocked_3_ro_spokes", "ro_spokes_3", "3_spokes_ro", "spokes_ro_3"):
-            try:
-                traj = as_traj_from_full(data, mode)
-                print(f"[info] Parsed traj {traj_path} as raw {dt} mode={mode}, shape={traj.shape}")
-                return traj
-            except Exception:
-                pass
-
-    # Try direction-only
-    if n == expect_dirs:
-        for mode in ("spokes_3", "3_spokes"):
-            try:
-                d = as_dirs(data, mode)
-                # normalize direction cosines just in case
-                norms = np.linalg.norm(d, axis=1)
-                bad = norms == 0
-                if np.any(bad):
-                    raise ValueError("zero-norm direction found")
-                d = d / norms[:, None]
-                print(f"[info] Parsed traj {traj_path} as direction-only raw {dt} mode={mode}, shape={d.shape}")
-                # Caller will expand along RO using kmax model
-                return d  # (spokes,3)
-            except Exception:
-                pass
-
-    # If failed, print a quick diagnostic once (caller decides)
-    exp_bytes_full = expect_full * dt.itemsize
-    exp_bytes_dirs = expect_dirs * dt.itemsize
-    print(
-        f"[warn] Could not parse {traj_path} as raw traj with dt={dt}. "
-        f"bytes={nbytes}. Expected bytes: full={exp_bytes_full}, dirs={exp_bytes_dirs}",
-        file=sys.stderr,
-    )
-    return None
+def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.ndarray:
+    """
+    traj: (3, ro, nsp)
+    Expand along spoke axis to (3, ro, target_spokes) if divisible.
+    """
+    nsp = traj.shape[2]
+    if target_spokes == nsp:
+        return traj
+    if target_spokes % nsp != 0:
+        raise ValueError(f"Cannot expand traj spokes {nsp} to {target_spokes} (not divisible)")
+    reps = target_spokes // nsp
+    print(f"[info] Expanding traj spokes {nsp} -> {target_spokes} with reps={reps} using order='{order}'")
+    if order == "tile":
+        return np.tile(traj, (1, 1, reps))
+    if order == "repeat":
+        return np.repeat(traj, reps, axis=2)
+    raise ValueError(f"Unknown spoke-order: {order}")
 
 
 def load_traj_auto(
     series_path: Path,
+    method: Path,
+    acqp: Path,
     true_ro: int,
     spokes_all: int,
     NX: int,
@@ -532,11 +488,9 @@ def load_traj_auto(
     reverse_readout: bool,
     traj_source: str,
     traj_file: Optional[Path],
-    traj_dtype_flag: str,
-    traj_endian: str,
 ) -> Tuple[np.ndarray, str]:
     """
-    Return traj_full (3,RO,spokes) and a short string describing the source used.
+    Return traj_full (3,RO,spokes_all) and description string.
     """
 
     def _from_gradoutput() -> np.ndarray:
@@ -547,35 +501,23 @@ def load_traj_auto(
         dirs_full = expand_spoke_dirs(dirs, spokes_all, spoke_order)
         return build_traj_from_dirs(true_ro, dirs_full, NX, traj_scale, readout_origin, reverse_readout)
 
-    def _expand_dirs_to_traj(dirs_sp3: np.ndarray) -> np.ndarray:
-        s = _build_readout_s(true_ro, NX, traj_scale, readout_origin, reverse_readout)
-        traj = np.zeros((3, true_ro, spokes_all), dtype=np.complex64)
-        for i in range(spokes_all):
-            traj[0, :, i] = s * dirs_sp3[i, 0]
-            traj[1, :, i] = s * dirs_sp3[i, 1]
-            traj[2, :, i] = s * dirs_sp3[i, 2]
-        return traj
+    def _from_trajfile(p: Path) -> Tuple[np.ndarray, str]:
+        npro = infer_npro(method, acqp)
+        if npro is None:
+            raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
 
-    def _from_trajfile(p: Path) -> np.ndarray:
-        dt = _dtype_from_flag(traj_dtype_flag)
-        parsed = try_parse_bruker_traj_file(p, true_ro, spokes_all, dt, traj_endian)
-        if parsed is None:
-            raise RuntimeError(f"Failed to parse traj file: {p}")
-        # parsed may be full traj or direction-only
-        if parsed.ndim == 2 and parsed.shape == (spokes_all, 3):
-            return _expand_dirs_to_traj(parsed)
-        if parsed.ndim == 3 and parsed.shape == (3, true_ro, spokes_all):
-            return parsed
-        raise RuntimeError(f"Parsed traj has unexpected shape {parsed.shape} from {p}")
-
-    # Explicit override first
-    if traj_file is not None:
-        if not traj_file.exists():
-            raise RuntimeError(f"--traj-file does not exist: {traj_file}")
-        return _from_trajfile(traj_file), f"trajfile:{traj_file}"
+        traj = parse_trajfile_bruker_float32_npro_ro3(p, npro=npro, true_ro=true_ro, endian="<")
+        traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
+        return traj, f"trajfile:f4:(NPro={npro},RO={true_ro},3)"
 
     if traj_source == "gradoutput":
         return _from_gradoutput(), "gradoutput"
+
+    if traj_file is not None:
+        if not traj_file.exists():
+            raise RuntimeError(f"--traj-file does not exist: {traj_file}")
+        traj, mode = _from_trajfile(traj_file)
+        return traj, mode
 
     if traj_source in ("trajfile", "auto"):
         cands = find_traj_candidates(series_path)
@@ -585,10 +527,10 @@ def load_traj_auto(
         last_err = None
         for p in cands:
             try:
-                return _from_trajfile(p), f"trajfile:auto:{p}"
+                traj, mode = _from_trajfile(p)
+                return traj, mode
             except Exception as e:
                 last_err = e
-                continue
 
         if traj_source == "trajfile":
             raise RuntimeError(
@@ -596,7 +538,6 @@ def load_traj_auto(
                 f"Last error: {last_err}"
             )
 
-        # auto fallback
         return _from_gradoutput(), "gradoutput(fallback)"
 
     raise ValueError(f"Unknown traj-source: {traj_source}")
@@ -629,6 +570,8 @@ def write_qa_nifti(qa_frames: list[Path], qa_base: Path):
 
 def run_bart(
     series_path: Path,
+    method: Path,
+    acqp: Path,
     out_base: Path,
     NX: int, NY: int, NZ: int,
     true_ro: int,
@@ -645,13 +588,13 @@ def run_bart(
     reverse_readout: bool,
     traj_source: str,
     traj_file: Optional[Path],
-    traj_dtype_flag: str,
-    traj_endian: str,
 ):
     bart_bin = "bart"
 
     traj_full, traj_used = load_traj_auto(
         series_path=series_path,
+        method=method,
+        acqp=acqp,
         true_ro=true_ro,
         spokes_all=spokes_all,
         NX=NX,
@@ -661,8 +604,6 @@ def run_bart(
         reverse_readout=reverse_readout,
         traj_source=traj_source,
         traj_file=traj_file,
-        traj_dtype_flag=traj_dtype_flag,
-        traj_endian=traj_endian,
     )
     print(f"[info] Trajectory source used: {traj_used}")
 
@@ -708,8 +649,8 @@ def run_bart(
 
         print(f"[info] Frame {i} spokes [{start}:{stop}] (n={nsp})")
 
-        ksp_frame = ksp[:, start:stop, :]         # (ro, spokes, coils)
-        traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes)
+        ksp_frame = ksp[:, start:stop, :]          # (ro, spokes, coils)
+        traj_frame = traj_full[:, :, start:stop]   # (3, ro, spokes)
 
         # BART NUFFT expects k-space with RO in dim0 and spokes in dim1.
         # Put a singleton dim2 (slice) and coils in dim3:
@@ -731,8 +672,8 @@ def run_bart(
         subprocess.run(cmd2, check=True)
 
         if not first_dims_reported:
-            dims_ksp  = bart_image_dims(bart_bin, ksp_base)
             dims_traj = bart_image_dims(bart_bin, traj_base)
+            dims_ksp  = bart_image_dims(bart_bin, ksp_base)
             dims_coil = bart_image_dims(bart_bin, coil_base)
             dims_sos  = bart_image_dims(bart_bin, sos_base)
             if dims_traj is not None:
@@ -772,21 +713,17 @@ def run_bart(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Bruker 3D radial → BART NUFFT recon driver (grad.output or traj).",
+        description="Bruker 3D radial → BART NUFFT recon driver (grad.output or trajfile).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\
-            Example (known-good traj dataset):
-              python bruker_radial_bart.py \
-                --series /path/to/8 \
-                --traj-source trajfile \
-                --traj-dtype f4 --traj-endian '<' \
-                --export-nifti \
-                --out /path/to/outprefix
+            Examples:
 
-            If parsing fails, try:
-              --traj-dtype f8
-              --traj-endian '>'
+              Use trajectory file (Bruker writes <series>/traj):
+                python bruker_radial_bart.py --series /path/to/8 --traj-source trajfile --export-nifti --out /tmp/out
+
+              Use grad.output:
+                python bruker_radial_bart.py --series /path/to/29 --traj-source gradoutput --export-nifti --out /tmp/out
             """
         ),
     )
@@ -812,8 +749,6 @@ def main():
 
     ap.add_argument("--traj-source", choices=["auto", "trajfile", "gradoutput"], default="auto")
     ap.add_argument("--traj-file", default=None, help="Explicit traj file path (defaults to <series>/traj or pdata/**/traj)")
-    ap.add_argument("--traj-dtype", choices=["f4", "f8", "i4", "i2"], default="f4", help="Raw traj dtype for Bruker traj file")
-    ap.add_argument("--traj-endian", choices=["<", ">"], default="<", help="Raw traj endianness for Bruker traj file")
 
     ap.add_argument("--qa-first", type=int, default=0)
     ap.add_argument("--export-nifti", action="store_true")
@@ -870,6 +805,8 @@ def main():
 
     run_bart(
         series_path=series_path,
+        method=method,
+        acqp=acqp,
         out_base=out_base,
         NX=NX, NY=NY, NZ=NZ,
         true_ro=true_ro,
@@ -886,8 +823,6 @@ def main():
         reverse_readout=args.reverse_readout,
         traj_source=args.traj_source,
         traj_file=traj_file,
-        traj_dtype_flag=args.traj_dtype,
-        traj_endian=args.traj_endian,
     )
 
 
