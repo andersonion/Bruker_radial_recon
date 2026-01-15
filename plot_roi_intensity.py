@@ -530,11 +530,12 @@ def main():
         plt.axvline((segments_t[-1][0]) / x_scale, linestyle="--")  # img1->img2
 
     # slope debug overlays (img1->img2)
-    if data2 is not None and args.norm_method in ("slope", "both") and dbg is not None:
-        plt.plot(dbg["t1_tail"] / x_scale, dbg["y1_fit_tail"], linestyle="--")
-        plt.plot(dbg["t2_head"] / x_scale, dbg["L1_target"], linestyle="--")
-        plt.plot(dbg["t2_head"] / x_scale, dbg["L2_pre"], linestyle=":")
-        plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle=":")
+	if data2 is not None and args.norm_method in ("slope", "both") and dbg is not None:
+		# img1 tail fit (reference)
+		plt.plot(dbg["t1_tail"] / x_scale, dbg["y1_fit_tail"], linestyle="--", alpha=0.7)
+	
+		# img2 post-normalization fit ONLY (for continuity QA)
+		plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
 
     plt.xlabel(x_label)
     plt.ylabel("Mean ROI intensity")
