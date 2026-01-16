@@ -682,6 +682,28 @@ def run_bart(
     )
     print(f"[info] Trajectory source used: {traj_used}")
 
+    # --- If traj came from Bruker trajfile, auto-scale it into BART k-space units ---
+    # Bruker traj values (e.g., PVM_TrajK*) are typically not in BART's expected units.
+    # Empirically, BART NUFFT expects k-space coordinates roughly spanning [-NX/2, NX/2].
+    if traj_used.startswith("trajfile:") and (traj_scale is None):
+        k_mag = np.sqrt(
+            traj_full[0].real**2 +
+            traj_full[1].real**2 +
+            traj_full[2].real**2
+        )  # (RO, spokes)
+
+        kmax_curr = float(np.median(k_mag[-1, :]))
+        kmax_tgt = 0.5 * float(NX)
+
+        if not np.isfinite(kmax_curr) or kmax_curr <= 0:
+            raise RuntimeError(f"trajfile auto-scale failed: kmax_curr={kmax_curr}")
+
+        scale = kmax_tgt / kmax_curr
+        traj_full = traj_full * np.complex64(scale)
+
+        print(f"[info] trajfile auto-scale: kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt:.6g} (scale={scale:.6g})")
+
+
     have_gpu = False
     if use_gpu:
         have_gpu = bart_supports_gpu(bart_bin)
