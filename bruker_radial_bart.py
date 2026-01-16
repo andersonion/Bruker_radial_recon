@@ -630,7 +630,6 @@ def load_traj_auto(
         npro = infer_npro(method, acqp)
         if npro is None:
             raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
-    
         traj, tag = parse_trajfile_autoshape(p, npro=int(npro), ro=true_ro)  # (3, RO, NPro)
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
         return traj, f"trajfile_autoshape:{tag}:(NPro={npro},RO={true_ro},3)"
