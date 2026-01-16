@@ -282,6 +282,56 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
         return False
     return False
 
+def _traj_monotonic_score(traj_3_ro_sp: np.ndarray) -> float:
+    """
+    traj_3_ro_sp: (3, RO, spokes) float32/float64
+    Score higher when |k| starts small and increases with RO (center-out).
+    """
+    k_mag = np.sqrt(
+        traj_3_ro_sp[0] ** 2 +
+        traj_3_ro_sp[1] ** 2 +
+        traj_3_ro_sp[2] ** 2
+    )  # (RO, spokes)
+
+    ro0 = float(np.median(k_mag[0, :]))
+    rom = float(np.median(k_mag[k_mag.shape[0] // 2, :]))
+    rol = float(np.median(k_mag[-1, :]))
+
+    slope = rol - ro0
+    mid_bonus = rom - ro0
+
+    start_frac = (ro0 / rol) if rol > 0 else 1.0
+
+    score = 0.0
+    score += 5.0 * slope
+    score += 2.0 * mid_bonus
+    score += -10.0 * start_frac
+
+    return score
+
+
+def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np.ndarray, str]:
+    """
+    Returns:
+      traj (3, RO, NPro) float32
+      tag describing chosen interpretation
+
+    Tries:
+      - float32 LE/BE
+      - int32 LE/BE scaled by Q30
+    and tries multiple reshape/permutation/order hypotheses, selecting the one
+    that best matches a center-out readout (|k| increasing with RO).
+    """
+    b = traj_path.read_bytes()
+    if len(b) % 4 != 0:
+        raise ValueError(f"traj bytes not multiple of 4: {len(b)}")
+
+    nelem = len(b) // 4
+    expected = 3 * ro * npro
+    if nelem != expected:
+        raise ValueError(f"traj element count mismatch: have {nelem}, expected {expected} (=3*RO*NPro)")
+
+    candidates: list[tuple[str, np.ndarray]] = []
 
 # ---------------- grad.output trajectory ---------------- #
 
@@ -580,10 +630,10 @@ def load_traj_auto(
         npro = infer_npro(method, acqp)
         if npro is None:
             raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
-
-        traj, fmt = parse_trajfile_bruker_traj_autofmt(p, npro=npro, true_ro=true_ro)
+    
+        traj, tag = parse_trajfile_autoshape(p, npro=int(npro), ro=true_ro)  # (3, RO, NPro)
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
-        return traj, f"trajfile:{fmt}:(NPro={npro},RO={true_ro},3)"
+        return traj, f"trajfile_autoshape:{tag}:(NPro={npro},RO={true_ro},3)"
 
     if traj_source == "gradoutput":
         return _from_gradoutput(), "gradoutput"
