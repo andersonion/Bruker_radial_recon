@@ -682,6 +682,25 @@ def run_bart(
     )
     print(f"[info] Trajectory source used: {traj_used}")
 
+    # ---- TRAJ SANITY CHECKS ----
+    # traj_full shape: (3, RO, spokes)
+    k_mag = np.sqrt(
+        traj_full[0].real**2 +
+        traj_full[1].real**2 +
+        traj_full[2].real**2
+    )  # (RO, spokes)
+
+    ro0 = np.median(k_mag[0, :])
+    rom = np.median(k_mag[k_mag.shape[0] // 2, :])
+    rol = np.median(k_mag[-1, :])
+
+    # variation across spokes at the END of readout
+    end_spread = np.percentile(k_mag[-1, :], [5, 50, 95])
+
+    print(f"[debug] traj sanity |k| median at RO[0],RO[mid],RO[-1]: {ro0:.6g}, {rom:.6g}, {rol:.6g}")
+    print(f"[debug] traj sanity |k| at RO[-1] p5/p50/p95: {end_spread[0]:.6g}, {end_spread[1]:.6g}, {end_spread[2]:.6g}")
+
+
     # --- If traj came from Bruker trajfile, auto-scale it into BART k-space units ---
     # Bruker traj values (e.g., PVM_TrajK*) are typically not in BART's expected units.
     # Empirically, BART NUFFT expects k-space coordinates roughly spanning [-NX/2, NX/2].
