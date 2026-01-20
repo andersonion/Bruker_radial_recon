@@ -380,21 +380,24 @@ def _traj_radial_coordinate(traj: np.ndarray, *, mode: str = "end_minus_start") 
 
 
 def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
+    # k-based profile (roll-invariant)
+    k_mag = np.sqrt(
+        np.real(traj[0]) ** 2 +
+        np.real(traj[1]) ** 2 +
+        np.real(traj[2]) ** 2
+    ).astype(np.float64, copy=False)
+    k_ro_med = np.median(k_mag, axis=1)
+    imin = int(np.argmin(k_ro_med))
+
+    # r-based profile (depends on direction estimate)
     r = _traj_radial_coordinate(traj, mode="end_minus_start")
-
-    r0 = float(np.median(r[0, :]))
-    rm = float(np.median(r[r.shape[0] // 2, :]))
-    rL = float(np.median(r[-1, :]))
-
-    rmin = float(np.median(np.min(r, axis=0)))
-    rmax = float(np.median(np.max(r, axis=0)))
-
     r_ro_med = np.median(r, axis=1)
     iz = int(np.argmin(np.abs(r_ro_med)))
 
-    print(f"[debug] {label} radial median r at RO[0],RO[mid],RO[-1]: {r0:.6g}, {rm:.6g}, {rL:.6g}")
-    print(f"[debug] {label} per-spoke r range (median min, median max): {rmin:.6g}, {rmax:.6g}")
-    print(f"[debug] {label} median r over spokes: closest-to-0 at RO={iz} (r≈{r_ro_med[iz]:.6g})")
+    print(f"[debug] {label} |k| median at RO[0],RO[mid],RO[-1]: {k_ro_med[0]:.6g}, {k_ro_med[k_ro_med.shape[0]//2]:.6g}, {k_ro_med[-1]:.6g}")
+    print(f"[debug] {label} |k| median min at RO={imin} (|k|≈{k_ro_med[imin]:.6g})")
+    print(f"[debug] {label} r median closest-to-0 at RO={iz} (r≈{r_ro_med[iz]:.6g})")
+
 
 
 def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np.ndarray, str]:
@@ -672,31 +675,37 @@ def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.n
 
 def _maybe_recenter_readout_by_zero_crossing(traj: np.ndarray, *, label: str = "traj") -> tuple[np.ndarray, int]:
     """
-    For centered readouts (r spans negative to positive), circular-shift RO so that
-    the median radial coordinate is closest to 0 at RO[mid].
+    Recenter RO axis using |k| minimum, which is invariant to RO rolling and does not
+    depend on an endpoint-based direction estimate.
+
+    For centered readouts, |k| is minimized near the k≈0 sample.
+    We roll RO so that argmin(median_spokes(|k|)) lands at RO[mid].
 
     Returns (traj_out, shift_applied). shift_applied is roll shift on axis=1 (RO).
     """
-    r = _traj_radial_coordinate(traj, mode="end_minus_start")
-    r_ro_med = np.median(r, axis=1)
+    # |k| across RO/spokes
+    k_mag = np.sqrt(
+        np.real(traj[0]) ** 2 +
+        np.real(traj[1]) ** 2 +
+        np.real(traj[2]) ** 2
+    ).astype(np.float64, copy=False)  # (RO, spokes)
 
-    rmin = float(np.min(r_ro_med))
-    rmax = float(np.max(r_ro_med))
+    k_ro_med = np.median(k_mag, axis=1)  # (RO,)
+    imin = int(np.argmin(k_ro_med))
+    mid = int(k_ro_med.shape[0] // 2)
 
-    # Only attempt recentering if clearly centered (crosses 0)
-    if not (rmin < 0.0 < rmax):
+    # Decide if this looks "centered": min is not near an endpoint
+    # (heuristic, but good enough to prevent nonsense on center-out)
+    if imin < 0.1 * k_ro_med.shape[0] or imin > 0.9 * k_ro_med.shape[0]:
+        # likely center-out; don't roll to mid here
         return traj, 0
 
-    iz = int(np.argmin(np.abs(r_ro_med)))
-    mid = int(r_ro_med.shape[0] // 2)
-
-    # already centered
-    if iz == mid:
+    if imin == mid:
         return traj, 0
 
-    shift = mid - iz
+    shift = mid - imin
     traj2 = np.roll(traj, shift=shift, axis=1)
-    print(f"[info] {label}: centered readout; shifted RO axis by {shift} to place r≈0 at RO[mid]={mid}")
+    print(f"[info] {label}: centered readout; shifted RO axis by {shift} to place |k| min at RO[mid]={mid} (imin={imin})")
     return traj2, shift
 
 def _scale_traj_to_bart_pixels(traj: np.ndarray, NX: int, *, label: str = "traj") -> tuple[np.ndarray, float]:
