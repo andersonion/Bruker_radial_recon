@@ -717,9 +717,36 @@ def load_traj_auto(
         npro = infer_npro(method, acqp)
         if npro is None:
             raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
-        traj, tag = parse_trajfile_autoshape(p, npro=int(npro), ro=true_ro)  # (3, RO, NPro)
+
+        # Parse traj as (3, RO, NPro)
+        traj, fmt = parse_trajfile_bruker_traj_autofmt(p, npro=int(npro), true_ro=true_ro)
+
+        # ---- trajfile-specific sanity / fixing ----
+        # Bruker UTE traj is often center-out: |k|(RO=0) ~ 0 and increases with RO.
+        # If we see the opposite (center at the END), flip the RO axis.
+        k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)  # (RO, NPro)
+        ro0 = float(np.median(k_mag[0, :]))
+        rol = float(np.median(k_mag[-1, :]))
+        print(f"[debug] trajfile pre-fix |k| median RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
+
+        if rol < ro0:
+            traj = traj[:, ::-1, :].copy()
+            k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
+            ro0 = float(np.median(k_mag[0, :]))
+            rol = float(np.median(k_mag[-1, :]))
+            print(f"[info] trajfile: flipped readout axis so center is at RO[0]. Now RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
+
+        # Apply explicit reverse-readout flag for trajfile too
+        if reverse_readout:
+            traj = traj[:, ::-1, :].copy()
+            k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
+            ro0 = float(np.median(k_mag[0, :]))
+            rol = float(np.median(k_mag[-1, :]))
+            print(f"[info] trajfile: applied --reverse-readout. Now RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
+
+        # Expand spokes if acquisition has multiple volumes and traj is per-volume
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
-        return traj, f"trajfile_autoshape:{tag}:(NPro={npro},RO={true_ro},3)"
+        return traj, f"trajfile:{fmt}:(NPro={npro},RO={true_ro},3)"
 
     if traj_source == "gradoutput":
         return _from_gradoutput(), "gradoutput"
