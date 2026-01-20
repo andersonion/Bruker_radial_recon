@@ -319,7 +319,7 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
     Tries:
       - float32 LE/BE
       - int32 LE/BE scaled by Q30
-    and tries multiple reshape/permutation/order hypotheses, selecting the one
+    and multiple reshape/permutation/order hypotheses, selecting the one
     that best matches a center-out readout (|k| increasing with RO).
     """
     b = traj_path.read_bytes()
@@ -329,9 +329,96 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
     nelem = len(b) // 4
     expected = 3 * ro * npro
     if nelem != expected:
-        raise ValueError(f"traj element count mismatch: have {nelem}, expected {expected} (=3*RO*NPro)")
+        raise ValueError(
+            f"traj element count mismatch: have {nelem}, expected {expected} (=3*RO*NPro)"
+        )
 
     candidates: list[tuple[str, np.ndarray]] = []
+
+    # float32
+    candidates.append(("f4_le", np.frombuffer(b, dtype="<f4").astype(np.float32)))
+    candidates.append(("f4_be", np.frombuffer(b, dtype=">f4").astype(np.float32)))
+
+    # int32 Q30
+    candidates.append(("i4_le_q30", np.frombuffer(b, dtype="<i4").astype(np.float32) / float(1 << 30)))
+    candidates.append(("i4_be_q30", np.frombuffer(b, dtype=">i4").astype(np.float32) / float(1 << 30)))
+
+    shapes = [
+        ("3_ro_sp", (3, ro, npro)),
+        ("ro_3_sp", (ro, 3, npro)),
+        ("sp_ro_3", (npro, ro, 3)),
+        ("sp_3_ro", (npro, 3, ro)),
+        ("ro_sp_3", (ro, npro, 3)),
+        ("3_sp_ro", (3, npro, ro)),
+    ]
+    orders = ["C", "F"]
+
+    best_score: float | None = None
+    best_tag: str | None = None
+    best_traj: np.ndarray | None = None
+
+    for dtype_tag, v in candidates:
+        if not np.all(np.isfinite(v)):
+            continue
+
+        vmax = float(np.max(np.abs(v)))
+        if dtype_tag.startswith("f4") and vmax > 1e6:
+            continue
+
+        for shape_tag, shp in shapes:
+            for ord_tag in orders:
+                try:
+                    arr = v.reshape(shp, order=ord_tag)
+                except Exception:
+                    continue
+
+                if shape_tag == "3_ro_sp":
+                    traj = arr
+                elif shape_tag == "ro_3_sp":
+                    traj = np.transpose(arr, (1, 0, 2))
+                elif shape_tag == "sp_ro_3":
+                    traj = np.transpose(arr, (2, 1, 0))
+                elif shape_tag == "sp_3_ro":
+                    traj = np.transpose(arr, (1, 2, 0))
+                elif shape_tag == "ro_sp_3":
+                    traj = np.transpose(arr, (2, 0, 1))
+                elif shape_tag == "3_sp_ro":
+                    traj = np.transpose(arr, (0, 2, 1))
+                else:
+                    continue
+
+                score = _traj_monotonic_score(traj)
+
+                # Penalize if RO[0] is not near zero relative to RO[-1]
+                k_mag0 = np.sqrt(traj[0, 0, :] ** 2 + traj[1, 0, :] ** 2 + traj[2, 0, :] ** 2)
+                k_magl = np.sqrt(traj[0, -1, :] ** 2 + traj[1, -1, :] ** 2 + traj[2, -1, :] ** 2)
+                ro0_med = float(np.median(k_mag0))
+                rol_med = float(np.median(k_magl))
+                if rol_med > 0 and (ro0_med / rol_med) > 0.25:
+                    score -= 100.0
+
+                tag = f"{dtype_tag}:{shape_tag}:{ord_tag}"
+
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_tag = tag
+                    best_traj = traj
+
+    if best_traj is None or best_tag is None:
+        raise RuntimeError(f"Could not find any plausible traj reshape for {traj_path}")
+
+    k_mag = np.sqrt(best_traj[0] ** 2 + best_traj[1] ** 2 + best_traj[2] ** 2)
+    ro0 = float(np.median(k_mag[0, :]))
+    rom = float(np.median(k_mag[k_mag.shape[0] // 2, :]))
+    rol = float(np.median(k_mag[-1, :]))
+    end_spread = np.percentile(k_mag[-1, :], [5, 50, 95])
+
+    print(f"[info] traj autoshape chose {best_tag}")
+    print(f"[debug] traj sanity |k| median at RO[0],RO[mid],RO[-1]: {ro0:.6g}, {rom:.6g}, {rol:.6g}")
+    print(f"[debug] traj sanity |k| at RO[-1] p5/p50/p95: {end_spread[0]:.6g}, {end_spread[1]:.6g}, {end_spread[2]:.6g}")
+
+    return best_traj.astype(np.float32), best_tag
+
 
 # ---------------- grad.output trajectory ---------------- #
 
