@@ -349,26 +349,20 @@ def _traj_score(traj_3_ro_sp: np.ndarray) -> float:
 
 
 def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
-    """
-    traj: (3, RO, spokes) complex or real
-    Prints a radial coordinate profile using projection onto an estimated spoke direction.
-    Works for centered (negative->positive) and center-out (0->positive).
-    """
     tx = np.real(traj[0]).astype(np.float64, copy=False)
     ty = np.real(traj[1]).astype(np.float64, copy=False)
     tz = np.real(traj[2]).astype(np.float64, copy=False)
 
-    # Estimate direction per spoke from the last sample (largest magnitude typically)
-    dx = tx[-1, :]
-    dy = ty[-1, :]
-    dz = tz[-1, :]
+    # Use (end - start) direction per spoke (works for centered trajectories)
+    dx = tx[-1, :] - tx[0, :]
+    dy = ty[-1, :] - ty[0, :]
+    dz = tz[-1, :] - tz[0, :]
     dn = np.sqrt(dx * dx + dy * dy + dz * dz)
     dn[dn == 0] = 1.0
     dx /= dn
     dy /= dn
     dz /= dn
 
-    # Project trajectory onto direction -> scalar radial coordinate r(RO, spoke)
     r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
 
     r0 = float(np.median(r[0, :]))
@@ -378,15 +372,13 @@ def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
     rmin = float(np.median(np.min(r, axis=0)))
     rmax = float(np.median(np.max(r, axis=0)))
 
-    # Where does median r cross closest to 0?
     r_ro_med = np.median(r, axis=1)
     iz = int(np.argmin(np.abs(r_ro_med)))
 
     print(f"[debug] {label} radial median r at RO[0],RO[mid],RO[-1]: {r0:.6g}, {rm:.6g}, {rL:.6g}")
     print(f"[debug] {label} per-spoke r range (median min, median max): {rmin:.6g}, {rmax:.6g}")
     print(f"[debug] {label} median r over spokes: closest-to-0 at RO={iz} (r≈{r_ro_med[iz]:.6g})")
-
-
+	
 def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np.ndarray, str]:
     """
     Returns:
@@ -669,25 +661,15 @@ def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.n
 
 def _scale_traj_to_bart_pixels(traj: np.ndarray, NX: int, *, label: str = "traj") -> tuple[np.ndarray, float]:
     """
-    Scale trajectory so that median |r| at the last RO sample is ~ NX/2.
-    Uses radial projection (robust for centered trajectories).
+    Scale trajectory so that median |k| at the last RO sample is ~ NX/2.
+    This is robust and matches the usual BART "pixel" convention.
     """
     tx = np.real(traj[0]).astype(np.float64, copy=False)
     ty = np.real(traj[1]).astype(np.float64, copy=False)
     tz = np.real(traj[2]).astype(np.float64, copy=False)
 
-    # Direction estimate per spoke from last sample
-    dx = tx[-1, :]
-    dy = ty[-1, :]
-    dz = tz[-1, :]
-    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
-    dn[dn == 0] = 1.0
-    dx /= dn
-    dy /= dn
-    dz /= dn
-
-    r_end = tx[-1, :] * dx + ty[-1, :] * dy + tz[-1, :] * dz
-    kmax_curr = float(np.median(np.abs(r_end)))
+    k_end = np.sqrt(tx[-1, :] * tx[-1, :] + ty[-1, :] * ty[-1, :] + tz[-1, :] * tz[-1, :])
+    kmax_curr = float(np.median(k_end))
     kmax_tgt = 0.5 * float(NX)
 
     if kmax_curr <= 0:
@@ -781,9 +763,6 @@ def load_traj_auto(
         traj = np.asfortranarray(traj_real.astype(np.float32)).astype(np.complex64)
 
         traj_radial_profile_debug(traj, label="trajfile raw")
-
-        # If it is centered and 0-crossing is not at RO[0], optionally recenter
-        traj, _shift = _maybe_recenter_readout_by_zero_crossing(traj, label="trajfile")
 
         # Apply explicit reverse-readout flag (after any recentering)
         if reverse_readout:
