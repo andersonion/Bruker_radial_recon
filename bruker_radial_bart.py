@@ -504,8 +504,9 @@ def build_traj_from_dirs(
     reverse_readout: bool,
 ) -> np.ndarray:
     spokes = dirs_xyz.shape[0]
-    # BART NUFFT expects k in cycles/FOV units ~ [-0.5, 0.5]
-    kmax = 0.5
+
+    # Match trajfile scaling convention: kmax ~ NX/2
+    kmax = 0.5 * float(NX)
     if traj_scale is not None:
         kmax *= float(traj_scale)
 
@@ -761,23 +762,27 @@ def load_traj_auto(
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
 
         # ---- IMPORTANT: BART NUFFT trajectory scaling ----
-        # BART expects k in cycles/FOV (about [-0.5, 0.5], or [0, 0.5] for center-out).
-        # So the correct target kmax is 0.5, NOT NX/2.
-        #
+        # We want the trajectory expressed in the units BART's NUFFT expects.
+        # In practice, BART behaves like k is in "pixels" where kmax ~ NX/2
+        # (e.g., NX=100 -> target ~50). We scale trajfile accordingly.
+
         # Auto-scale based on the median radius at the last RO sample (robust for center-out).
         tx = np.real(traj[0])
         ty = np.real(traj[1])
         tz = np.real(traj[2])
         k_end = np.sqrt(tx[-1, :] * tx[-1, :] + ty[-1, :] * ty[-1, :] + tz[-1, :] * tz[-1, :])
         kmax_curr = float(np.median(k_end))
-        kmax_tgt = 0.5
+        kmax_tgt = 0.5 * float(NX)
 
         if kmax_curr > 0:
-            scale = kmax_tgt / kmax_curr
-            traj = (traj * scale).astype(np.complex64, copy=False)
-            print(f"[info] trajfile auto-scale (BART units): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt} (scale={scale:.6g})")
-        else:
-            print("[warn] trajfile auto-scale skipped: kmax_curr≈0", file=sys.stderr)
+            # Skip if already close (5% tolerance)
+            if abs(kmax_curr - kmax_tgt) / max(kmax_tgt, 1e-12) < 0.05:
+                print(f"[info] trajfile auto-scale skipped: already close (kmax_curr≈{kmax_curr:.6g})")
+            else:
+                scale = kmax_tgt / kmax_curr
+                traj = (traj * scale).astype(np.complex64, copy=False)
+                print(f"[info] trajfile auto-scale ((target NX/2)): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt} (scale={scale:.6g})")
+
 
         return traj, f"trajfile:{fmt}:(NPro={npro},RO={true_ro},3)"
 
@@ -896,32 +901,6 @@ def run_bart(
 
     print(f"[debug] traj sanity |k| median at RO[0],RO[mid],RO[-1]: {ro0:.6g}, {rom:.6g}, {rol:.6g}")
     print(f"[debug] traj sanity |k| at RO[-1] p5/p50/p95: {end_spread[0]:.6g}, {end_spread[1]:.6g}, {end_spread[2]:.6g}")
-
-
-    # ---- IMPORTANT: BART NUFFT trajectory scaling (global) ----
-    # BART expects k in cycles/FOV units ~ [-0.5, 0.5] (or [0, 0.5] for center-out).
-    # So the correct target kmax is 0.5, NOT NX/2.
-    #
-    # Also: do NOT double-scale. If already ~0.5, skip.
-    if traj_used.startswith("trajfile"):
-        tx = np.real(traj_full[0])
-        ty = np.real(traj_full[1])
-        tz = np.real(traj_full[2])
-
-        k_end = np.sqrt(tx[-1, :] * tx[-1, :] + ty[-1, :] * ty[-1, :] + tz[-1, :] * tz[-1, :])
-        kmax_curr = float(np.median(k_end))
-        kmax_tgt = 0.5
-
-        if kmax_curr > 0:
-            # If we're already basically at the BART target, don't rescale again.
-            if abs(kmax_curr - kmax_tgt) < 0.05:
-                print(f"[info] trajfile auto-scale skipped (already BART-scaled): kmax_curr≈{kmax_curr:.6g}")
-            else:
-                scale = kmax_tgt / kmax_curr
-                traj_full = (traj_full * scale).astype(np.complex64, copy=False)
-                print(f"[info] trajfile auto-scale (BART units): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt} (scale={scale:.6g})")
-        else:
-            print("[warn] trajfile auto-scale skipped: kmax_curr≈0", file=sys.stderr)
 
     have_gpu = False
     if use_gpu:
