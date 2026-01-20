@@ -15,14 +15,15 @@ Key points:
         ro_coils_spokes
   - Supports spoke expansion tile/repeat when spokes_all is a multiple of NPro or N_dirs
 
-Trajectory handling improvements vs your current version:
+Trajectory handling:
   - Adds float64 LE/BE trajectory parsing (MATLAB collaborator reads float64 ieee-le).
-  - Uses autoshape *including* f8/f4/i4 and multiple reshape+order hypotheses.
-  - Replaces misleading |k| "RO[0] should be ~0" logic with radial-projection diagnostics.
-  - Optionally recenters RO axis by circular shift so that the radial coordinate crosses 0 at RO[0]
-    (only when the profile is clearly centered and the zero-crossing is not already at RO[0]).
-  - Scales trajectory to BART "pixel" units so that median |r| at the readout end is ~ NX/2,
-    matching the common BART NUFFT expectation and your collaborator’s approach (traj * N).
+  - Uses autoshape including f8/f4/i4/i2 and multiple reshape+order hypotheses.
+  - Uses radial-projection diagnostics to understand centered vs center-out trajectories.
+  - Recenters RO axis:
+        * centered readout (r spans negative to positive): put r≈0 at RO[mid]
+        * center-out readout: put r≈0 at RO[0]
+  - Scales trajectory to BART "pixel" units so that kmax ~ NX/2.
+    Uses a range-based kmax that is robust for centered readouts.
 """
 
 import argparse
@@ -296,10 +297,8 @@ def bart_supports_gpu(bart_bin: str = "bart") -> bool:
 
 def _traj_monotonic_score_centered(traj_3_ro_sp: np.ndarray) -> float:
     """
-    Prefer centered readout: radial coordinate crosses 0 (negative->positive)
-    and per-RO |k| is smallest near the middle.
+    Prefer centered readout: |k| is smallest near the middle (weak heuristic).
     """
-    # Use |k| shape as a weak heuristic only
     k_mag = np.sqrt(
         traj_3_ro_sp[0] ** 2 +
         traj_3_ro_sp[1] ** 2 +
@@ -308,7 +307,6 @@ def _traj_monotonic_score_centered(traj_3_ro_sp: np.ndarray) -> float:
     k_ro_med = np.median(k_mag, axis=1)
     imin = int(np.argmin(k_ro_med))
     mid = k_ro_med.shape[0] // 2
-    # score higher if minimum is near mid
     return -abs(imin - mid)
 
 
@@ -340,7 +338,6 @@ def _traj_monotonic_score_centerout(traj_3_ro_sp: np.ndarray) -> float:
 def _traj_score(traj_3_ro_sp: np.ndarray) -> float:
     """
     Combined score that allows either centered or center-out.
-    We don't want to hard-assume center-out anymore.
     """
     return max(
         _traj_monotonic_score_centerout(traj_3_ro_sp),
@@ -349,11 +346,15 @@ def _traj_score(traj_3_ro_sp: np.ndarray) -> float:
 
 
 def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
+    """
+    Prints radial-coordinate diagnostics based on per-spoke direction (end-start),
+    robust for centered trajectories.
+    """
     tx = np.real(traj[0]).astype(np.float64, copy=False)
     ty = np.real(traj[1]).astype(np.float64, copy=False)
     tz = np.real(traj[2]).astype(np.float64, copy=False)
 
-    # Use (end - start) direction per spoke (works for centered trajectories)
+    # Direction from (end - start) per spoke (works for centered trajectories)
     dx = tx[-1, :] - tx[0, :]
     dy = ty[-1, :] - ty[0, :]
     dz = tz[-1, :] - tz[0, :]
@@ -378,7 +379,8 @@ def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
     print(f"[debug] {label} radial median r at RO[0],RO[mid],RO[-1]: {r0:.6g}, {rm:.6g}, {rL:.6g}")
     print(f"[debug] {label} per-spoke r range (median min, median max): {rmin:.6g}, {rmax:.6g}")
     print(f"[debug] {label} median r over spokes: closest-to-0 at RO={iz} (r≈{r_ro_med[iz]:.6g})")
-	
+
+
 def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np.ndarray, str]:
     """
     Returns:
@@ -399,7 +401,6 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
         raise ValueError(f"traj bytes not multiple of 2: {len(b)}")
 
     expected = 3 * ro * npro
-
     candidates: list[tuple[str, np.ndarray]] = []
 
     # float64
@@ -409,18 +410,16 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
             candidates.append(("f8_le", np.frombuffer(b, dtype="<f8").astype(np.float32)))
             candidates.append(("f8_be", np.frombuffer(b, dtype=">f8").astype(np.float32)))
 
-    # float32
+    # float32 / int32
     if len(b) % 4 == 0:
         nelem4 = len(b) // 4
         if nelem4 == expected:
             candidates.append(("f4_le", np.frombuffer(b, dtype="<f4").astype(np.float32)))
             candidates.append(("f4_be", np.frombuffer(b, dtype=">f4").astype(np.float32)))
-
-            # int32 Q30
             candidates.append(("i4_le_q30", np.frombuffer(b, dtype="<i4").astype(np.float32) / float(1 << 30)))
             candidates.append(("i4_be_q30", np.frombuffer(b, dtype=">i4").astype(np.float32) / float(1 << 30)))
 
-    # int16 Q15
+    # int16
     if len(b) % 2 == 0:
         nelem2 = len(b) // 2
         if nelem2 == expected:
@@ -453,7 +452,6 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
             continue
 
         vmax = float(np.max(np.abs(v)))
-        # reject completely absurd float candidates
         if dtype_tag.startswith(("f4", "f8")) and vmax > 1e9:
             continue
 
@@ -481,7 +479,6 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
 
                 score = _traj_score(traj)
 
-                # Mild penalty if everything is ~0
                 k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
                 if float(np.max(k_mag)) < 1e-6:
                     score -= 1e6
@@ -496,7 +493,6 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
     if best_traj is None or best_tag is None:
         raise RuntimeError(f"Could not find any plausible traj reshape for {traj_path}")
 
-    # Debug stats
     k_mag = np.sqrt(best_traj[0] ** 2 + best_traj[1] ** 2 + best_traj[2] ** 2)
     end_spread = np.percentile(k_mag[-1, :], [5, 50, 95])
 
@@ -591,7 +587,7 @@ def build_traj_from_dirs(
 ) -> np.ndarray:
     spokes = dirs_xyz.shape[0]
 
-    # BART "pixel" scaling: target kmax ~ NX/2 (centered)
+    # BART "pixel" scaling: target kmax ~ NX/2
     kmax = 0.5 * float(NX)
     if traj_scale is not None:
         kmax *= float(traj_scale)
@@ -659,17 +655,83 @@ def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.n
     raise ValueError(f"Unknown spoke-order: {order}")
 
 
-def _scale_traj_to_bart_pixels(traj: np.ndarray, NX: int, *, label: str = "traj") -> tuple[np.ndarray, float]:
+def _maybe_recenter_readout_by_zero_crossing(traj: np.ndarray, *, label: str = "traj") -> tuple[np.ndarray, int]:
     """
-    Scale trajectory so that median |k| at the last RO sample is ~ NX/2.
-    This is robust and matches the usual BART "pixel" convention.
+    Recenter RO axis based on where the radial coordinate r crosses ~0.
+
+    - If readout looks CENTERED (r spans negative to positive), we want r≈0 at RO[mid].
+    - If readout looks CENTER-OUT (r mostly >= 0), we want r≈0 at RO[0].
+
+    Returns (traj_out, shift_applied). shift_applied is the roll shift used (0 means no change).
     """
     tx = np.real(traj[0]).astype(np.float64, copy=False)
     ty = np.real(traj[1]).astype(np.float64, copy=False)
     tz = np.real(traj[2]).astype(np.float64, copy=False)
 
-    k_end = np.sqrt(tx[-1, :] * tx[-1, :] + ty[-1, :] * ty[-1, :] + tz[-1, :] * tz[-1, :])
-    kmax_curr = float(np.median(k_end))
+    # Direction estimate per spoke from (end - start); robust for centered readouts
+    dx = tx[-1, :] - tx[0, :]
+    dy = ty[-1, :] - ty[0, :]
+    dz = tz[-1, :] - tz[0, :]
+    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dn[dn == 0] = 1.0
+    dx /= dn
+    dy /= dn
+    dz /= dn
+
+    r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
+
+    rmin_med = float(np.median(np.min(r, axis=0)))
+    rmax_med = float(np.median(np.max(r, axis=0)))
+    centered = (rmin_med < 0.0) and (rmax_med > 0.0)
+
+    r_ro_med = np.median(r, axis=1)
+    iz = int(np.argmin(np.abs(r_ro_med)))
+
+    ro_mid = traj.shape[1] // 2
+    target = ro_mid if centered else 0
+
+    if iz == target:
+        return traj, 0
+
+    shift = target - iz
+    traj2 = np.roll(traj, shift=shift, axis=1)
+
+    if centered:
+        print(f"[info] {label}: centered readout; shifted RO axis by {shift} to place r≈0 at RO[mid]={ro_mid}")
+    else:
+        print(f"[info] {label}: center-out readout; shifted RO axis by {shift} to place r≈0 at RO[0]")
+
+    return traj2, shift
+
+
+def _scale_traj_to_bart_pixels(traj: np.ndarray, NX: int, *, label: str = "traj") -> tuple[np.ndarray, float]:
+    """
+    Scale trajectory to BART "pixel" units where kmax ~ NX/2.
+
+    For CENTERED readouts, using |k| at RO[-1] can be misleading.
+    Use a range-based kmax computed from the radial coordinate:
+
+        kmax_curr ≈ 0.5 * (median(r_max_per_spoke) - median(r_min_per_spoke))
+    """
+    tx = np.real(traj[0]).astype(np.float64, copy=False)
+    ty = np.real(traj[1]).astype(np.float64, copy=False)
+    tz = np.real(traj[2]).astype(np.float64, copy=False)
+
+    dx = tx[-1, :] - tx[0, :]
+    dy = ty[-1, :] - ty[0, :]
+    dz = tz[-1, :] - tz[0, :]
+    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dn[dn == 0] = 1.0
+    dx /= dn
+    dy /= dn
+    dz /= dn
+
+    r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
+
+    rmin_med = float(np.median(np.min(r, axis=0)))
+    rmax_med = float(np.median(np.max(r, axis=0)))
+    kmax_curr = 0.5 * (rmax_med - rmin_med)
+
     kmax_tgt = 0.5 * float(NX)
 
     if kmax_curr <= 0:
@@ -678,50 +740,8 @@ def _scale_traj_to_bart_pixels(traj: np.ndarray, NX: int, *, label: str = "traj"
 
     scale = kmax_tgt / kmax_curr
     traj2 = (traj * scale).astype(np.complex64, copy=False)
-    print(f"[info] {label} auto-scale (target NX/2): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt:.6g} (scale={scale:.6g})")
+    print(f"[info] {label} auto-scale (range-based): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt:.6g} (scale={scale:.6g})")
     return traj2, scale
-
-
-def _maybe_recenter_readout_by_zero_crossing(traj: np.ndarray, *, label: str = "traj") -> tuple[np.ndarray, int]:
-    """
-    If trajectory appears centered (r spans negative to positive), optionally circular-shift
-    RO axis so that median radial coordinate is closest to 0 at RO[0].
-
-    Returns (traj_out, shift_applied). shift_applied is the roll shift used (0 means no change).
-    """
-    tx = np.real(traj[0]).astype(np.float64, copy=False)
-    ty = np.real(traj[1]).astype(np.float64, copy=False)
-    tz = np.real(traj[2]).astype(np.float64, copy=False)
-
-    # Direction estimate per spoke from last sample
-    dx = tx[-1, :]
-    dy = ty[-1, :]
-    dz = tz[-1, :]
-    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
-    dn[dn == 0] = 1.0
-    dx /= dn
-    dy /= dn
-    dz /= dn
-
-    r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
-    r_ro_med = np.median(r, axis=1)
-
-    rmin = float(np.min(r_ro_med))
-    rmax = float(np.max(r_ro_med))
-
-    # Only attempt recentering if clearly centered (crosses 0)
-    if not (rmin < 0.0 < rmax):
-        return traj, 0
-
-    iz = int(np.argmin(np.abs(r_ro_med)))
-    if iz == 0:
-        return traj, 0
-
-    # Circular shift so iz -> 0
-    shift = -iz
-    traj2 = np.roll(traj, shift=shift, axis=1)
-    print(f"[info] {label}: circularly shifted RO axis by {shift} to place r≈0 at RO[0]")
-    return traj2, shift
 
 
 def load_traj_auto(
@@ -756,7 +776,6 @@ def load_traj_auto(
         if npro is None:
             raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
 
-        # Parse with autoshape (float64 included)
         traj_real, fmt = parse_trajfile_autoshape(p, npro=int(npro), ro=true_ro)
 
         # Convert to complex64 for BART compatibility (imaginary part = 0)
@@ -764,18 +783,24 @@ def load_traj_auto(
 
         traj_radial_profile_debug(traj, label="trajfile raw")
 
-        # Apply explicit reverse-readout flag (after any recentering)
+        # Apply explicit reverse-readout flag FIRST (it changes where r≈0 occurs)
         if reverse_readout:
             traj = traj[:, ::-1, :].copy()
             print("[info] trajfile: applied --reverse-readout")
+            traj_radial_profile_debug(traj, label="trajfile after_reverse")
+
+        # Recenter RO axis (centered -> RO[mid], center-out -> RO[0])
+        traj, shift = _maybe_recenter_readout_by_zero_crossing(traj, label="trajfile")
+        if shift != 0:
+            traj_radial_profile_debug(traj, label="trajfile after_recenter")
 
         # Expand spokes if traj is per-volume and k-space has multiple volumes
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
 
-        # Scale to BART pixel units (target ~ NX/2 at the end of readout)
+        # Scale to BART pixel units (target ~ NX/2)
         traj, _scale = _scale_traj_to_bart_pixels(traj, NX, label="trajfile")
 
-        # Optional extra user scale factor
+        # Optional extra user multiplier (applied AFTER pixel-scaling)
         if traj_scale is not None:
             traj = (traj * float(traj_scale)).astype(np.complex64, copy=False)
             print(f"[info] trajfile: applied --traj-scale multiplier {float(traj_scale):.6g}")
@@ -796,7 +821,9 @@ def load_traj_auto(
     if traj_source in ("trajfile", "auto"):
         cands = find_traj_candidates(series_path)
         if traj_source == "trajfile" and not cands:
-            raise RuntimeError(f"--traj-source trajfile requested, but no traj candidate found under {series_path} or pdata/*")
+            raise RuntimeError(
+                f"--traj-source trajfile requested, but no traj candidate found under {series_path} or pdata/*"
+            )
 
         last_err = None
         for p in cands:
@@ -881,7 +908,7 @@ def run_bart(
     )
     print(f"[info] Trajectory source used: {traj_used}")
 
-    # ---- TRAJ SANITY CHECKS ----
+    # Trajectory sanity checks (projection-based)
     traj_radial_profile_debug(traj_full, label="traj_full")
 
     have_gpu = False
