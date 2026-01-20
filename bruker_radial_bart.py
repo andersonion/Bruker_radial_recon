@@ -378,6 +378,7 @@ def _traj_radial_coordinate(traj: np.ndarray, *, mode: str = "end_minus_start") 
     r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
     return r
 
+
 def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
     r = _traj_radial_coordinate(traj, mode="end_minus_start")
 
@@ -689,7 +690,7 @@ def _maybe_recenter_readout_by_zero_crossing(traj: np.ndarray, *, label: str = "
     iz = int(np.argmin(np.abs(r_ro_med)))
     mid = int(r_ro_med.shape[0] // 2)
 
-    # If already basically centered, do nothing
+    # already centered
     if iz == mid:
         return traj, 0
 
