@@ -718,71 +718,67 @@ def load_traj_auto(
     def _from_trajfile(p: Path) -> Tuple[np.ndarray, str]:
         npro = infer_npro(method, acqp)
         if npro is None:
-            raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
+            raise RuntimeError(
+                "trajfile parsing requires NPro, but could not read ##$NPro from method/acqp."
+            )
 
-        # Parse traj as (3, RO, NPro)
-        traj, fmt = parse_trajfile_bruker_traj_autofmt(p, npro=int(npro), true_ro=true_ro)
+        # ------------------------------------------------------------
+        # Parse traj using autoshape logic (no assumptions about layout)
+        # ------------------------------------------------------------
+        traj_real, fmt = parse_trajfile_autoshape(
+            p,
+            npro=int(npro),
+            ro=true_ro,
+        )
 
-        # ---- trajfile-specific sanity / fixing ----
-        # NOTE: traj is complex64 (imag=0) because we store CFL that way.
-        # Always operate on the real part to avoid ComplexWarning.
-        tx = np.real(traj[0])
-        ty = np.real(traj[1])
-        tz = np.real(traj[2])
+        # Convert to complex64 for BART compatibility (imaginary part = 0)
+        traj = np.asfortranarray(traj_real.astype(np.float32)).astype(np.complex64)
 
-        k_mag = np.sqrt(tx * tx + ty * ty + tz * tz)  # (RO, NPro)
-        ro0 = float(np.median(k_mag[0, :]))
-        rol = float(np.median(k_mag[-1, :]))
-        print(f"[debug] trajfile pre-fix |k| median RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
+        # ------------------------------------------------------------
+        # Trajectory sanity check: |k| vs RO
+        # ------------------------------------------------------------
+        k_mag = np.sqrt(
+            traj[0].real ** 2 +
+            traj[1].real ** 2 +
+            traj[2].real ** 2
+        )  # (RO, NPro)
 
-        # For center-out, |k| should generally increase with RO.
-        # If it decreases, flip the readout axis.
-        if rol < ro0:
-            traj = traj[:, ::-1, :].copy()
-            tx = np.real(traj[0])
-            ty = np.real(traj[1])
-            tz = np.real(traj[2])
-            k_mag = np.sqrt(tx * tx + ty * ty + tz * tz)
-            ro0 = float(np.median(k_mag[0, :]))
-            rol = float(np.median(k_mag[-1, :]))
-            print(f"[info] trajfile: flipped readout axis so center is at RO[0]. Now RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
+        k_ro_med = np.median(k_mag, axis=1)
+        imin = int(np.argmin(k_ro_med))
 
-        # Apply explicit reverse-readout flag for trajfile too
+        print(
+            f"[debug] traj |k| median over spokes: "
+            f"min={k_ro_med[imin]:.6g} at RO={imin}, "
+            f"RO[0]={k_ro_med[0]:.6g}, "
+            f"RO[mid]={k_ro_med[len(k_ro_med)//2]:.6g}, "
+            f"RO[-1]={k_ro_med[-1]:.6g}"
+        )
+
+        # ------------------------------------------------------------
+        # If center is not at RO[0], shift readout (NOT scale!)
+        # ------------------------------------------------------------
+        if imin != 0:
+            traj = np.roll(traj, shift=-imin, axis=1)
+            print(
+                f"[info] trajfile: circularly shifted RO axis by {-imin} "
+                f"to place k≈0 at RO[0]"
+            )
+
+        # ------------------------------------------------------------
+        # Apply optional explicit reverse-readout flag
+        # ------------------------------------------------------------
         if reverse_readout:
             traj = traj[:, ::-1, :].copy()
-            tx = np.real(traj[0])
-            ty = np.real(traj[1])
-            tz = np.real(traj[2])
-            k_mag = np.sqrt(tx * tx + ty * ty + tz * tz)
-            ro0 = float(np.median(k_mag[0, :]))
-            rol = float(np.median(k_mag[-1, :]))
-            print(f"[info] trajfile: applied --reverse-readout. Now RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
+            print("[info] trajfile: applied --reverse-readout")
 
-        # Expand spokes if acquisition has multiple volumes and traj is per-volume
-        traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
-
-        # ---- IMPORTANT: BART NUFFT trajectory scaling ----
-        # We want the trajectory expressed in the units BART's NUFFT expects.
-        # In practice, BART behaves like k is in "pixels" where kmax ~ NX/2
-        # (e.g., NX=100 -> target ~50). We scale trajfile accordingly.
-
-        # Auto-scale based on the median radius at the last RO sample (robust for center-out).
-        tx = np.real(traj[0])
-        ty = np.real(traj[1])
-        tz = np.real(traj[2])
-        k_end = np.sqrt(tx[-1, :] * tx[-1, :] + ty[-1, :] * ty[-1, :] + tz[-1, :] * tz[-1, :])
-        kmax_curr = float(np.median(k_end))
-        kmax_tgt = 0.5 * float(NX)
-
-        if kmax_curr > 0:
-            # Skip if already close (5% tolerance)
-            if abs(kmax_curr - kmax_tgt) / max(kmax_tgt, 1e-12) < 0.05:
-                print(f"[info] trajfile auto-scale skipped: already close (kmax_curr≈{kmax_curr:.6g})")
-            else:
-                scale = kmax_tgt / kmax_curr
-                traj = (traj * scale).astype(np.complex64, copy=False)
-                print(f"[info] trajfile auto-scale ((target NX/2)): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt} (scale={scale:.6g})")
-
+        # ------------------------------------------------------------
+        # Expand spokes if traj is per-volume
+        # ------------------------------------------------------------
+        traj = expand_traj_spokes(
+            traj,
+            target_spokes=spokes_all,
+            order=spoke_order,
+        )
 
         return traj, f"trajfile:{fmt}:(NPro={npro},RO={true_ro},3)"
 
