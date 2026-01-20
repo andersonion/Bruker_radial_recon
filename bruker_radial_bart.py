@@ -506,7 +506,7 @@ def build_traj_from_dirs(
     spokes = dirs_xyz.shape[0]
     # BART NUFFT expects k in cycles/FOV units ~ [-0.5, 0.5]
     kmax = 0.5
-	if traj_scale is not None:
+    if traj_scale is not None:
         kmax *= float(traj_scale)
 
     if readout_origin == "zero":
