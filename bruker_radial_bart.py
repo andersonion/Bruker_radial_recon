@@ -344,20 +344,31 @@ def _traj_score(traj_3_ro_sp: np.ndarray) -> float:
         5.0 * _traj_monotonic_score_centered(traj_3_ro_sp),
     )
 
-
-def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
+def _traj_radial_coordinate(traj: np.ndarray, *, mode: str = "end_minus_start") -> np.ndarray:
     """
-    Prints radial-coordinate diagnostics based on per-spoke direction (end-start),
-    robust for centered trajectories.
+    Compute radial coordinate r(RO,spoke) by projecting k onto an estimated spoke direction.
+
+    mode:
+      - "end_minus_start": direction = traj[-1] - traj[0]   (robust for centered readouts)
+      - "end":            direction = traj[-1]             (ok for center-out)
+    Returns:
+      r: (RO, spokes) float64
     """
     tx = np.real(traj[0]).astype(np.float64, copy=False)
     ty = np.real(traj[1]).astype(np.float64, copy=False)
     tz = np.real(traj[2]).astype(np.float64, copy=False)
 
-    # Direction from (end - start) per spoke (works for centered trajectories)
-    dx = tx[-1, :] - tx[0, :]
-    dy = ty[-1, :] - ty[0, :]
-    dz = tz[-1, :] - tz[0, :]
+    if mode == "end_minus_start":
+        dx = tx[-1, :] - tx[0, :]
+        dy = ty[-1, :] - ty[0, :]
+        dz = tz[-1, :] - tz[0, :]
+    elif mode == "end":
+        dx = tx[-1, :]
+        dy = ty[-1, :]
+        dz = tz[-1, :]
+    else:
+        raise ValueError(f"Unknown mode={mode}")
+
     dn = np.sqrt(dx * dx + dy * dy + dz * dz)
     dn[dn == 0] = 1.0
     dx /= dn
@@ -365,6 +376,10 @@ def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
     dz /= dn
 
     r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
+    return r
+
+def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
+    r = _traj_radial_coordinate(traj, mode="end_minus_start")
 
     r0 = float(np.median(r[0, :]))
     rm = float(np.median(r[r.shape[0] // 2, :]))
@@ -654,55 +669,34 @@ def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.n
         return np.repeat(traj, reps, axis=2)
     raise ValueError(f"Unknown spoke-order: {order}")
 
-
 def _maybe_recenter_readout_by_zero_crossing(traj: np.ndarray, *, label: str = "traj") -> tuple[np.ndarray, int]:
     """
-    Recenter RO axis based on where the radial coordinate r crosses ~0.
+    For centered readouts (r spans negative to positive), circular-shift RO so that
+    the median radial coordinate is closest to 0 at RO[mid].
 
-    - If readout looks CENTERED (r spans negative to positive), we want r≈0 at RO[mid].
-    - If readout looks CENTER-OUT (r mostly >= 0), we want r≈0 at RO[0].
-
-    Returns (traj_out, shift_applied). shift_applied is the roll shift used (0 means no change).
+    Returns (traj_out, shift_applied). shift_applied is roll shift on axis=1 (RO).
     """
-    tx = np.real(traj[0]).astype(np.float64, copy=False)
-    ty = np.real(traj[1]).astype(np.float64, copy=False)
-    tz = np.real(traj[2]).astype(np.float64, copy=False)
-
-    # Direction estimate per spoke from (end - start); robust for centered readouts
-    dx = tx[-1, :] - tx[0, :]
-    dy = ty[-1, :] - ty[0, :]
-    dz = tz[-1, :] - tz[0, :]
-    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
-    dn[dn == 0] = 1.0
-    dx /= dn
-    dy /= dn
-    dz /= dn
-
-    r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
-
-    rmin_med = float(np.median(np.min(r, axis=0)))
-    rmax_med = float(np.median(np.max(r, axis=0)))
-    centered = (rmin_med < 0.0) and (rmax_med > 0.0)
-
+    r = _traj_radial_coordinate(traj, mode="end_minus_start")
     r_ro_med = np.median(r, axis=1)
-    iz = int(np.argmin(np.abs(r_ro_med)))
 
-    ro_mid = traj.shape[1] // 2
-    target = ro_mid if centered else 0
+    rmin = float(np.min(r_ro_med))
+    rmax = float(np.max(r_ro_med))
 
-    if iz == target:
+    # Only attempt recentering if clearly centered (crosses 0)
+    if not (rmin < 0.0 < rmax):
         return traj, 0
 
-    shift = target - iz
+    iz = int(np.argmin(np.abs(r_ro_med)))
+    mid = int(r_ro_med.shape[0] // 2)
+
+    # If already basically centered, do nothing
+    if iz == mid:
+        return traj, 0
+
+    shift = mid - iz
     traj2 = np.roll(traj, shift=shift, axis=1)
-
-    if centered:
-        print(f"[info] {label}: centered readout; shifted RO axis by {shift} to place r≈0 at RO[mid]={ro_mid}")
-    else:
-        print(f"[info] {label}: center-out readout; shifted RO axis by {shift} to place r≈0 at RO[0]")
-
+    print(f"[info] {label}: centered readout; shifted RO axis by {shift} to place r≈0 at RO[mid]={mid}")
     return traj2, shift
-
 
 def _scale_traj_to_bart_pixels(traj: np.ndarray, NX: int, *, label: str = "traj") -> tuple[np.ndarray, float]:
     """
