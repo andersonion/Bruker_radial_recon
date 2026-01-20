@@ -858,17 +858,19 @@ def load_traj_auto(
             traj_radial_profile_debug(traj, label="trajfile after_reverse")
 
         # ---------------------------------------------
-        # Robust RO recentering using |k| minimum
+        # Robust RO recentering + per-spoke de-offset
         # ---------------------------------------------
+
+        # 1) Roll RO so GLOBAL median(|k|) minimum is at RO[mid] (centered readout)
         k_mag = np.sqrt(
             np.real(traj[0]) ** 2 +
             np.real(traj[1]) ** 2 +
             np.real(traj[2]) ** 2
-        ).astype(np.float64, copy=False)   # (RO, spokes)
+        ).astype(np.float64, copy=False)  # (RO, spokes)
 
         k_ro_med = np.median(k_mag, axis=1)  # (RO,)
         imin = int(np.argmin(k_ro_med))
-        mid = k_ro_med.shape[0] // 2
+        mid = int(k_ro_med.shape[0] // 2)
 
         if 0.1 * k_ro_med.shape[0] < imin < 0.9 * k_ro_med.shape[0]:
             shift = mid - imin
@@ -876,14 +878,39 @@ def load_traj_auto(
                 traj = np.roll(traj, shift=shift, axis=1)
                 print(
                     f"[info] trajfile: centered readout; shifted RO axis by {shift} "
-                    f"to place |k| min at RO[mid]={mid} (imin={imin})"
+                    f"to place |k| med-min at RO[mid]={mid} (imin={imin})"
                 )
-                traj_radial_profile_debug(traj, label="trajfile after_recenter_kmin")
         else:
             print(
                 f"[info] trajfile: center-out readout detected "
-                f"(|k| min at RO={imin}); no RO recentering applied"
+                f"(|k| med-min at RO={imin}); leaving RO axis unrolled"
             )
+
+        traj_radial_profile_debug(traj, label="trajfile after_recenter_kmin")
+
+        # 2) Per-spoke de-offset: force each spoke to pass through k=0
+        #    Find, for each spoke, the RO index where |k| is minimal, then subtract that k-vector.
+        k_mag2 = np.sqrt(
+            np.real(traj[0]) ** 2 +
+            np.real(traj[1]) ** 2 +
+            np.real(traj[2]) ** 2
+        ).astype(np.float64, copy=False)  # (RO, spokes)
+
+        i0 = np.argmin(k_mag2, axis=0).astype(np.int64)  # (spokes,)
+
+        # Gather k0 per spoke: shape (3, spokes)
+        spoke_idx = np.arange(traj.shape[2], dtype=np.int64)
+        k0 = traj[:, i0, spoke_idx]  # (3, spokes)
+
+        # Subtract k0 from all RO samples for each spoke
+        traj = traj - k0[:, None, :]
+
+        # Optional: if you want a *global* de-offset instead, you could do:
+        # k0_global = np.median(k0, axis=1, keepdims=True)  # (3,1)
+        # traj = traj - k0_global[:, None, :]
+
+        traj_radial_profile_debug(traj, label="trajfile after_spoke_deoffset")
+
 
         # Expand spokes if traj is per-volume and k-space has multiple volumes
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
