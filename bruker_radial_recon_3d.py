@@ -1,796 +1,1133 @@
 #!/usr/bin/env python3
-# Bruker 3D radial recon — v4.7 (production auto-cal + ring control)
-# Deps: pip install sigpy nibabel numpy pillow
-# New flags:
-#   --prod (coarse 64³ auto-delay+auto-scale, then final recon at --matrix)
-#   --gpu-psf (use GPU for PSF during auto-* searches)
-#   --demean-spoke (subtract per-spoke DC)
-#   --clip-pi (clip |k| to <= π)
-#   --apod {none,hann,tukey,kaiser,gauss}, with --tukey-alpha/--kaiser-beta/--gauss-sigma
+"""
+Bruker 3D radial -> BART NUFFT recon driver.
 
-from __future__ import annotations
-import argparse, os, re, json
+Key points:
+  - For BART NUFFT, k-space must be written as (1, RO, spokes, coils)
+    (BART asserts ksp_dims[0] == 1).
+  - Supports trajectory from:
+        * traj file (Bruker writes <series>/traj)  --traj-source trajfile
+        * grad.output directions                   --traj-source gradoutput
+        * auto (prefer traj if parsable else grad) --traj-source auto
+  - Supports FID dtypes i2/i4/f4 and endianness
+  - Supports FID layouts:
+        ro_spokes_coils (default)
+        ro_coils_spokes
+  - Supports spoke expansion tile/repeat when spokes_all is a multiple of NPro or N_dirs
+
+Trajectory handling:
+  - Adds float64 LE/BE trajectory parsing (MATLAB collaborator reads float64 ieee-le).
+  - Uses autoshape including f8/f4/i4/i2 and multiple reshape+order hypotheses.
+  - Uses radial-projection diagnostics to understand centered vs center-out trajectories.
+  - Recenters RO axis:
+        * centered readout (r spans negative to positive): put r≈0 at RO[mid]
+        * center-out readout: put r≈0 at RO[0]
+  - Scales trajectory to BART "pixel" units so that kmax ~ NX/2.
+    Uses a range-based kmax that is robust for centered readouts.
+"""
+
+import argparse
+import sys
+import subprocess
+import textwrap
+import re
 from pathlib import Path
+from typing import Optional, Tuple, List
+
 import numpy as np
 import nibabel as nib
-import sigpy as sp
-import sigpy.mri as mr
-from PIL import Image, ImageDraw, ImageFont
 
-try:
-    import cupy as cp
-except Exception:
-    cp = None
 
-# ---------------- JCAMP parsing ----------------
-def _parse_jcamp(path: Path) -> dict:
-    d, key = {}, None
+# ---------------- Bruker helpers ---------------- #
+
+def read_bruker_param(path: Path, key: str, default=None):
     if not path.exists():
-        return d
-    with path.open("r", errors="ignore") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("$$"):
-                continue
-            if s.startswith("##$") and "=" in s:
-                key, val = s[3:].split("=", 1)
-                d[key.strip()] = val.strip()
-            elif key:
-                d[key] += " " + s
-    return d
+        return default
 
-_num_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
-def _nums(s: str) -> list[float]:
-    if not s: return []
-    out = []
-    for v in _num_re.findall(s):
-        if "." in v or "e" in v.lower():
-            out.append(float(v))
-        else:
-            try: out.append(int(v))
-            except ValueError: out.append(float(v))
-    return out
-
-def _get_int(d: dict, key: str, default=0) -> int:
+    token = f"##${key}="
     try:
-        v = _nums(d.get(key, ""))
-        return int(v[0]) if v else default
+        lines = path.read_text(errors="ignore").splitlines()
     except Exception:
         return default
 
-def _get_fov_mm(acqp: dict, method: dict):
-    for k,scale in (("PVM_Fov",1.0),("ACQ_fov_mm",1.0),("ACQ_fov_cm",10.0),("ACQ_fov",10.0)):
-        if k in method or k in acqp:
-            src = method if k in method else acqp
-            v = np.array(_nums(src[k]), float)
-            if v.size == 2: v = np.array([v[0], v[1], v[1]], float)
-            if v.size >= 3:
-                v = v[:3] * scale
-                return v
-    return None
-
-# ---------------- Bruker loader ----------------
-def load_bruker_series(series_dir: str):
-    series = Path(series_dir)
-    acqp   = _parse_jcamp(series / "acqp")
-    method = _parse_jcamp(series / "method")
-    visu   = _parse_jcamp(series / "visu_pars")
-
-    dim = int((_nums(acqp.get("ACQ_dim", "")) or [3])[0])
-    if dim != 3:
-        raise RuntimeError(f"ACQ_dim={dim} (expected 3 for 3D)")
-
-    acq_size = _nums(acqp.get("ACQ_size", ""))
-    nspokes_hint = int(acq_size[1]) if len(acq_size) > 1 else None
-
-    rec_sel = (acqp.get("ACQ_ReceiverSelect", "") or "").lower().split()
-    ncoils = rec_sel.count("yes") or _get_int(method, "PVM_EncNReceivers", 1) or 1
-
-    fid_path = series / "fid"
-    if not fid_path.exists():
-        raise RuntimeError(f"Missing FID: {fid_path}")
-
-    fmt  = (acqp.get("GO_raw_data_format") or method.get("GO_raw_data_format") or "GO_32BIT_SGN_INT").strip()
-    byto = (acqp.get("BYTORDA") or method.get("BYTORDA") or "little").strip().lower()
-    endian = "<" if ("little" in byto or "lsb" in byto) else ">"
-
-    dt_map = {"GO_16BIT_SGN_INT": np.int16, "GO_32BIT_SGN_INT": np.int32, "GO_32BIT_FLOAT": np.float32}
-    base = dt_map.get(fmt, np.int32)
-    raw  = np.fromfile(fid_path, dtype=endian + np.dtype(base).str[1:])
-    if raw.size % 2 != 0:
-        raise RuntimeError("Raw FID length is odd; expected interleaved real/imag pairs.")
-    ri = raw.reshape(-1, 2).astype(np.float32)
-    data = ri[:, 0] + 1j * ri[:, 1]
-
-    # Infer nread
-    complex_samples = data.size
-    nread = None
-    td = _get_int(acqp, "TD", 0)
-    for cand in [td, td // 2]:
-        if cand and cand > 8 and (complex_samples % cand == 0):
-            nread = cand; break
-    if nread is None and nspokes_hint and ncoils:
-        NR, NECHOES, NA, NI = (_get_int(acqp, k, 1) or 1 for k in ("NR","NECHOES","NA","NI"))
-        denom = nspokes_hint * ncoils * max(1, NR) * max(1, NECHOES) * max(1, NA) * max(1, NI)
-        if denom > 0 and complex_samples % denom == 0:
-            cand = complex_samples // denom
-            if 8 < cand < 8192: nread = int(cand)
-    if nread is None:
-        for cand in (128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024):
-            if complex_samples % cand == 0:
-                nread = cand; break
-    if nread is None:
-        raise RuntimeError("Failed to infer nread.")
-
-    # Shape (nread, nspokes, ncoils)
-    vecs = data.reshape(-1, nread)
-    total_vecs = vecs.shape[0]
-    if total_vecs % ncoils != 0:
-        raise RuntimeError(f"Vector count {total_vecs} not divisible by ncoils={ncoils}")
-    per_coil = total_vecs // ncoils
-    nspokes  = per_coil
-    if nspokes_hint and nspokes_hint != nspokes:
-        print(f"[warn] ACQ_size hinted nspokes={nspokes_hint}, inferred from FID={nspokes}.")
-
-    arr   = vecs.reshape(ncoils, nspokes, nread)
-    kdata = np.transpose(arr, (2, 1, 0)).astype(np.complex64)
-
-    SW_h  = float((_nums(acqp.get("SW_h", "0")) or [0])[0])
-    vox   = np.array(_nums(visu.get("VisuCoreVoxelSize", "")) or [1,1,1], dtype=float)
-    fovmm = _get_fov_mm(acqp, method)
-
-    meta = dict(nread=nread, nspokes=nspokes, ncoils=ncoils, SW_h=SW_h, vox=vox, fovmm=fovmm)
-    return kdata, meta, dict(acqp=acqp, method=method, visu=visu)
-
-# -------------- Trajectory (GA fallback) --------------
-def make_ga_traj_3d(nspokes: int, nread: int) -> np.ndarray:
-    i = np.arange(nspokes, dtype=np.float64) + 0.5
-    phi = (1 + np.sqrt(5)) / 2
-    z = 1.0 - 2.0 * i / (nspokes + 1.0)
-    r = np.sqrt(np.maximum(0.0, 1.0 - z*z))
-    theta = 2.0 * np.pi * i / (phi ** 2)
-    dirs = np.stack([r*np.cos(theta), r*np.sin(theta), z], axis=1)
-    kmax = np.pi
-    t = np.linspace(-1.0, 1.0, nread, endpoint=False, dtype=np.float64)
-    ktraj = (kmax * t)[:, None, None] * dirs[None, :, :]
-    return ktraj.reshape(-1, 3).astype(np.float32)
-
-# ---- External 'traj' loader ----
-def _read_txt_array(path: Path) -> np.ndarray:
-    rows = []
-    with path.open("r", errors="ignore") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#") or s.startswith("//"): continue
-            parts = re.split(r"[,\s]+", s)
-            try:
-                row = [float(p) for p in parts if p != ""]
-                if row: rows.append(row)
-            except ValueError:
-                continue
-    return np.array(rows, dtype=np.float64) if rows else np.empty((0,))
-
-def _scale_to_radians(k: np.ndarray, img_shape_xyz, fov_mm_xyz, vox_xyz):
-    if k.size == 0: return k
-    Nx, Ny, Nz = img_shape_xyz
-    if fov_mm_xyz is not None:
-        dxi = np.array([fov_mm_xyz[0]/Nx, fov_mm_xyz[1]/Ny, fov_mm_xyz[2]/Nz], float)
-    else:
-        dxi = np.array(vox_xyz if vox_xyz is not None else [1,1,1], float)
-    k = np.asarray(k, float)
-    kabs = np.percentile(np.linalg.norm(k, axis=1), 99.0)
-    if kabs <= 1.2:      # cycles/FOV
-        return k * (2*np.pi)
-    elif kabs <= 4.2:    # already radians/pixel
-        return k
-    else:                # 1/mm or 1/m
-        scale_unit = 1.0 if kabs < 1000 else (1/1000.0)
-        return (k * scale_unit) * (2*np.pi) * dxi
-
-def load_series_traj(series_dir: str, nread: int, nspokes: int,
-                     img_shape_xyz, fov_mm, vox_xyz, traj_order: str):
-    p = Path(series_dir) / "traj"
-    if not p.exists():
-        return None
-    M = nread * nspokes
-    arr = _read_txt_array(p)
-    def maybe_reorder(A):
-        if traj_order == "sample": return A
-        try:
-            return A.reshape(nspokes, nread, 3).transpose(1,0,2).reshape(M,3)
-        except Exception:
-            return A
-    if arr.ndim == 2 and arr.size > 0:
-        if arr.shape[0] == M and arr.shape[1] >= 3:
-            k = maybe_reorder(arr[:, :3])
-            return _scale_to_radians(k, img_shape_xyz, fov_mm, vox_xyz).astype(np.float32)
-        if arr.shape[0] == nspokes and arr.shape[1] >= 3:
-            dirs = arr[:, :3]
-            kmax = np.pi; t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
-            k = (kmax * t)[:, None] * dirs[None, :, :]
-            return k.reshape(-1, 3).astype(np.float32)
-        if arr.shape[0] == nspokes and arr.shape[1] == 2:
-            th, ph = arr[:,0], arr[:,1]
-            dirs = np.stack([np.sin(ph)*np.cos(th), np.sin(ph)*np.sin(th), np.cos(ph)], axis=1)
-            kmax = np.pi; t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
-            k = (kmax * t)[:, None] * dirs[None, :, :]
-            return k.reshape(-1, 3).astype(np.float32)
-    for dtype in (np.float32, np.float64):
-        try:
-            flat = np.fromfile(p, dtype=dtype)
-        except Exception:
+    for i, line in enumerate(lines):
+        if not line.startswith(token):
             continue
-        if flat.size == M * 3:
-            k = maybe_reorder(flat.reshape(M, 3).astype(np.float64))
-            return _scale_to_radians(k, img_shape_xyz, fov_mm, vox_xyz).astype(np.float32)
-        if flat.size == nspokes * 3:
-            dirs = flat.reshape(nspokes, 3).astype(np.float64)
-            kmax = np.pi; t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
-            k = (kmax * t)[:, None] * dirs[None, :, :]
-            return k.reshape(-1, 3).astype(np.float32)
-        if flat.size == nspokes * 2:
-            ang = flat.reshape(nspokes, 2).astype(np.float64)
-            th, ph = ang[:,0], ang[:,1]
-            dirs = np.stack([np.sin(ph)*np.cos(th), np.sin(ph)*np.sin(th), np.cos(ph)], axis=1)
-            kmax = np.pi; t = np.linspace(-1.0, 1.0, nread, endpoint=False)[:, None]
-            k = (kmax * t)[:, None] * dirs[None, :, :]
-            return k.reshape(-1, 3).astype(np.float32)
-    print("[warn] Could not parse 'traj'; using golden-angle fallback.")
-    return None
+
+        rhs = line.split("=", 1)[1].strip()
+
+        if rhs.startswith("("):  # multiline array
+            vals = []
+            j = i + 1
+            while j < len(lines):
+                l2 = lines[j].strip()
+                if l2.startswith("##"):
+                    break
+                if l2 and not l2.startswith("$$"):
+                    vals.extend(l2.split())
+                j += 1
+
+            out = []
+            for v in vals:
+                try:
+                    out.append(float(v) if "." in v or "e" in v.lower() else int(v))
+                except ValueError:
+                    out.append(v)
+            return out[0] if len(out) == 1 else out
+
+        rhs = rhs.strip("()")
+        toks = rhs.split()
+        out = []
+        for v in toks:
+            try:
+                out.append(float(v) if "." in v or "e" in v.lower() else int(v))
+            except ValueError:
+                out.append(v)
+        return out[0] if len(out) == 1 else out
+
+    return default
 
 
-def equalize_k_sphere(coords, pct=95.0, strength=1.0):
-    """
-    Make the k-space cloud more spherical by 'whitening' its covariance.
+def infer_matrix(method: Path):
+    mat = read_bruker_param(method, "PVM_Matrix", None)
+    if mat is None or isinstance(mat, (int, float)) or len(mat) != 3:
+        raise ValueError(f"Could not infer PVM_Matrix (got {mat})")
+    return tuple(map(int, mat))
 
-    - pct:    Ignore the largest |k| outliers above this percentile when
-              estimating the covariance (robustness).
-    - strength in [0, 1]: 0 = no change, 1 = full whitening; values like
-              0.3–0.6 are usually safe for production.
 
-    Returns coords' with the same shape/dtype as input.
-    """
-    k = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
+def infer_true_ro(acqp: Path) -> int:
+    v = read_bruker_param(acqp, "ACQ_size", None)
+    if v is None:
+        raise ValueError("Could not infer ACQ_size")
+    return int(v if isinstance(v, (int, float)) else v[0])
 
-    # Robust subset for statistics
-    r = np.linalg.norm(k, axis=1)
-    cutoff = np.percentile(r, pct)
-    mask = r <= cutoff
-    if mask.sum() < 64:    # guard for very small subsets
-        mask[:] = True
 
-    # Whiten: A = Σ^{-1/2}
-    C = np.cov(k[mask].T)
-    w, V = np.linalg.eigh(C)
-    w = np.maximum(w, 1e-12)                      # numerical safety
-    A = V @ np.diag(1.0 / np.sqrt(w)) @ V.T       # Σ^{-1/2}
+def infer_coils(method: Path) -> int:
+    v = read_bruker_param(method, "PVM_EncNReceivers", 1)
+    return int(v if not isinstance(v, (list, tuple)) else v[0])
 
-    k_eq = (k @ A.T)
 
-    if 0.0 < strength < 1.0:
-        k_out = k + strength * (k_eq - k)
-    elif strength >= 1.0:
-        k_out = k_eq
-    else:
-        k_out = k
-
-    return k_out.astype(coords.dtype, copy=False).reshape(coords.shape)
-
-# ---------------- NUFFT helpers ----------------
-def compute_dcf(coords: np.ndarray, mode: str = "pipe", os: float = 1.75, width: int = 4):
-    if mode == "none":
+def infer_npro(method: Path, acqp: Path) -> Optional[int]:
+    v = read_bruker_param(method, "NPro", None)
+    if v is None:
+        v = read_bruker_param(acqp, "NPro", None)
+    if v is None:
         return None
-    dcf = None
+    if isinstance(v, (list, tuple)):
+        return int(v[0])
     try:
-        if hasattr(mr.dcf, "pipe_menon"):
-            dcf = mr.dcf.pipe_menon(coords, niter=30, os=os, width=width)
-        elif hasattr(mr.dcf, "pipe_menon_dcf"):
-            dcf = mr.dcf.pipe_menon_dcf(coords, max_iter=30, os=os, width=width)
+        return int(v)
     except Exception:
-        dcf = None
-    if dcf is None:
-        r = np.linalg.norm(coords, axis=1)
-        dcf = (r**2 + 1e-6)
-    dcf = dcf.astype(np.float32, copy=False)
-    dcf *= (dcf.size / (dcf.sum() + 1e-8))
-    return dcf
+        return None
 
-def apply_read_shift(coords: np.ndarray, nread: int, nspokes: int, shift_samples: float):
-    if abs(shift_samples) < 1e-12: return coords
-    delta = float(shift_samples) * (2*np.pi / float(nread))
-    uvw = coords.reshape(nread, nspokes, 3)
-    dirs = uvw[-1,:,:] - uvw[0,:,:]
-    norm = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
-    dirs = dirs / norm
-    uvw = uvw + delta * dirs[None, :, :]
-    return uvw.reshape(-1, 3)
 
-def psf_volume(coords: np.ndarray, img_shape_zyx: tuple[int,int,int], os_fac=1.75, width=4, gpu=-1):
-    if gpu >= 0 and cp is not None:
-        with sp.Device(gpu):
-            ones = cp.ones(coords.shape[0], dtype=cp.complex64)
-            coords_g = cp.asarray(coords, dtype=cp.float32)
-            psf = sp.nufft_adjoint(ones, coords_g, oshape=img_shape_zyx, oversamp=os_fac, width=width)
-            psf = cp.abs(psf); psf /= cp.max(psf) + 1e-12
-            return cp.asnumpy(psf)
-    ones = np.ones(coords.shape[0], np.complex64)
-    psf = sp.nufft_adjoint(ones, coords, oshape=img_shape_zyx, oversamp=os_fac, width=width)
-    psf = np.abs(psf); psf /= psf.max() + 1e-12
-    return psf
+# ---------------- FID / k-space loading ---------------- #
 
-def anisotropy_metrics(vol: np.ndarray):
-    Z, Y, X = vol.shape
-    zc, yc, xc = Z//2, Y//2, X//2
-    r = max(4, min(Z, Y, X)//6)
-    sub = vol[zc-r:zc+r+1, yc-r:yc+r+1, xc-r:xc+r+1]
-    def second_moment(a, axis):
-        idx = np.arange(a.shape[axis]) - a.shape[axis]/2.0
-        shape = [1,1,1]; shape[axis] = -1
-        w = idx.reshape(shape)
-        num = float(np.sum((w**2) * a)); den = float(np.sum(a) + 1e-12)
-        return num/den
-    vz = second_moment(sub, 0); vy = second_moment(sub, 1); vx = second_moment(sub, 2)
-    return vz, vy, vx
+def factor_fid(total_points: int, true_ro: int, coils_hint: int | None):
+    block_candidates = [true_ro]
+    for b in (128, 96, 64, 256, 192, 384, 512):
+        if b != true_ro:
+            block_candidates.append(b)
 
-def psf_aniso_cost(coords: np.ndarray, img_shape_zyx_small, os_fac, width, gpu):
-    psf = psf_volume(coords, img_shape_zyx_small, os_fac=os_fac, width=width, gpu=gpu)
-    vz, vy, vx = anisotropy_metrics(psf)
-    vmean = (vx+vy+vz)/3.0
-    cost = abs(vz/vmean-1) + abs(vy/vmean-1) + abs(vx/vmean-1)
-    return cost, (vz, vy, vx)
-
-def radial_apod_window(nread: int, kind: str, tukey_alpha=0.30, kaiser_beta=6.0, gauss_sigma=0.18):
-    r = np.linspace(-1, 1, nread, endpoint=False)
-    if kind == "hann":
-        w = 0.5 * (1 + np.cos(np.pi * r))
-    elif kind == "tukey":
-        a = float(tukey_alpha); at = np.abs(r); w = np.ones_like(r)
-        if a <= 0: pass
-        elif a >= 1: w = 0.5 * (1 + np.cos(np.pi * r))
-        else:
-            m = (at > (1-a)) & (a > 0)
-            w[m] = 0.5 * (1 + np.cos(np.pi/a * (at[m] - (1-a))))
-            w[at >= 1] = 0.0
-    elif kind == "kaiser":
-        from numpy import i0
-        b = float(kaiser_beta); w = i0(b * np.sqrt(1 - r**2)) / i0(b)
-    elif kind == "gauss":
-        s = float(gauss_sigma); w = np.exp(-0.5 * (r/s)**2)
+    if coils_hint is not None:
+        coil_candidates = [coils_hint] + [c for c in range(1, 33) if c != coils_hint]
     else:
-        w = np.ones_like(r)
-    return (w / (w.mean() + 1e-12)).astype(np.float32)
+        coil_candidates = list(range(1, 33))
 
-def recon_adj_percoil(kdata, img_shape, coords, dcf_mode="pipe", gpu=-1):
-    """Adjoint NUFFT per coil. Returns (ncoils, Z, Y, X) complex64."""
-    nread, nspokes, ncoils = kdata.shape
-    assert coords.shape == (nread * nspokes, 3)
-    coils = []
-    if gpu < 0 or cp is None:
-        dcf = compute_dcf(coords, mode=dcf_mode)
-        for c in range(ncoils):
-            y = kdata[:, :, c].reshape(-1)
-            if dcf is not None:
-                y = y * dcf
-            x = sp.nufft_adjoint(y, coords, oshape=img_shape)
-            coils.append(x.astype(np.complex64, copy=False))
-        return np.stack(coils, axis=0)
+    best = None
+    best_score = -1
+
+    for stored_ro in block_candidates:
+        for c in coil_candidates:
+            denom = stored_ro * c
+            if denom <= 0:
+                continue
+            if total_points % denom != 0:
+                continue
+            spokes = total_points // denom
+
+            score = 0
+            if stored_ro >= true_ro:
+                score += 2
+            if abs(stored_ro - true_ro) <= 10:
+                score += 2
+            if spokes > 100:
+                score += 1
+            if coils_hint is not None and c == coils_hint:
+                score += 2
+
+            if score > best_score:
+                best_score = score
+                best = (stored_ro, c, spokes)
+
+    if best is None:
+        raise ValueError(
+            f"Could not factor FID: total={total_points}, true_ro={true_ro}, coils_hint={coils_hint}"
+        )
+    return best  # (stored_ro, coils, spokes)
+
+
+def load_bruker_kspace(
+    fid_path: Path,
+    true_ro: int,
+    coils_hint: int | None,
+    endian: str,
+    base_kind: str,
+    fid_layout: str,
+):
+    if not fid_path.exists():
+        raise FileNotFoundError(f"FID not found: {fid_path}")
+
+    np_dtype = np.dtype(endian + base_kind)
+    raw = np.fromfile(fid_path, dtype=np_dtype).astype(np.float32)
+    if raw.size % 2 != 0:
+        raise ValueError(f"FID length {raw.size} not even (real/imag pairs).")
+
+    cplx = raw[0::2] + 1j * raw[1::2]
+    total_points = cplx.size
+
+    stored_ro, coils, spokes = factor_fid(total_points, true_ro, coils_hint)
+
+    if coils_hint is not None and coils != coils_hint:
+        print(
+            f"[warn] FID suggests coils={coils}, header said {coils_hint}; using {coils}.",
+            file=sys.stderr,
+        )
+
+    print(
+        f"[info] Loaded k-space with stored_ro={stored_ro}, true_ro={true_ro}, spokes={spokes}, coils={coils}"
+    )
+
+    if fid_layout == "ro_spokes_coils":
+        ksp = cplx.reshape(stored_ro, spokes, coils)
+    elif fid_layout == "ro_coils_spokes":
+        ksp = cplx.reshape(stored_ro, coils, spokes).transpose(0, 2, 1)
     else:
-        with sp.Device(gpu):
-            coords_g = cp.asarray(coords, dtype=cp.float32)
-            dcf = compute_dcf(coords, mode=dcf_mode)
-            dcf_g = cp.asarray(dcf, dtype=cp.float32) if dcf is not None else None
-            coils_g = []
-            for c in range(ncoils):
-                y_g = cp.asarray(kdata[:, :, c].reshape(-1))
-                if dcf_g is not None:
-                    y_g = y_g * dcf_g
-                x_g = sp.nufft_adjoint(y_g, coords_g, oshape=img_shape)
-                coils_g.append(x_g)
-            coils_g = cp.stack(coils_g, axis=0)
-            return cp.asnumpy(coils_g).astype(np.complex64, copy=False)
+        raise ValueError(f"Unknown fid_layout: {fid_layout}")
 
-def combine_coils(coil_imgs, method="sos", lp_frac=0.12, bias_correct=False):
-    if method == "sos":
-        mag = np.sqrt((np.abs(coil_imgs) ** 2).sum(axis=0))
-        out = mag
+    if stored_ro != true_ro:
+        if stored_ro < true_ro:
+            raise ValueError(f"stored_ro={stored_ro} < true_ro={true_ro}")
+        ksp = ksp[:true_ro]
+        print(f"[info] Trimmed k-space from stored_ro={stored_ro} to true_ro={true_ro}")
+
+    return ksp, stored_ro, spokes, coils
+
+
+# ---------------- BART CFL helpers ---------------- #
+
+def writecfl(name: str, arr: np.ndarray):
+    base = Path(name)
+    hdr = base.with_suffix(".hdr")
+    cfl = base.with_suffix(".cfl")
+
+    arr_f = np.asfortranarray(arr.astype(np.complex64))
+    dims = list(arr_f.shape) + [1] * (16 - arr_f.ndim)
+
+    with hdr.open("w") as f:
+        f.write("# Dimensions\n")
+        f.write(" ".join(str(d) for d in dims) + "\n")
+
+    stacked = np.empty(arr_f.size * 2, dtype=np.float32)
+    stacked[0::2] = arr_f.real.ravel(order="F")
+    stacked[1::2] = arr_f.imag.ravel(order="F")
+    stacked.tofile(cfl)
+
+
+def readcfl(name: str) -> np.ndarray:
+    base = Path(name)
+    hdr = base.with_suffix(".hdr")
+    cfl = base.with_suffix(".cfl")
+    if not hdr.exists() or not cfl.exists():
+        raise FileNotFoundError(f"CFL/HDR not found: {base}")
+
+    lines = hdr.read_text(errors="ignore").splitlines()
+    if len(lines) < 2:
+        raise ValueError(f"Malformed hdr: {hdr}")
+
+    dims16 = [int(x) for x in lines[1].split()]
+    last_non1 = 0
+    for i, d in enumerate(dims16):
+        if d > 1:
+            last_non1 = i
+    ndim = max(1, last_non1 + 1)
+    dims = dims16[:ndim]
+
+    data = np.fromfile(cfl, dtype=np.float32)
+    if data.size % 2 != 0:
+        raise ValueError(f"CFL length {data.size} not even: {cfl}")
+
+    cplx = data[0::2] + 1j * data[1::2]
+    expected = int(np.prod(dims))
+    if cplx.size != expected:
+        raise ValueError(
+            f"CFL size mismatch: have {cplx.size} complex, expected {expected} from dims {dims} for {base}"
+        )
+
+    return cplx.reshape(dims, order="F")
+
+
+def bart_image_dims(bart_bin: str, base: Path) -> list[int] | None:
+    dims: list[int] = []
+    for d in range(16):
+        proc = subprocess.run(
+            [bart_bin, "show", "-d", str(d), str(base)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode != 0:
+            print(f"[warn] bart show -d {d} failed: {proc.stderr.strip()}", file=sys.stderr)
+            return None
+        dims.append(int(proc.stdout.strip()))
+    return dims
+
+
+def bart_supports_gpu(bart_bin: str = "bart") -> bool:
+    proc = subprocess.run([bart_bin, "nufft", "-i", "-g"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode == 0:
+        return True
+    s = (proc.stderr or "").lower()
+    if "compiled without gpu support" in s or "unknown option" in s:
+        return False
+    return False
+
+
+# ---------------- Trajectory parsing & diagnostics ---------------- #
+
+def _traj_monotonic_score_centered(traj_3_ro_sp: np.ndarray) -> float:
+    """
+    Prefer centered readout: |k| is smallest near the middle (weak heuristic).
+    """
+    k_mag = np.sqrt(
+        traj_3_ro_sp[0] ** 2 +
+        traj_3_ro_sp[1] ** 2 +
+        traj_3_ro_sp[2] ** 2
+    )  # (RO, spokes)
+    k_ro_med = np.median(k_mag, axis=1)
+    imin = int(np.argmin(k_ro_med))
+    mid = k_ro_med.shape[0] // 2
+    return -abs(imin - mid)
+
+
+def _traj_monotonic_score_centerout(traj_3_ro_sp: np.ndarray) -> float:
+    """
+    Prefer center-out readout: |k| increases with RO and starts near 0.
+    """
+    k_mag = np.sqrt(
+        traj_3_ro_sp[0] ** 2 +
+        traj_3_ro_sp[1] ** 2 +
+        traj_3_ro_sp[2] ** 2
+    )  # (RO, spokes)
+
+    ro0 = float(np.median(k_mag[0, :]))
+    rom = float(np.median(k_mag[k_mag.shape[0] // 2, :]))
+    rol = float(np.median(k_mag[-1, :]))
+
+    slope = rol - ro0
+    mid_bonus = rom - ro0
+    start_frac = (ro0 / rol) if rol > 0 else 1.0
+
+    score = 0.0
+    score += 5.0 * slope
+    score += 2.0 * mid_bonus
+    score += -10.0 * start_frac
+    return score
+
+
+def _traj_score(traj_3_ro_sp: np.ndarray) -> float:
+    """
+    Combined score that allows either centered or center-out.
+    """
+    return max(
+        _traj_monotonic_score_centerout(traj_3_ro_sp),
+        5.0 * _traj_monotonic_score_centered(traj_3_ro_sp),
+    )
+
+
+def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
+    """
+    Prints radial-coordinate diagnostics based on per-spoke direction (end-start),
+    robust for centered trajectories.
+    """
+    tx = np.real(traj[0]).astype(np.float64, copy=False)
+    ty = np.real(traj[1]).astype(np.float64, copy=False)
+    tz = np.real(traj[2]).astype(np.float64, copy=False)
+
+    # Direction from (end - start) per spoke (works for centered trajectories)
+    dx = tx[-1, :] - tx[0, :]
+    dy = ty[-1, :] - ty[0, :]
+    dz = tz[-1, :] - tz[0, :]
+    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dn[dn == 0] = 1.0
+    dx /= dn
+    dy /= dn
+    dz /= dn
+
+    r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
+
+    r0 = float(np.median(r[0, :]))
+    rm = float(np.median(r[r.shape[0] // 2, :]))
+    rL = float(np.median(r[-1, :]))
+
+    rmin = float(np.median(np.min(r, axis=0)))
+    rmax = float(np.median(np.max(r, axis=0)))
+
+    r_ro_med = np.median(r, axis=1)
+    iz = int(np.argmin(np.abs(r_ro_med)))
+
+    print(f"[debug] {label} radial median r at RO[0],RO[mid],RO[-1]: {r0:.6g}, {rm:.6g}, {rL:.6g}")
+    print(f"[debug] {label} per-spoke r range (median min, median max): {rmin:.6g}, {rmax:.6g}")
+    print(f"[debug] {label} median r over spokes: closest-to-0 at RO={iz} (r≈{r_ro_med[iz]:.6g})")
+
+
+def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np.ndarray, str]:
+    """
+    Returns:
+      traj (3, RO, NPro) float32
+      tag describing chosen interpretation
+
+    Tries:
+      - float64 LE/BE    (collaborator MATLAB uses float64 ieee-le)
+      - float32 LE/BE
+      - int32 LE/BE scaled by Q30
+      - int16 LE/BE scaled by Q15
+    and multiple reshape/permutation/order hypotheses, selecting the one
+    that yields a plausible radial readout (centered OR center-out).
+    """
+    b = traj_path.read_bytes()
+
+    if len(b) % 2 != 0:
+        raise ValueError(f"traj bytes not multiple of 2: {len(b)}")
+
+    expected = 3 * ro * npro
+    candidates: list[tuple[str, np.ndarray]] = []
+
+    # float64
+    if len(b) % 8 == 0:
+        nelem8 = len(b) // 8
+        if nelem8 == expected:
+            candidates.append(("f8_le", np.frombuffer(b, dtype="<f8").astype(np.float32)))
+            candidates.append(("f8_be", np.frombuffer(b, dtype=">f8").astype(np.float32)))
+
+    # float32 / int32
+    if len(b) % 4 == 0:
+        nelem4 = len(b) // 4
+        if nelem4 == expected:
+            candidates.append(("f4_le", np.frombuffer(b, dtype="<f4").astype(np.float32)))
+            candidates.append(("f4_be", np.frombuffer(b, dtype=">f4").astype(np.float32)))
+            candidates.append(("i4_le_q30", np.frombuffer(b, dtype="<i4").astype(np.float32) / float(1 << 30)))
+            candidates.append(("i4_be_q30", np.frombuffer(b, dtype=">i4").astype(np.float32) / float(1 << 30)))
+
+    # int16
+    if len(b) % 2 == 0:
+        nelem2 = len(b) // 2
+        if nelem2 == expected:
+            candidates.append(("i2_le_q15", np.frombuffer(b, dtype="<i2").astype(np.float32) / float(1 << 15)))
+            candidates.append(("i2_be_q15", np.frombuffer(b, dtype=">i2").astype(np.float32) / float(1 << 15)))
+
+    if not candidates:
+        raise RuntimeError(
+            f"traj size {len(b)} bytes does not match expected encodings for "
+            f"(NPro={npro}, RO={ro}, 3): expected element count {expected} "
+            f"for f8/f4/i4/i2 encodings."
+        )
+
+    shapes = [
+        ("3_ro_sp", (3, ro, npro)),
+        ("ro_3_sp", (ro, 3, npro)),
+        ("sp_ro_3", (npro, ro, 3)),
+        ("sp_3_ro", (npro, 3, ro)),
+        ("ro_sp_3", (ro, npro, 3)),
+        ("3_sp_ro", (3, npro, ro)),
+    ]
+    orders = ["C", "F"]
+
+    best_score: float | None = None
+    best_tag: str | None = None
+    best_traj: np.ndarray | None = None
+
+    for dtype_tag, v in candidates:
+        if not np.all(np.isfinite(v)):
+            continue
+
+        vmax = float(np.max(np.abs(v)))
+        if dtype_tag.startswith(("f4", "f8")) and vmax > 1e9:
+            continue
+
+        for shape_tag, shp in shapes:
+            for ord_tag in orders:
+                try:
+                    arr = v.reshape(shp, order=ord_tag)
+                except Exception:
+                    continue
+
+                if shape_tag == "3_ro_sp":
+                    traj = arr
+                elif shape_tag == "ro_3_sp":
+                    traj = np.transpose(arr, (1, 0, 2))
+                elif shape_tag == "sp_ro_3":
+                    traj = np.transpose(arr, (2, 1, 0))
+                elif shape_tag == "sp_3_ro":
+                    traj = np.transpose(arr, (1, 2, 0))
+                elif shape_tag == "ro_sp_3":
+                    traj = np.transpose(arr, (2, 0, 1))
+                elif shape_tag == "3_sp_ro":
+                    traj = np.transpose(arr, (0, 2, 1))
+                else:
+                    continue
+
+                score = _traj_score(traj)
+
+                k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
+                if float(np.max(k_mag)) < 1e-6:
+                    score -= 1e6
+
+                tag = f"{dtype_tag}:{shape_tag}:{ord_tag}"
+
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_tag = tag
+                    best_traj = traj
+
+    if best_traj is None or best_tag is None:
+        raise RuntimeError(f"Could not find any plausible traj reshape for {traj_path}")
+
+    k_mag = np.sqrt(best_traj[0] ** 2 + best_traj[1] ** 2 + best_traj[2] ** 2)
+    end_spread = np.percentile(k_mag[-1, :], [5, 50, 95])
+
+    print(f"[info] traj autoshape chose {best_tag}")
+    print(f"[debug] traj |k| at RO[-1] p5/p50/p95: {end_spread[0]:.6g}, {end_spread[1]:.6g}, {end_spread[2]:.6g}")
+
+    return best_traj.astype(np.float32), best_tag
+
+
+# ---------------- grad.output trajectory ---------------- #
+
+def _extract_grad_block(lines: list[str], name: str) -> np.ndarray:
+    hdr_pat = re.compile(rf"^\s*\d+:{re.escape(name)}:\s+index\s*=\s*\d+,\s+size\s*=\s*(\d+)\s*$")
+
+    start = None
+    size = None
+    for i, line in enumerate(lines):
+        m = hdr_pat.match(line.strip())
+        if m:
+            start = i + 1
+            size = int(m.group(1))
+            break
+
+    if start is None or size is None:
+        raise ValueError(f"Could not find {name} in grad.output")
+
+    vals: list[int] = []
+    for line in lines[start:]:
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^\d+:\w+:", line) or line.startswith("Ramp Shape"):
+            break
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        vals.append(int(parts[1]))
+        if len(vals) >= size:
+            break
+
+    if len(vals) != size:
+        raise ValueError(f"{name}: expected {size} values, got {len(vals)}")
+    return np.array(vals, dtype=np.float64)
+
+
+def load_grad_output_dirs(grad_output_path: Path, normalize: bool = True) -> np.ndarray:
+    lines = grad_output_path.read_text(errors="ignore").splitlines()
+    r = _extract_grad_block(lines, "ProjR")
+    p = _extract_grad_block(lines, "ProjP")
+    s = _extract_grad_block(lines, "ProjS")
+
+    scale = float(1 << 30)
+    dirs = np.stack([r, p, s], axis=1) / scale
+
+    norms = np.linalg.norm(dirs, axis=1)
+    print(f"[info] Parsed {dirs.shape[0]} spoke directions from {grad_output_path}")
+    print(f"[info] Direction norms BEFORE normalize: min={norms.min():.4f} median={np.median(norms):.4f} max={norms.max():.4f}")
+
+    if normalize:
+        bad = norms == 0
+        if np.any(bad):
+            raise ValueError(f"Found {bad.sum()} zero-norm direction(s) in {grad_output_path}")
+        dirs = dirs / norms[:, None]
+        norms2 = np.linalg.norm(dirs, axis=1)
+        print(f"[info] Direction norms AFTER  normalize: min={norms2.min():.4f} median={np.median(norms2):.4f} max={norms2.max():.4f}")
+
+    return dirs
+
+
+def expand_spoke_dirs(dirs: np.ndarray, target_spokes: int, order: str) -> np.ndarray:
+    n = dirs.shape[0]
+    if target_spokes == n:
+        return dirs
+    if target_spokes % n != 0:
+        raise ValueError(f"Cannot expand dirs length {n} to {target_spokes} (not divisible)")
+    reps = target_spokes // n
+    print(f"[info] Expanding {n} dirs to {target_spokes} spokes with reps={reps} using order='{order}'")
+    if order == "tile":
+        return np.tile(dirs, (reps, 1))
+    if order == "repeat":
+        return np.repeat(dirs, reps, axis=0)
+    raise ValueError(f"Unknown spoke-order: {order}")
+
+
+def build_traj_from_dirs(
+    true_ro: int,
+    dirs_xyz: np.ndarray,   # (spokes,3)
+    NX: int,
+    traj_scale: float | None,
+    readout_origin: str,
+    reverse_readout: bool,
+) -> np.ndarray:
+    spokes = dirs_xyz.shape[0]
+
+    # BART "pixel" scaling: target kmax ~ NX/2
+    kmax = 0.5 * float(NX)
+    if traj_scale is not None:
+        kmax *= float(traj_scale)
+
+    if readout_origin == "zero":
+        s = np.linspace(0.0, kmax, true_ro, dtype=np.float64)
     else:
-        S = estimate_sens_maps(coil_imgs, frac=lp_frac)
-        img_c = adaptive_combine(coil_imgs, S)          # complex
-        out = np.abs(img_c)
-    if bias_correct:
-        bias = np.abs(fft_lowpass3d(out.astype(np.complex64), frac=0.05))
-        bias = bias / (bias.mean() + 1e-8)
-        out = out / (bias + 1e-8)
-    return out.astype(np.float32, copy=False)
+        s = np.linspace(-kmax, kmax, true_ro, dtype=np.float64)
 
-def fft_lowpass3d(img, frac=0.12):
-    """Low-pass a 3D complex image by masking in k-space (spherical)."""
-    z, y, x = img.shape
-    kz = np.fft.fftfreq(z); ky = np.fft.fftfreq(y); kx = np.fft.fftfreq(x)
-    KZ, KY, KX = np.meshgrid(kz, ky, kx, indexing="ij")
-    kr = np.sqrt(KZ**2 + KY**2 + KX**2)
-    mask = (kr <= frac).astype(np.float32)
-    F = np.fft.fftn(img)
-    return np.fft.ifftn(F * mask)
+    if reverse_readout:
+        s = s[::-1].copy()
 
-def estimate_sens_maps(coil_imgs, frac=0.12, eps=1e-8):
-    """
-    coil_imgs: (ncoils, Z, Y, X) complex, adjoint NUFFT per coil.
-    Returns sens maps (ncoils, Z, Y, X) with sum |S|^2 ≈ 1.
-    """
-    ncoils = coil_imgs.shape[0]
-    # Low-pass each coil image to get smooth sensitivities
-    S = np.empty_like(coil_imgs, dtype=np.complex64)
-    for c in range(ncoils):
-        S[c] = fft_lowpass3d(coil_imgs[c], frac=frac)
-    denom = np.sqrt((np.abs(S) ** 2).sum(axis=0)) + eps  # SoS magnitude
-    S /= denom  # normalize so SoS of maps ≈ 1
-    return S
+    traj = np.zeros((3, true_ro, spokes), dtype=np.complex64)
+    dx, dy, dz = dirs_xyz[:, 0], dirs_xyz[:, 1], dirs_xyz[:, 2]
+    for i in range(spokes):
+        traj[0, :, i] = s * dx[i]
+        traj[1, :, i] = s * dy[i]
+        traj[2, :, i] = s * dz[i]
 
-def adaptive_combine(coil_imgs, sens_maps, eps=1e-8):
-    """
-    Complex-optimal (Walsh) combine: sum conj(S)*I / sum |S|^2.
-    coil_imgs: (ncoils, Z, Y, X) complex
-    sens_maps: (ncoils, Z, Y, X) complex
-    """
-    num = (np.conj(sens_maps) * coil_imgs).sum(axis=0)
-    den = (np.abs(sens_maps) ** 2).sum(axis=0) + eps
-    return num / den  # complex image
+    print(f"[info] Traj built with max |k| ≈ {np.abs(traj).max():.2f} (origin={readout_origin}, reverse={reverse_readout})")
+    return traj
 
-def apply_scales_guarded(coords: np.ndarray,
-                         sx: float, sy: float, sz: float,
-                         args) -> np.ndarray:
+
+# ---------------- traj file support ---------------- #
+
+def find_traj_candidates(series_path: Path) -> List[Path]:
+    cands: List[Path] = []
+
+    p0 = series_path / "traj"
+    if p0.exists() and p0.is_file():
+        cands.append(p0)
+
+    pdata = series_path / "pdata"
+    if pdata.exists():
+        for p in pdata.rglob("traj"):
+            if p.exists() and p.is_file():
+                cands.append(p)
+
+    seen = set()
+    out = []
+    for p in cands:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.ndarray:
     """
-    Apply per-axis scale to coords with optional disable/cap.
-    Works regardless of how sx,sy,sz were obtained (auto or manual).
+    traj: (3, ro, nsp)
+    Expand along spoke axis to (3, ro, target_spokes) if divisible.
     """
-    if getattr(args, "no_auto_scale", False):
-        sx, sy, sz = 1.0, 1.0, 1.0
+    nsp = traj.shape[2]
+    if target_spokes == nsp:
+        return traj
+    if target_spokes % nsp != 0:
+        raise ValueError(f"Cannot expand traj spokes {nsp} to {target_spokes} (not divisible)")
+    reps = target_spokes // nsp
+    print(f"[info] Expanding traj spokes {nsp} -> {target_spokes} with reps={reps} using order='{order}'")
+    if order == "tile":
+        return np.tile(traj, (1, 1, reps))
+    if order == "repeat":
+        return np.repeat(traj, reps, axis=2)
+    raise ValueError(f"Unknown spoke-order: {order}")
+
+
+def _maybe_recenter_readout_by_zero_crossing(traj: np.ndarray, *, label: str = "traj") -> tuple[np.ndarray, int]:
+    """
+    Recenter RO axis based on where the radial coordinate r crosses ~0.
+
+    - If readout looks CENTERED (r spans negative to positive), we want r≈0 at RO[mid].
+    - If readout looks CENTER-OUT (r mostly >= 0), we want r≈0 at RO[0].
+
+    Returns (traj_out, shift_applied). shift_applied is the roll shift used (0 means no change).
+    """
+    tx = np.real(traj[0]).astype(np.float64, copy=False)
+    ty = np.real(traj[1]).astype(np.float64, copy=False)
+    tz = np.real(traj[2]).astype(np.float64, copy=False)
+
+    # Direction estimate per spoke from (end - start); robust for centered readouts
+    dx = tx[-1, :] - tx[0, :]
+    dy = ty[-1, :] - ty[0, :]
+    dz = tz[-1, :] - tz[0, :]
+    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dn[dn == 0] = 1.0
+    dx /= dn
+    dy /= dn
+    dz /= dn
+
+    r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
+
+    rmin_med = float(np.median(np.min(r, axis=0)))
+    rmax_med = float(np.median(np.max(r, axis=0)))
+    centered = (rmin_med < 0.0) and (rmax_med > 0.0)
+
+    r_ro_med = np.median(r, axis=1)
+    iz = int(np.argmin(np.abs(r_ro_med)))
+
+    ro_mid = traj.shape[1] // 2
+    target = ro_mid if centered else 0
+
+    if iz == target:
+        return traj, 0
+
+    shift = target - iz
+    traj2 = np.roll(traj, shift=shift, axis=1)
+
+    if centered:
+        print(f"[info] {label}: centered readout; shifted RO axis by {shift} to place r≈0 at RO[mid]={ro_mid}")
     else:
-        cap = float(getattr(args, "scale_cap", 0.05))
-        # Only cap *deviations from 1.0*; manual scales still pass through
-        sx = float(np.clip(sx, 1.0 - cap, 1.0 + cap))
-        sy = float(np.clip(sy, 1.0 - cap, 1.0 + cap))
-        sz = float(np.clip(sz, 1.0 - cap, 1.0 + cap))
+        print(f"[info] {label}: center-out readout; shifted RO axis by {shift} to place r≈0 at RO[0]")
 
-    coords = coords.reshape(-1, 3)
-    coords[:, 0] *= sx
-    coords[:, 1] *= sy
-    coords[:, 2] *= sz
-    print(f"[scale] Applied per-axis scales (x,y,z) = ({sx:.3f}, {sy:.3f}, {sz:.3f})")
-    return coords
+    return traj2, shift
 
 
-# ---------------- PNG helpers ----------------
-def _tripanel_from_volume(vol: np.ndarray, labels=("Axial","Coronal","Sagittal")):
-    Z, Y, X = vol.shape
-    ax  = vol[Z//2,:,:]
-    cor = vol[:,Y//2,:]
-    sag = vol[:,:,X//2]
-    def to_u8(a):
-        vmin = np.percentile(a, 1.0); vmax = np.percentile(a, 99.0)
-        a = np.clip((a - vmin) / (vmax - vmin + 1e-12), 0, 1)
-        return (a * 255).astype(np.uint8)
-    imgs = [Image.fromarray(to_u8(x)) for x in (ax, cor, sag)]
-    target_h = max(im.size[1] for im in imgs)
-    rs = []
-    for im in imgs:
-        w, h = im.size
-        if h != target_h:
-            im = im.resize((int(round(w * (target_h / h))), target_h), Image.BICUBIC)
-        rs.append(im)
-    margin=20; gap=16; label_h=28
-    total_w = margin*2 + sum(im.size[0] for im in rs) + gap*2
-    total_h = margin*2 + label_h + target_h
-    canvas = Image.new("L", (total_w, total_h), color=16)
-    draw = ImageDraw.Draw(canvas)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 18)
-        textw = lambda t: draw.textlength(t, font=font)
-    except Exception:
-        font = ImageFont.load_default()
-        textw = lambda t: draw.textbbox((0,0), t, font=font)[2]
-    x = margin; y_img = margin + label_h
-    for im, lab in zip(rs, labels):
-        w, h = im.size; tw = textw(lab); th = font.size
-        tx = x + (w - int(tw))//2; ty = margin + (label_h - th)//2
-        draw.text((tx+1, ty+1), lab, fill=0, font=font)
-        draw.text((tx,   ty),   lab, fill=240, font=font)
-        canvas.paste(im, (x, y_img))
-        x += w + gap
-    return canvas
+def _scale_traj_to_bart_pixels(traj: np.ndarray, NX: int, *, label: str = "traj") -> tuple[np.ndarray, float]:
+    """
+    Scale trajectory to BART "pixel" units where kmax ~ NX/2.
 
-# ---------------- CLI ----------------
+    For CENTERED readouts, using |k| at RO[-1] can be misleading.
+    Use a range-based kmax computed from the radial coordinate:
+
+        kmax_curr ≈ 0.5 * (median(r_max_per_spoke) - median(r_min_per_spoke))
+    """
+    tx = np.real(traj[0]).astype(np.float64, copy=False)
+    ty = np.real(traj[1]).astype(np.float64, copy=False)
+    tz = np.real(traj[2]).astype(np.float64, copy=False)
+
+    dx = tx[-1, :] - tx[0, :]
+    dy = ty[-1, :] - ty[0, :]
+    dz = tz[-1, :] - tz[0, :]
+    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
+    dn[dn == 0] = 1.0
+    dx /= dn
+    dy /= dn
+    dz /= dn
+
+    r = tx * dx[None, :] + ty * dy[None, :] + tz * dz[None, :]
+
+    rmin_med = float(np.median(np.min(r, axis=0)))
+    rmax_med = float(np.median(np.max(r, axis=0)))
+    kmax_curr = 0.5 * (rmax_med - rmin_med)
+
+    kmax_tgt = 0.5 * float(NX)
+
+    if kmax_curr <= 0:
+        print(f"[warn] {label} scaling skipped (kmax_curr≈0).", file=sys.stderr)
+        return traj, 1.0
+
+    scale = kmax_tgt / kmax_curr
+    traj2 = (traj * scale).astype(np.complex64, copy=False)
+    print(f"[info] {label} auto-scale (range-based): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt:.6g} (scale={scale:.6g})")
+    return traj2, scale
+
+
+def load_traj_auto(
+    series_path: Path,
+    method: Path,
+    acqp: Path,
+    true_ro: int,
+    spokes_all: int,
+    NX: int,
+    traj_scale: float | None,
+    spoke_order: str,
+    readout_origin: str,
+    reverse_readout: bool,
+    traj_source: str,
+    traj_file: Optional[Path],
+) -> Tuple[np.ndarray, str]:
+    """
+    Return traj_full (3,RO,spokes_all) and description string.
+    """
+
+    def _from_gradoutput() -> np.ndarray:
+        grad_path = series_path / "grad.output"
+        if not grad_path.exists():
+            raise RuntimeError(f"grad.output not found in {series_path}")
+        dirs = load_grad_output_dirs(grad_path, normalize=True)
+        dirs_full = expand_spoke_dirs(dirs, spokes_all, spoke_order)
+        traj = build_traj_from_dirs(true_ro, dirs_full, NX, traj_scale, readout_origin, reverse_readout)
+        return traj
+
+    def _from_trajfile(p: Path) -> Tuple[np.ndarray, str]:
+        npro = infer_npro(method, acqp)
+        if npro is None:
+            raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
+
+        traj_real, fmt = parse_trajfile_autoshape(p, npro=int(npro), ro=true_ro)
+
+        # Convert to complex64 for BART compatibility (imaginary part = 0)
+        traj = np.asfortranarray(traj_real.astype(np.float32)).astype(np.complex64)
+
+        traj_radial_profile_debug(traj, label="trajfile raw")
+
+        # Apply explicit reverse-readout flag FIRST (it changes where r≈0 occurs)
+        if reverse_readout:
+            traj = traj[:, ::-1, :].copy()
+            print("[info] trajfile: applied --reverse-readout")
+            traj_radial_profile_debug(traj, label="trajfile after_reverse")
+
+        # Recenter RO axis (centered -> RO[mid], center-out -> RO[0])
+        traj, shift = _maybe_recenter_readout_by_zero_crossing(traj, label="trajfile")
+        if shift != 0:
+            traj_radial_profile_debug(traj, label="trajfile after_recenter")
+
+        # Expand spokes if traj is per-volume and k-space has multiple volumes
+        traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
+
+        # Scale to BART pixel units (target ~ NX/2)
+        traj, _scale = _scale_traj_to_bart_pixels(traj, NX, label="trajfile")
+
+        # Optional extra user multiplier (applied AFTER pixel-scaling)
+        if traj_scale is not None:
+            traj = (traj * float(traj_scale)).astype(np.complex64, copy=False)
+            print(f"[info] trajfile: applied --traj-scale multiplier {float(traj_scale):.6g}")
+
+        traj_radial_profile_debug(traj, label="trajfile final")
+
+        return traj, f"trajfile:{fmt}:(NPro={npro},RO={true_ro},3)"
+
+    if traj_source == "gradoutput":
+        return _from_gradoutput(), "gradoutput"
+
+    if traj_file is not None:
+        if not traj_file.exists():
+            raise RuntimeError(f"--traj-file does not exist: {traj_file}")
+        traj, mode = _from_trajfile(traj_file)
+        return traj, mode
+
+    if traj_source in ("trajfile", "auto"):
+        cands = find_traj_candidates(series_path)
+        if traj_source == "trajfile" and not cands:
+            raise RuntimeError(
+                f"--traj-source trajfile requested, but no traj candidate found under {series_path} or pdata/*"
+            )
+
+        last_err = None
+        for p in cands:
+            try:
+                traj, mode = _from_trajfile(p)
+                return traj, mode
+            except Exception as e:
+                last_err = e
+
+        if traj_source == "trajfile":
+            raise RuntimeError(
+                f"--traj-source trajfile requested, but no candidate trajectory could be parsed under {series_path} or pdata/*.\n"
+                f"Last error: {last_err}"
+            )
+
+        return _from_gradoutput(), "gradoutput(fallback)"
+
+    raise ValueError(f"Unknown traj-source: {traj_source}")
+
+
+# ---------------- NIfTI writers ---------------- #
+
+def bart_cfl_to_nifti(base: Path, out_nii_gz: Path):
+    arr = np.abs(readcfl(str(base)))
+    nib.save(nib.Nifti1Image(arr.astype(np.float32), np.eye(4)), str(out_nii_gz))
+
+
+def write_qa_nifti(qa_frames: list[Path], qa_base: Path):
+    vols = []
+    shape0 = None
+    for p in qa_frames:
+        mag = np.abs(readcfl(str(p)))
+        if shape0 is None:
+            shape0 = mag.shape
+        elif mag.shape != shape0:
+            raise ValueError(f"QA frame {p} has shape {mag.shape}, expected {shape0}")
+        vols.append(mag)
+    qa_stack = np.stack(vols, axis=-1)
+    out = qa_base.with_suffix(".nii.gz")
+    nib.save(nib.Nifti1Image(qa_stack.astype(np.float32), np.eye(4)), str(out))
+    print(f"[info] Wrote QA NIfTI {out} with shape {qa_stack.shape}")
+
+
+# ---------------- Core recon ---------------- #
+
+def run_bart(
+    series_path: Path,
+    method: Path,
+    acqp: Path,
+    out_base: Path,
+    NX: int, NY: int, NZ: int,
+    true_ro: int,
+    ksp: np.ndarray,                 # (ro, spokes, coils)
+    spokes_all: int,
+    spokes_per_frame: int,
+    frame_shift: int,
+    qa_first: int | None,
+    export_nifti: bool,
+    traj_scale: float | None,
+    use_gpu: bool,
+    spoke_order: str,
+    readout_origin: str,
+    reverse_readout: bool,
+    traj_source: str,
+    traj_file: Optional[Path],
+):
+    bart_bin = "bart"
+
+    traj_full, traj_used = load_traj_auto(
+        series_path=series_path,
+        method=method,
+        acqp=acqp,
+        true_ro=true_ro,
+        spokes_all=spokes_all,
+        NX=NX,
+        traj_scale=traj_scale,
+        spoke_order=spoke_order,
+        readout_origin=readout_origin,
+        reverse_readout=reverse_readout,
+        traj_source=traj_source,
+        traj_file=traj_file,
+    )
+    print(f"[info] Trajectory source used: {traj_used}")
+
+    # Trajectory sanity checks (projection-based)
+    traj_radial_profile_debug(traj_full, label="traj_full")
+
+    have_gpu = False
+    if use_gpu:
+        have_gpu = bart_supports_gpu(bart_bin)
+        if not have_gpu:
+            print("[warn] BART has no GPU support; falling back to CPU.", file=sys.stderr)
+
+    if spokes_per_frame <= 0:
+        spokes_per_frame = spokes_all
+    if frame_shift <= 0:
+        frame_shift = spokes_per_frame
+
+    frame_starts = list(range(0, max(1, spokes_all - spokes_per_frame + 1), frame_shift))
+    print(f"[info] Sliding window: spokes-per-frame={spokes_per_frame}, frame-shift={frame_shift}")
+    print(f"[info] Will reconstruct {len(frame_starts)} frame(s).")
+
+    out_dir = out_base.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_paths: list[Path] = []
+    qa_written = False
+    first_dims_reported = False
+
+    rss_mask = str(1 << 3)  # coil dim=3 => 8
+
+    for i, start in enumerate(frame_starts):
+        stop = min(spokes_all, start + spokes_per_frame)
+        nsp = stop - start
+
+        tag = f"vol{i:05d}"
+        traj_base = out_dir / f"{out_base.name}_{tag}_traj"
+        ksp_base = out_dir / f"{out_base.name}_{tag}_ksp"
+        coil_base = out_dir / f"{out_base.name}_{tag}_coil"
+        sos_base = out_dir / f"{out_base.name}_{tag}"
+
+        frame_paths.append(sos_base)
+
+        if sos_base.with_suffix(".cfl").exists():
+            print(f"[info] Frame {i} already reconstructed -> {sos_base}, skipping.")
+            continue
+
+        print(f"[info] Frame {i} spokes [{start}:{stop}] (n={nsp})")
+
+        ksp_frame = ksp[:, start:stop, :]         # (ro, spokes, coils)
+        traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes)
+
+        # IMPORTANT: BART NUFFT expects k-space dims[0] == 1
+        # => k-space should be (1, RO, spokes, coils)
+        ksp_bart = ksp_frame[np.newaxis, :, :, :]  # (1, ro, spokes, coils)
+
+        writecfl(str(traj_base), traj_frame)
+        writecfl(str(ksp_base), ksp_bart)
+
+        cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
+        if use_gpu and have_gpu:
+            cmd.insert(2, "-g")
+        cmd += [str(traj_base), str(ksp_base), str(coil_base)]
+        print("[bart]", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+        cmd2 = [bart_bin, "rss", rss_mask, str(coil_base), str(sos_base)]
+        print("[bart]", " ".join(cmd2))
+        subprocess.run(cmd2, check=True)
+
+        if not first_dims_reported:
+            dims_traj = bart_image_dims(bart_bin, traj_base)
+            dims_ksp = bart_image_dims(bart_bin, ksp_base)
+            dims_coil = bart_image_dims(bart_bin, coil_base)
+            dims_sos = bart_image_dims(bart_bin, sos_base)
+            if dims_traj is not None:
+                print(f"[debug] BART dims traj vol0: {dims_traj}")
+            if dims_ksp is not None:
+                print(f"[debug] BART dims ksp  vol0: {dims_ksp}")
+            if dims_coil is not None:
+                print(f"[debug] BART dims coil vol0: {dims_coil}")
+            if dims_sos is not None:
+                print(f"[debug] BART dims SoS  vol0: {dims_sos}")
+            first_dims_reported = True
+
+        if qa_first is not None and not qa_written and len(frame_paths) >= qa_first:
+            qa_base = out_dir / f"{out_base.name}_QA_first{qa_first}"
+            write_qa_nifti(frame_paths[:qa_first], qa_base)
+            qa_written = True
+
+    sos_existing = [p for p in frame_paths if p.with_suffix(".cfl").exists()]
+    if not sos_existing:
+        print("[warn] No SoS frames exist; skipping 4D stack.", file=sys.stderr)
+        return
+
+    stack_base = out_dir / out_base.name
+    join_cmd = ["bart", "join", "3"] + [str(p) for p in sos_existing] + [str(stack_base)]
+    print("[bart]", " ".join(join_cmd))
+    subprocess.run(join_cmd, check=True)
+
+    if export_nifti:
+        out_nii = stack_base.with_suffix(".nii.gz")
+        bart_cfl_to_nifti(stack_base, out_nii)
+        print(f"[info] Wrote final 4D NIfTI {out_nii}")
+
+    print(f"[info] Done. 4D result base: {stack_base}")
+
+
+# ---------------- CLI ---------------- #
+
 def main():
-    ap = argparse.ArgumentParser(description="Bruker 3D radial recon (production)")
+    ap = argparse.ArgumentParser(
+        description="Bruker 3D radial → BART NUFFT recon driver (grad.output or trajfile).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+
+              Use trajectory file (Bruker writes <series>/traj):
+                python bruker_radial_bart.py --series /path/to/8 --traj-source trajfile --fid-dtype i2 --export-nifti --out /tmp/out
+
+              Use grad.output:
+                python bruker_radial_bart.py --series /path/to/29 --traj-source gradoutput --fid-dtype i4 --export-nifti --out /tmp/out
+            """
+        ),
+    )
+
     ap.add_argument("--series", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX","NY","NZ"), required=True)
-    ap.add_argument("--spoke-step", type=int, default=1)
-    ap.add_argument("--dcf", choices=["none","pipe"], default="pipe")
-    ap.add_argument("--os", dest="os_fac", type=float, default=1.75)
-    ap.add_argument("--width", type=int, default=4)
-    ap.add_argument("--png", action="store_true")
-    ap.add_argument("--psf", action="store_true")
-    ap.add_argument("--gpu", type=int, default=-1)
-    ap.add_argument("--gpu-psf", action="store_true")
-    ap.add_argument("--fov-scale", type=float, default=1.0)
-    ap.add_argument("--traj-order", choices=["sample","spoke"], default="sample")
-    ap.add_argument("--alt-rev", action="store_true")
-    ap.add_argument("--rev-all", action="store_true")
-    ap.add_argument("--auto-pi", action="store_true")
-    ap.add_argument("--rd-shift", type=float, default=0.0)
-    ap.add_argument("--auto-delay", action="store_true")
-    ap.add_argument("--auto-delay-range", nargs=2, type=float, default=(-0.6,0.6))
-    ap.add_argument("--auto-delay-steps", type=int, default=21)
-    ap.add_argument("--scale-x", type=float, default=1.0)
-    ap.add_argument("--scale-y", type=float, default=1.0)
-    ap.add_argument("--scale-z", type=float, default=1.0)
-    ap.add_argument("--auto-scale", action="store_true")
-    ap.add_argument("--auto-scale-range", nargs=2, type=float, default=(0.7,1.3))
-    ap.add_argument("--auto-scale-steps", type=int, default=5)
-    ap.add_argument("--apod", choices=["none","hann","tukey","kaiser","gauss"], default="none")
-    ap.add_argument("--tukey-alpha", type=float, default=0.30)
-    ap.add_argument("--kaiser-beta", type=float, default=8.0)
-    ap.add_argument("--gauss-sigma", type=float, default=0.22)
-    ap.add_argument("--demean-spoke", action="store_true")
-    ap.add_argument("--clip-pi", action="store_true")
-    ap.add_argument("--prod", action="store_true", help="coarse 64³ auto-cal, then final recon")
-    ap.add_argument("--combine", choices=["sos", "adaptive"], default="sos",
-                help="Coil combination: 'sos' or WALSH-style 'adaptive' (recommended).")
-    ap.add_argument("--lp-frac", type=float, default=0.12,
-                help="Low-pass fraction of Nyquist for sens-map estimate (0.08–0.18 typical).")
-    ap.add_argument("--bias-correct", action="store_true",
-                help="Divide final magnitude by a very low-pass bias field (flatten shading).")
-    ap.add_argument("--no-auto-scale", action="store_true",
-                help="Disable per-axis scale search (trust traj units).")
-    ap.add_argument("--scale-cap", type=float, default=0.05,
-                help="Max |scale-1| allowed per axis when auto-scaling (default ±5%).")
-    ap.add_argument("--eq-sphere-strength", type=float, default=0.0,
-                    help="Covariance-whitening strength in [0,1]. 0=off; try 0.3–0.6.")
-    ap.add_argument("--eq-sphere-pct", type=float, default=95.0,
-                    help="Percentile cutoff (e.g., 92–96) for robust covariance estimation.")
+
+    ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX", "NY", "NZ"))
+    ap.add_argument("--readout", type=int)
+    ap.add_argument("--coils", type=int)
+
+    ap.add_argument("--spokes-per-frame", type=int, default=0)
+    ap.add_argument("--frame-shift", type=int, default=0)
+
+    ap.add_argument("--fid-dtype", choices=["i2", "i4", "f4"], default="i2")
+    ap.add_argument("--fid-endian", choices=[">", "<"], default="<")
+    ap.add_argument("--fid-layout", choices=["ro_spokes_coils", "ro_coils_spokes"], default="ro_spokes_coils")
+
+    ap.add_argument("--spoke-order", choices=["tile", "repeat"], default="tile")
+    ap.add_argument("--readout-origin", choices=["centered", "zero"], default="centered")
+    ap.add_argument("--reverse-readout", action="store_true")
+    ap.add_argument("--traj-scale", type=float, default=None)
+
+    ap.add_argument("--traj-source", choices=["auto", "trajfile", "gradoutput"], default="auto")
+    ap.add_argument("--traj-file", default=None, help="Explicit traj file path (defaults to <series>/traj or pdata/**/traj)")
+
+    ap.add_argument("--qa-first", type=int, default=0)
+    ap.add_argument("--export-nifti", action="store_true")
+
+    ap.add_argument("--gpu", action="store_true")
 
     args = ap.parse_args()
 
-    # Device banner
-    use_gpu = (args.gpu >= 0 and cp is not None)
-    if use_gpu:
-        try:
-            ndev = cp.cuda.runtime.getDeviceCount()
-            if ndev > args.gpu:
-                with sp.Device(args.gpu):
-                    props = cp.cuda.runtime.getDeviceProperties(args.gpu)
-                    name = props["name"].decode() if isinstance(props["name"], bytes) else props["name"]
-                print(f"Using GPU {args.gpu}: {name}")
-            else:
-                print(f"[warn] Requested GPU {args.gpu} but only {ndev} device(s) found — falling back to CPU.")
-                args.gpu = -1
-        except Exception as e:
-            print(f"[warn] CuPy GPU init failed ({e}) — falling back to CPU.")
-            args.gpu = -1
+    series_path = Path(args.series).resolve()
+    out_base = Path(args.out).resolve()
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+
+    method = series_path / "method"
+    acqp = series_path / "acqp"
+    fid = series_path / "fid"
+    if not (method.exists() and acqp.exists() and fid.exists()):
+        ap.error(f"Could not find method/acqp/fid under {series_path}")
+
+    if args.matrix is not None:
+        NX, NY, NZ = map(int, args.matrix)
+        print(f"[info] Matrix overridden from CLI: {NX}x{NY}x{NZ}")
     else:
-        if args.gpu >= 0:
-            print("[warn] --gpu set but CuPy/CUDA not available — falling back to CPU.")
-        print("Using CPU.")
+        NX, NY, NZ = infer_matrix(method)
+        print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
-    # Load series
-    kdata, meta, hdr = load_bruker_series(args.series)
-    nread, nspokes = meta["nread"], meta["nspokes"]
-    vox = meta.get("vox", np.array([1,1,1], float))
-    fovmm = meta.get("fovmm", None)
-    print(f"Loaded: nread={nread}, nspokes={nspokes}, ncoils={meta['ncoils']}, SW_h={meta['SW_h']} Hz")
-    if fovmm is not None:
-        print(f"Header FOV (mm): {fovmm}")
+    if args.readout is not None:
+        true_ro = int(args.readout)
+        print(f"[info] Readout overridden from CLI: RO={true_ro}")
+    else:
+        true_ro = infer_true_ro(acqp)
+        print(f"[info] Readout (true RO) from ACQ_size: RO={true_ro}")
 
-    # Build coords
-    NX, NY, NZ = [int(x) for x in args.matrix]
-    img_shape_xyz = (NX, NY, NZ); img_shape_zyx = (NZ, NY, NX)
-    coords = load_series_traj(args.series, nread, nspokes, img_shape_xyz, fovmm, vox, args.traj_order)
-    if coords is None:
-        coords = make_ga_traj_3d(nspokes, nread)
+    if args.coils is not None:
+        coils_hint = int(args.coils)
+        print(f"[info] Coils overridden from CLI: {coils_hint}")
+    else:
+        coils_hint = infer_coils(method)
+        print(f"[info] Coils inferred from PVM_EncNReceivers: {coils_hint}")
 
-    # Spoke reversal (on data)
-    if args.rev_all:
-        kdata = kdata[::-1, :, :]
-        print("[readout] Reversed all spokes.")
-    elif args.alt_rev:
-        kdata[:, 1::2, :] = kdata[::-1, 1::2, :]
-        print("[readout] Reversed every other (odd) spoke.")
-
-    # Optional per-spoke DC remove
-    if args.demean_spoke:
-        kdata = kdata - kdata.mean(axis=0, keepdims=True)
-        print("[pre] Subtracted per-spoke DC (demean).")
-
-    # Decimate spokes if requested
-    if args.spoke_step > 1:
-        take = slice(0, nspokes, max(1, args.spoke_step))
-        kdata   = kdata[:, take, :]
-        coords  = coords.reshape(nread, nspokes, 3)[:, take, :].reshape(-1, 3)
-        nspokes = kdata.shape[1]
-        print(f"Decimated spokes by {args.spoke_step}: nspokes={nspokes}")
-
-
-    # ----- PROD mode: fast tuner then final (safe) -----
-    if args.prod:
-        small = tuple(max(64, s // 2) for s in img_shape_zyx)
-        gpu_psf = args.gpu if args.gpu_psf else -1
-
-        base = coords.copy()  # coords after any manual rd_shift/scale you've already applied
-
-        # Helper: finish a trial coord set exactly like the final pipeline will
-        def _finish(trial):
-            # optional whitening
-            if getattr(args, "eq_sphere_strength", 0.0) > 0.0:
-                trial, _ = equalize_k_sphere(
-                    trial,
-                    pct=float(getattr(args, "eq_sphere_pct", 95.0)),
-                    strength=float(getattr(args, "eq_sphere_strength", 0.0)),
-                )
-            # auto-pi (temporary, for fair cost)
-            if args.auto_pi:
-                p99 = float(np.percentile(np.linalg.norm(trial, axis=1), 99.0))
-                if p99 > 0:
-                    trial = trial * (np.pi / p99)
-            # FOV scale (so tuning “feels” the real crop)
-            if args.fov_scale != 1.0 and args.fov_scale > 0:
-                trial = trial / float(args.fov_scale)
-            # clip
-            if args.clip_pi:
-                r = np.linalg.norm(trial, axis=1)
-                mask = r > np.pi
-                if np.any(mask):
-                    trial[mask] *= (np.pi / r[mask])[:, None]
-            return trial
-
-        # 1) Auto-delay (coarse)
-        lo_d, hi_d = args.auto_delay_range
-        steps_d = max(5, args.auto_delay_steps)
-        best_d, best_cost = 0.0, 1e9
-        for sft in np.linspace(lo_d, hi_d, steps_d):
-            trial = apply_read_shift(base, nread, nspokes, sft)
-            trial = _finish(trial)
-            cost, _ = psf_aniso_cost(trial, small, os_fac=1.6, width=4, gpu=gpu_psf)
-            if cost < best_cost:
-                best_cost, best_d = cost, sft
-        coords = apply_read_shift(base, nread, nspokes, best_d)
-        print(f"[prod] auto-delay ≈ {best_d:.3f} (cost={best_cost:.4f})")
-
-        # 2) Auto-scale (per-axis, two passes around the chosen delay)
-        lo_s, hi_s = args.auto_scale_range
-        steps_s = max(3, args.auto_scale_steps)
-        scales = np.array([1.0, 1.0, 1.0], float)
-        for _ in range(2):
-            for ax in (0, 1, 2):
-                best_v, best_cost = 1.0, 1e9
-                for v in np.linspace(lo_s, hi_s, steps_s):
-                    test = coords.copy()
-                    test[:, ax] *= v
-                    test = _finish(test)
-                    cost, _ = psf_aniso_cost(test, small, os_fac=1.6, width=4, gpu=gpu_psf)
-                    if cost < best_cost:
-                        best_cost, best_v = cost, v
-                scales[ax] *= best_v
-                coords[:, ax] *= best_v
-
-        print(f"[prod] auto-scale ≈ (x,y,z)=({scales[0]:.3f},{scales[1]:.3f},{scales[2]:.3f})")
-
-        # Persist choices so your JSON sidecar reflects them
-        args.rd_shift = float(args.rd_shift + best_d)
-        args.scale_x = float(args.scale_x * scales[0])
-        args.scale_y = float(args.scale_y * scales[1])
-        args.scale_z = float(args.scale_z * scales[2])
-
-    # ---------- TRAJECTORY SANITIZER (single-pass) ----------
-    # coords shape: (M, 3), order: (kx, ky, kz)
-
-    # A) spoke/sample reordering already done earlier
-
-    # B) odd/even or all spoke reversal already done earlier
-
-    # C) manual readout delay (optional)
-    if abs(args.rd_shift) > 1e-12:
-        coords = apply_read_shift(coords, nread, nspokes, args.rd_shift)
-        print(f"[delay] Applied read shift of {args.rd_shift:.3f} samples.")
-
-    # D) manual per-axis scale (optional, broadcast-safe, no caps unless requested)
-    sx, sy, sz = float(args.scale_x), float(args.scale_y), float(args.scale_z)
-    if any(abs(s - 1.0) > 1e-12 for s in (sx, sy, sz)):
-        if getattr(args, "cap_manual_scale", False):
-            cap = float(getattr(args, "scale_cap", 0.05))
-            sx = float(np.clip(sx, 1.0 - cap, 1.0 + cap))
-            sy = float(np.clip(sy, 1.0 - cap, 1.0 + cap))
-            sz = float(np.clip(sz, 1.0 - cap, 1.0 + cap))
-        coords = coords.reshape(-1, 3)
-        coords[:, 0] *= sx
-        coords[:, 1] *= sy
-        coords[:, 2] *= sz
-        print(f"[scale] Applied per-axis scales (x,y,z) = ({sx:.3f}, {sy:.3f}, {sz:.3f})")
-
-    # E) OPTIONAL: sphere equalization (covariance whitening)
-    if getattr(args, "eq_sphere_strength", 0.0) > 0.0:
-        coords, gains = equalize_k_sphere(
-            coords,
-            pct=float(getattr(args, "eq_sphere_pct", 95.0)),
-            strength=float(args.eq_sphere_strength),
-        )
-        print(f"[eq-sphere] covariance whitening: pct={float(getattr(args,'eq_sphere_pct',95.0)):.1f}, strength={float(args.eq_sphere_strength):.2f}")
-
-    # F) Single π normalization (once!)
-    if args.auto_pi:
-        r_p99 = float(np.percentile(np.linalg.norm(coords, axis=1), 99.0))
-        if r_p99 > 0:
-            s = float(np.pi / r_p99)
-            coords *= s
-            print(f"[auto-pi] Scaled coords by {s:.4f} so |k|_p99 ≈ π.")
-
-    # F2) Effective FOV change (must be AFTER auto-pi or it gets undone)
-    if args.fov_scale != 1.0 and args.fov_scale > 0:
-        coords = coords / float(args.fov_scale)
-        print(f"[fov] Applying effective FOV scale = {args.fov_scale:.3f} (smaller = more crop)")
-
-    # G) Gentle safety clip AFTER π and FOV scaling
-    if args.clip_pi:
-        r = np.linalg.norm(coords, axis=1)
-        mask = r > np.pi
-        if np.any(mask):
-            coords[mask] *= (np.pi / r[mask])[:, None]
-            print(f"[clip] Clipped |k| to ≤ π for {int(mask.sum())}/{coords.shape[0]} samples.")
-
-    r = np.linalg.norm(coords, axis=1)
-    kstd = np.std(coords, axis=0)
-    print(f"[diag] |k| p[1,50,99] = {np.percentile(r,[1,50,99])}  std(kx,ky,kz)={tuple(kstd)}")
-    # ---------------------------------------------------------
-
-
-    # NUFFT adjoint per-coil
-    coil_imgs = recon_adj_percoil(
-        kdata, tuple(args.matrix), coords,
-        dcf_mode=args.dcf, gpu=args.gpu
+    ksp, stored_ro, spokes_all, coils = load_bruker_kspace(
+        fid_path=fid,
+        true_ro=true_ro,
+        coils_hint=coils_hint,
+        endian=args.fid_endian,
+        base_kind=args.fid_dtype,
+        fid_layout=args.fid_layout,
     )
 
-    # Coil combine (SoS or adaptive)
-    img = combine_coils(
-        coil_imgs, method=args.combine,
-        lp_frac=args.lp_frac, bias_correct=args.bias_correct
+    spf = spokes_all if args.spokes_per_frame <= 0 else args.spokes_per_frame
+    shift = spf if args.frame_shift <= 0 else args.frame_shift
+    qa_first = args.qa_first if args.qa_first > 0 else None
+
+    traj_file = Path(args.traj_file).resolve() if args.traj_file else None
+
+    run_bart(
+        series_path=series_path,
+        method=method,
+        acqp=acqp,
+        out_base=out_base,
+        NX=NX, NY=NY, NZ=NZ,
+        true_ro=true_ro,
+        ksp=ksp,
+        spokes_all=spokes_all,
+        spokes_per_frame=spf,
+        frame_shift=shift,
+        qa_first=qa_first,
+        export_nifti=args.export_nifti,
+        traj_scale=args.traj_scale,
+        use_gpu=args.gpu,
+        spoke_order=args.spoke_order,
+        readout_origin=args.readout_origin,
+        reverse_readout=args.reverse_readout,
+        traj_source=args.traj_source,
+        traj_file=traj_file,
     )
 
-    affine = np.diag([vox[0], vox[1], vox[2], 1.0])
-    nib.save(nib.Nifti1Image(np.asarray(img, np.float32), affine), args.out)
-    print(f"Wrote {args.out}")
-
-    # PNGs
-    if args.png:
-        trip = _tripanel_from_volume(img, labels=("Axial","Coronal","Sagittal"))
-        trip_path = str(Path(args.out).with_suffix("")) + "_tripanel.png"
-        trip.save(trip_path); print(f"Saved tripanel PNG → {trip_path}")
-    if args.psf:
-        psf_mag = psf_volume(coords, img_shape_zyx, os_fac=args.os_fac, width=args.width,
-                             gpu=(args.gpu if args.gpu_psf else -1))
-        vz, vy, vx = anisotropy_metrics(psf_mag)
-        vmean = (vx+vy+vz)/3.0
-        trip_psf = _tripanel_from_volume(psf_mag, labels=("PSF Axial","PSF Coronal","PSF Sagittal"))
-        psf_path = str(Path(args.out).with_suffix("")) + "_psf.png"
-        trip_psf.save(psf_path); print(f"Saved PSF PNG → {psf_path}")
-        print(f"[psf] second-moment variances (Z,Y,X) = ({vz:.4f}, {vy:.4f}, {vx:.4f}); "
-              f"anisotropy ratios vs mean = ({vz/vmean:.3f}, {vy/vmean:.3f}, {vx/vmean:.3f})")
-
-    # Sidecar for reproducibility
-    sidecar = {
-        "series": str(args.series), "out": str(args.out),
-        "matrix": [int(NX),int(NY),int(NZ)],
-        "traj_order": args.traj_order, "alt_rev": args.alt_rev, "rev_all": args.rev_all,
-        "auto_pi": args.auto_pi, "rd_shift": args.rd_shift,
-        "scale": {"x": args.scale_x, "y": args.scale_y, "z": args.scale_z},
-        "apod": {"kind": args.apod, "tukey_alpha": args.tukey_alpha,
-                 "kaiser_beta": args.kaiser_beta, "gauss_sigma": args.gauss_sigma},
-        "os": args.os_fac, "width": args.width, "fov_scale": args.fov_scale,
-        "demean_spoke": args.demean_spoke, "clip_pi": args.clip_pi
-    }
-    with open(str(Path(args.out).with_suffix("")) + "_recon.json", "w") as f:
-        json.dump(sidecar, f, indent=2)
-        print("Saved params →", f.name)
 
 if __name__ == "__main__":
     main()
