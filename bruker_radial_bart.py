@@ -504,7 +504,8 @@ def build_traj_from_dirs(
     reverse_readout: bool,
 ) -> np.ndarray:
     spokes = dirs_xyz.shape[0]
-    kmax = 0.5 * NX
+    # BART NUFFT expects k in cycles/FOV units ~ [-0.5, 0.5]
+    kmax = 0.5
     if traj_scale is not None:
         kmax *= float(traj_scale)
 
@@ -722,16 +723,25 @@ def load_traj_auto(
         traj, fmt = parse_trajfile_bruker_traj_autofmt(p, npro=int(npro), true_ro=true_ro)
 
         # ---- trajfile-specific sanity / fixing ----
-        # Bruker UTE traj is often center-out: |k|(RO=0) ~ 0 and increases with RO.
-        # If we see the opposite (center at the END), flip the RO axis.
-        k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)  # (RO, NPro)
+        # NOTE: traj is complex64 (imag=0) because we store CFL that way.
+        # Always operate on the real part to avoid ComplexWarning.
+        tx = np.real(traj[0])
+        ty = np.real(traj[1])
+        tz = np.real(traj[2])
+
+        k_mag = np.sqrt(tx * tx + ty * ty + tz * tz)  # (RO, NPro)
         ro0 = float(np.median(k_mag[0, :]))
         rol = float(np.median(k_mag[-1, :]))
         print(f"[debug] trajfile pre-fix |k| median RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
 
+        # For center-out, |k| should generally increase with RO.
+        # If it decreases, flip the readout axis.
         if rol < ro0:
             traj = traj[:, ::-1, :].copy()
-            k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
+            tx = np.real(traj[0])
+            ty = np.real(traj[1])
+            tz = np.real(traj[2])
+            k_mag = np.sqrt(tx * tx + ty * ty + tz * tz)
             ro0 = float(np.median(k_mag[0, :]))
             rol = float(np.median(k_mag[-1, :]))
             print(f"[info] trajfile: flipped readout axis so center is at RO[0]. Now RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
@@ -739,14 +749,38 @@ def load_traj_auto(
         # Apply explicit reverse-readout flag for trajfile too
         if reverse_readout:
             traj = traj[:, ::-1, :].copy()
-            k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
+            tx = np.real(traj[0])
+            ty = np.real(traj[1])
+            tz = np.real(traj[2])
+            k_mag = np.sqrt(tx * tx + ty * ty + tz * tz)
             ro0 = float(np.median(k_mag[0, :]))
             rol = float(np.median(k_mag[-1, :]))
             print(f"[info] trajfile: applied --reverse-readout. Now RO[0]={ro0:.6g} RO[-1]={rol:.6g}")
 
         # Expand spokes if acquisition has multiple volumes and traj is per-volume
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
+
+        # ---- IMPORTANT: BART NUFFT trajectory scaling ----
+        # BART expects k in cycles/FOV (about [-0.5, 0.5], or [0, 0.5] for center-out).
+        # So the correct target kmax is 0.5, NOT NX/2.
+        #
+        # Auto-scale based on the median radius at the last RO sample (robust for center-out).
+        tx = np.real(traj[0])
+        ty = np.real(traj[1])
+        tz = np.real(traj[2])
+        k_end = np.sqrt(tx[-1, :] * tx[-1, :] + ty[-1, :] * ty[-1, :] + tz[-1, :] * tz[-1, :])
+        kmax_curr = float(np.median(k_end))
+        kmax_tgt = 0.5
+
+        if kmax_curr > 0:
+            scale = kmax_tgt / kmax_curr
+            traj = (traj * scale).astype(np.complex64, copy=False)
+            print(f"[info] trajfile auto-scale (BART units): kmax_curr≈{kmax_curr:.6g} -> kmax_tgt={kmax_tgt} (scale={scale:.6g})")
+        else:
+            print("[warn] trajfile auto-scale skipped: kmax_curr≈0", file=sys.stderr)
+
         return traj, f"trajfile:{fmt}:(NPro={npro},RO={true_ro},3)"
+
 
     if traj_source == "gradoutput":
         return _from_gradoutput(), "gradoutput"
