@@ -793,10 +793,33 @@ def load_traj_auto(
             print("[info] trajfile: applied --reverse-readout")
             traj_radial_profile_debug(traj, label="trajfile after_reverse")
 
-        # Recenter RO axis (centered -> RO[mid], center-out -> RO[0])
-        traj, shift = _maybe_recenter_readout_by_zero_crossing(traj, label="trajfile")
-        if shift != 0:
-            traj_radial_profile_debug(traj, label="trajfile after_recenter")
+        # ---------------------------------------------
+        # Robust RO recentering using |k| minimum
+        # ---------------------------------------------
+        k_mag = np.sqrt(
+            np.real(traj[0]) ** 2 +
+            np.real(traj[1]) ** 2 +
+            np.real(traj[2]) ** 2
+        ).astype(np.float64, copy=False)   # (RO, spokes)
+
+        k_ro_med = np.median(k_mag, axis=1)  # (RO,)
+        imin = int(np.argmin(k_ro_med))
+        mid = k_ro_med.shape[0] // 2
+
+        if 0.1 * k_ro_med.shape[0] < imin < 0.9 * k_ro_med.shape[0]:
+            shift = mid - imin
+            if shift != 0:
+                traj = np.roll(traj, shift=shift, axis=1)
+                print(
+                    f"[info] trajfile: centered readout; shifted RO axis by {shift} "
+                    f"to place |k| min at RO[mid]={mid} (imin={imin})"
+                )
+                traj_radial_profile_debug(traj, label="trajfile after_recenter_kmin")
+        else:
+            print(
+                f"[info] trajfile: center-out readout detected "
+                f"(|k| min at RO={imin}); no RO recentering applied"
+            )
 
         # Expand spokes if traj is per-volume and k-space has multiple volumes
         traj = expand_traj_spokes(traj, target_spokes=spokes_all, order=spoke_order)
