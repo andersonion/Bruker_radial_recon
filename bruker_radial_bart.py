@@ -344,6 +344,54 @@ def _traj_score(traj_3_ro_sp: np.ndarray) -> float:
         5.0 * _traj_monotonic_score_centered(traj_3_ro_sp),
     )
 
+def _traj_ro_axis_variation_score(traj_3_a_b: np.ndarray) -> float:
+    """
+    Score a candidate traj assumed to be shaped as (3, RO, spokes).
+
+    High score when:
+      - Within each spoke, the radial coordinate varies a lot across RO
+      - Across spokes, the spread at a given RO is comparatively smaller
+
+    This helps disambiguate which axis is RO vs spokes across reshape/permutation candidates.
+    """
+    # traj_3_a_b is assumed (3, RO, spokes) for scoring
+    tx = np.real(traj_3_a_b[0]).astype(np.float64, copy=False)
+    ty = np.real(traj_3_a_b[1]).astype(np.float64, copy=False)
+    tz = np.real(traj_3_a_b[2]).astype(np.float64, copy=False)
+
+    # Use |k| as a direction-independent proxy
+    k_mag = np.sqrt(tx * tx + ty * ty + tz * tz)  # (RO, spokes)
+
+    # 1) Within-spoke variation across RO (per spoke: max-min over RO)
+    ro_range_per_spoke = np.max(k_mag, axis=0) - np.min(k_mag, axis=0)  # (spokes,)
+    ro_range_med = float(np.median(ro_range_per_spoke))
+
+    # 2) Across-spoke spread at a few RO positions (robust quantile spread)
+    ro_idx = [
+        0,
+        k_mag.shape[0] // 4,
+        k_mag.shape[0] // 2,
+        (3 * k_mag.shape[0]) // 4,
+        k_mag.shape[0] - 1,
+    ]
+    spoke_spreads = []
+    for i in ro_idx:
+        v = k_mag[i, :]
+        q05, q95 = np.percentile(v, [5.0, 95.0])
+        spoke_spreads.append(float(q95 - q05))
+    spoke_spread_med = float(np.median(spoke_spreads))
+
+    # Avoid division by zero; if everything is flat, this is junk anyway
+    eps = 1e-12
+    ratio = ro_range_med / max(spoke_spread_med, eps)
+
+    # Also reward having non-trivial RO range at all
+    if ro_range_med < 1e-6:
+        return -1e6
+
+    return ratio
+
+
 def _traj_radial_coordinate(traj: np.ndarray, *, mode: str = "end_minus_start") -> np.ndarray:
     """
     Compute radial coordinate r(RO,spoke) by projecting k onto an estimated spoke direction.
@@ -496,9 +544,24 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
                 else:
                     continue
 
-                score = _traj_score(traj)
+             # -------------------------------
+                # RO-axis identification scoring
+                # -------------------------------
 
-                k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
+                score_monotonic = _traj_score(traj)
+                score_roaxis = _traj_ro_axis_variation_score(traj)
+
+                # Weighted blend:
+                # - RO-axis variation dominates (which axis is RO?)
+                # - monotonic score refines centered vs center-out
+                score = (5.0 * score_roaxis) + (1.0 * score_monotonic)
+
+                # Reject degenerate trajectories
+                k_mag = np.sqrt(
+                    traj[0] ** 2 +
+                    traj[1] ** 2 +
+                    traj[2] ** 2
+                )
                 if float(np.max(k_mag)) < 1e-6:
                     score -= 1e6
 
@@ -507,6 +570,7 @@ def parse_trajfile_autoshape(traj_path: Path, *, npro: int, ro: int) -> tuple[np
                 if best_score is None or score > best_score:
                     best_score = score
                     best_tag = tag
+                    best_traj = traj
                     best_traj = traj
 
     if best_traj is None or best_tag is None:
