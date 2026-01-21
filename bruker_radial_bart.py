@@ -904,6 +904,22 @@ def load_traj_auto(
 
         # Subtract k0 from all RO samples for each spoke
         traj = traj - k0[:, None, :]
+        
+        # Sanity check: per-spoke min(|k|) should now be ~0
+        k_mag3 = np.sqrt(
+            np.real(traj[0]) ** 2 +
+            np.real(traj[1]) ** 2 +
+            np.real(traj[2]) ** 2
+        ).astype(np.float64, copy=False)  # (RO, spokes)
+
+        per_spoke_min = np.min(k_mag3, axis=0)  # (spokes,)
+        p = np.percentile(per_spoke_min, [0, 1, 5, 50, 95, 99, 100])
+        print(
+            "[debug] trajfile after_spoke_deoffset per-spoke min(|k|) "
+            f"p0/p1/p5/p50/p95/p99/p100: {p[0]:.6g}, {p[1]:.6g}, {p[2]:.6g}, "
+            f"{p[3]:.6g}, {p[4]:.6g}, {p[5]:.6g}, {p[6]:.6g}"
+        )
+
 
         # Optional: if you want a *global* de-offset instead, you could do:
         # k0_global = np.median(k0, axis=1, keepdims=True)  # (3,1)
