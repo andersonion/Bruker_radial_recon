@@ -1,37 +1,41 @@
 #!/usr/bin/env python3
 """
-bruker_radial_bart.py
+Bruker 3D radial -> BART NUFFT recon driver.
 
-Bruker 3D radial -> BART NUFFT recon, with MATLAB-faithful parsing of:
-  - fid: int32 ieee-le, block-trimmed to n_ray per "ray", then reshaped with column-major semantics
-  - traj: float64 ieee-le, reshaped (3, n_read, n_spokes) with column-major semantics, scaled by traj_scaling
+Supports trajectory from:
+  - traj file (Bruker writes <series>/traj)  --traj-source trajfile
+  - grad.output directions                   --traj-source gradoutput
+  - auto: prefer trajfile if usable else gradoutput
 
-Also includes an OPTIONAL gradient-delay / readout-shift correction:
-  - Find opposed spoke pairs from traj directions
-  - Estimate per-pair 1D shift (samples) by FFT cross-correlation against conjugate-reversed opposite spoke
-  - Fit axis-dependent model: s_i ≈ ax*uix + ay*uiy + az*uiz
-  - Predict per-spoke shifts and apply fractional shift along RO via Fourier shift theorem
+Key points:
+  - BART NUFFT expects k-space dims[0] == 1 => write ksp as (1, RO, spokes, coils)
+  - Traj written as (3, RO, spokes)
 
-Notes:
-  - BART NUFFT expects k-space dims[0] == 1 => ksp written as (1, RO, spokes, coils)
-  - traj written as (3, RO, spokes)
-  - This script aims to be boring and faithful. No autoshape/heuristics for traj parsing.
+This version:
+  - Keeps prior argument surface; NEVER requires specifying N_coils/N_read/N_vols manually.
+  - Uses MATLAB-faithful traj parsing by default:
+      * reads float64, tries LE/BE, reshapes with order='F'
+      * infers traj RO from file length and NPro (##$NPro)
+      * scales by NX (PVM_Matrix[0]) so [-0.5,0.5] -> [-NX/2, NX/2]
+  - Adds MATLAB-faithful FID parsing path for int32 with 1024-byte block trimming.
+
+If you want your older autoshape logic back later, we can add it as a fallback mode,
+but right now we're prioritizing “match MATLAB that you verified”.
 """
 
 import argparse
-import subprocess
 import sys
+import subprocess
 import textwrap
+import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import nibabel as nib
 
 
-# ----------------------------
-# Bruker param helpers
-# ----------------------------
+# ---------------- Bruker helpers ---------------- #
 
 def read_bruker_param(path: Path, key: str, default=None):
     if not path.exists():
@@ -100,11 +104,23 @@ def infer_coils(method: Path) -> int:
     return int(v if not isinstance(v, (list, tuple)) else v[0])
 
 
-# ----------------------------
-# BART CFL I/O
-# ----------------------------
+def infer_npro(method: Path, acqp: Path) -> Optional[int]:
+    v = read_bruker_param(method, "NPro", None)
+    if v is None:
+        v = read_bruker_param(acqp, "NPro", None)
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return int(v[0])
+    try:
+        return int(v)
+    except Exception:
+        return None
 
-def writecfl(name: str, arr: np.ndarray) -> None:
+
+# ---------------- BART CFL helpers ---------------- #
+
+def writecfl(name: str, arr: np.ndarray):
     base = Path(name)
     hdr = base.with_suffix(".hdr")
     cfl = base.with_suffix(".cfl")
@@ -155,39 +171,408 @@ def readcfl(name: str) -> np.ndarray:
     return cplx.reshape(dims, order="F")
 
 
-def bart_cfl_to_nifti(base: Path, out_nii_gz: Path, voxel_mm: Optional[float] = None) -> None:
+def bart_image_dims(bart_bin: str, base: Path) -> list[int] | None:
+    dims: list[int] = []
+    for d in range(16):
+        proc = subprocess.run(
+            [bart_bin, "show", "-d", str(d), str(base)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode != 0:
+            print(f"[warn] bart show -d {d} failed: {proc.stderr.strip()}", file=sys.stderr)
+            return None
+        dims.append(int(proc.stdout.strip()))
+    return dims
+
+
+def bart_supports_gpu(bart_bin: str = "bart") -> bool:
+    proc = subprocess.run([bart_bin, "nufft", "-i", "-g"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode == 0:
+        return True
+    s = (proc.stderr or "").lower()
+    if "compiled without gpu support" in s or "unknown option" in s:
+        return False
+    return False
+
+
+# ---------------- NIfTI writers ---------------- #
+
+def bart_cfl_to_nifti(base: Path, out_nii_gz: Path):
     arr = np.abs(readcfl(str(base)))
-    aff = np.eye(4, dtype=np.float64)
-    if voxel_mm is not None and voxel_mm > 0:
-        aff[0, 0] = voxel_mm
-        aff[1, 1] = voxel_mm
-        aff[2, 2] = voxel_mm
-    nib.save(nib.Nifti1Image(arr.astype(np.float32), aff), str(out_nii_gz))
+    nib.save(nib.Nifti1Image(arr.astype(np.float32), np.eye(4)), str(out_nii_gz))
 
 
-# ----------------------------
-# MATLAB-faithful readers
-# ----------------------------
+def write_qa_nifti(qa_frames: list[Path], qa_base: Path):
+    vols = []
+    shape0 = None
+    for p in qa_frames:
+        mag = np.abs(readcfl(str(p)))
+        if shape0 is None:
+            shape0 = mag.shape
+        elif mag.shape != shape0:
+            raise ValueError(f"QA frame {p} has shape {mag.shape}, expected {shape0}")
+        vols.append(mag)
+    qa_stack = np.stack(vols, axis=-1)
+    out = qa_base.with_suffix(".nii.gz")
+    nib.save(nib.Nifti1Image(qa_stack.astype(np.float32), np.eye(4)), str(out))
+    print(f"[info] Wrote QA NIfTI {out} with shape {qa_stack.shape}")
 
-def read_fid_matlab_like(
-    fid_file: Path,
+
+# ---------------- Trajectory: MATLAB-faithful trajfile ---------------- #
+
+def _traj_sanity_score(v: np.ndarray) -> float:
+    """
+    Very lightweight sanity:
+      - finite
+      - not all zeros
+      - magnitude percentiles not absurd
+    Returns higher=better.
+    """
+    if not np.all(np.isfinite(v)):
+        return -1e9
+    vmax = float(np.max(np.abs(v)))
+    if vmax == 0.0:
+        return -1e9
+    p = np.percentile(np.abs(v), [50, 95, 99])
+    # prefer values that look like “fractions” before scaling (often <= ~1)
+    score = 0.0
+    score += -abs(np.log10(max(p[0], 1e-12)) - np.log10(0.5))
+    score += -abs(np.log10(max(p[1], 1e-12)) - np.log10(1.0))
+    score += -abs(np.log10(max(p[2], 1e-12)) - np.log10(2.0))
+    return score
+
+
+def parse_trajfile_matlab_faithful(
+    traj_path: Path,
     *,
-    n_vols: int,
-    n_coils: int,
-    n_read: int,
-    endian: str = "<",              # MATLAB: ieee-le
-    dtype: str = "i4",              # MATLAB: int32
-    block_bytes: int = 1024,
-) -> np.ndarray:
+    npro: int,
+    nx: int,
+) -> Tuple[np.ndarray, int, str]:
     """
-    Returns complex64 array shaped (n_read, n_coils, n_spokes, n_vols),
-    mirroring your MATLAB semantics, including column-major reshapes.
-    """
-    fid_file = Path(fid_file)
-    raw = np.fromfile(fid_file, dtype=np.dtype(endian + dtype))
+    MATLAB-faithful:
+      traj = fread(..., 'float64', 'ieee-le');
+      traj = reshape(traj, 3, n_read, []);
+      traj = traj * traj_scaling;   % where traj_scaling should be NX (not hardcoded)
 
-    n_ray = int(n_coils * n_read * 2)  # 2 for re/im
-    bytes_per_sample = np.dtype(endian + dtype).itemsize
+    We infer n_read from file length and NPro:
+      len = 3 * n_read * npro  (float64 elements)
+
+    Returns:
+      traj: complex64 shaped (3, n_read, npro)
+      n_read
+      tag: 'f8_le_F' or 'f8_be_F'
+    """
+    b = traj_path.read_bytes()
+    if len(b) % 8 != 0:
+        raise ValueError(f"traj bytes {len(b)} not multiple of 8; cannot be float64")
+
+    ne = len(b) // 8
+    if ne % (3 * npro) != 0:
+        raise ValueError(
+            f"traj element count {ne} not divisible by (3*NPro)={3*npro}. "
+            f"Cannot infer n_read."
+        )
+
+    n_read = ne // (3 * npro)
+
+    v_le = np.frombuffer(b, dtype="<f8")
+    v_be = np.frombuffer(b, dtype=">f8")
+
+    s_le = _traj_sanity_score(v_le)
+    s_be = _traj_sanity_score(v_be)
+
+    if s_be > s_le:
+        v = v_be
+        tag = "f8_be_F"
+    else:
+        v = v_le
+        tag = "f8_le_F"
+
+    traj = v.reshape(3, n_read, npro, order="F").astype(np.float32, copy=False)
+
+    # Scaling: MATLAB used traj_scaling=96, but the general rule is scale by NX
+    # so [-0.5,0.5] -> [-NX/2, NX/2].
+    traj *= float(nx)
+
+    traj_c = np.asfortranarray(traj).astype(np.complex64, copy=False)
+    return traj_c, int(n_read), tag
+
+
+def traj_radial_profile_debug(traj: np.ndarray, label: str = "traj") -> None:
+    k_mag = np.sqrt(
+        np.real(traj[0]) ** 2 +
+        np.real(traj[1]) ** 2 +
+        np.real(traj[2]) ** 2
+    ).astype(np.float64, copy=False)
+    k_ro_med = np.median(k_mag, axis=1)
+    imin = int(np.argmin(k_ro_med))
+    mid = k_ro_med.shape[0] // 2
+    print(f"[debug] {label} |k| median at RO[0],RO[mid],RO[-1]: {k_ro_med[0]:.6g}, {k_ro_med[mid]:.6g}, {k_ro_med[-1]:.6g}")
+    print(f"[debug] {label} |k| median min at RO={imin} (|k|≈{k_ro_med[imin]:.6g})")
+
+
+def recenter_ro_by_kmin_if_centered(traj: np.ndarray, *, label: str) -> Tuple[np.ndarray, int]:
+    """
+    If centered readout, roll RO so median(|k|) minimum is at RO[mid].
+    """
+    k_mag = np.sqrt(
+        np.real(traj[0]) ** 2 +
+        np.real(traj[1]) ** 2 +
+        np.real(traj[2]) ** 2
+    ).astype(np.float64, copy=False)
+    k_ro_med = np.median(k_mag, axis=1)
+    imin = int(np.argmin(k_ro_med))
+    mid = int(k_ro_med.shape[0] // 2)
+
+    # only shift if min isn't near ends
+    if 0.1 * k_ro_med.shape[0] < imin < 0.9 * k_ro_med.shape[0]:
+        shift = mid - imin
+        if shift != 0:
+            traj2 = np.roll(traj, shift=shift, axis=1)
+            print(f"[info] {label}: centered readout; shifted RO axis by {shift} to place |k| med-min at RO[mid]={mid} (imin={imin})")
+            return traj2, shift
+        return traj, 0
+
+    print(f"[info] {label}: center-out readout detected (|k| min at RO={imin}); no RO recentering applied")
+    return traj, 0
+
+
+def expand_traj_spokes(traj: np.ndarray, target_spokes: int, order: str) -> np.ndarray:
+    nsp = traj.shape[2]
+    if target_spokes == nsp:
+        return traj
+    if target_spokes % nsp != 0:
+        raise ValueError(f"Cannot expand traj spokes {nsp} to {target_spokes} (not divisible)")
+    reps = target_spokes // nsp
+    print(f"[info] Expanding traj spokes {nsp} -> {target_spokes} with reps={reps} using order='{order}'")
+    if order == "tile":
+        return np.tile(traj, (1, 1, reps))
+    if order == "repeat":
+        return np.repeat(traj, reps, axis=2)
+    raise ValueError(f"Unknown spoke-order: {order}")
+
+
+# ---------------- grad.output trajectory ---------------- #
+
+def _extract_grad_block(lines: list[str], name: str) -> np.ndarray:
+    hdr_pat = re.compile(rf"^\s*\d+:{re.escape(name)}:\s+index\s*=\s*\d+,\s+size\s*=\s*(\d+)\s*$")
+
+    start = None
+    size = None
+    for i, line in enumerate(lines):
+        m = hdr_pat.match(line.strip())
+        if m:
+            start = i + 1
+            size = int(m.group(1))
+            break
+
+    if start is None or size is None:
+        raise ValueError(f"Could not find {name} in grad.output")
+
+    vals: list[int] = []
+    for line in lines[start:]:
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^\d+:\w+:", line) or line.startswith("Ramp Shape"):
+            break
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        vals.append(int(parts[1]))
+        if len(vals) >= size:
+            break
+
+    if len(vals) != size:
+        raise ValueError(f"{name}: expected {size} values, got {len(vals)}")
+    return np.array(vals, dtype=np.float64)
+
+
+def load_grad_output_dirs(grad_output_path: Path, normalize: bool = True) -> np.ndarray:
+    lines = grad_output_path.read_text(errors="ignore").splitlines()
+    r = _extract_grad_block(lines, "ProjR")
+    p = _extract_grad_block(lines, "ProjP")
+    s = _extract_grad_block(lines, "ProjS")
+
+    scale = float(1 << 30)
+    dirs = np.stack([r, p, s], axis=1) / scale
+
+    norms = np.linalg.norm(dirs, axis=1)
+    print(f"[info] Parsed {dirs.shape[0]} spoke directions from {grad_output_path}")
+    print(f"[info] Direction norms BEFORE normalize: min={norms.min():.4f} median={np.median(norms):.4f} max={norms.max():.4f}")
+
+    if normalize:
+        bad = norms == 0
+        if np.any(bad):
+            raise ValueError(f"Found {bad.sum()} zero-norm direction(s) in {grad_output_path}")
+        dirs = dirs / norms[:, None]
+        norms2 = np.linalg.norm(dirs, axis=1)
+        print(f"[info] Direction norms AFTER  normalize: min={norms2.min():.4f} median={np.median(norms2):.4f} max={norms2.max():.4f}")
+
+    return dirs
+
+
+def expand_spoke_dirs(dirs: np.ndarray, target_spokes: int, order: str) -> np.ndarray:
+    n = dirs.shape[0]
+    if target_spokes == n:
+        return dirs
+    if target_spokes % n != 0:
+        raise ValueError(f"Cannot expand dirs length {n} to {target_spokes} (not divisible)")
+    reps = target_spokes // n
+    print(f"[info] Expanding {n} dirs to {target_spokes} spokes with reps={reps} using order='{order}'")
+    if order == "tile":
+        return np.tile(dirs, (reps, 1))
+    if order == "repeat":
+        return np.repeat(dirs, reps, axis=0)
+    raise ValueError(f"Unknown spoke-order: {order}")
+
+
+def build_traj_from_dirs(true_ro: int, dirs_xyz: np.ndarray, NX: int) -> np.ndarray:
+    spokes = dirs_xyz.shape[0]
+    # Build centered readout from -NX/2..NX/2 in "pixel" units
+    kmax = 0.5 * float(NX)
+    s = np.linspace(-kmax, kmax, true_ro, dtype=np.float64)
+
+    traj = np.zeros((3, true_ro, spokes), dtype=np.complex64)
+    dx, dy, dz = dirs_xyz[:, 0], dirs_xyz[:, 1], dirs_xyz[:, 2]
+    for i in range(spokes):
+        traj[0, :, i] = s * dx[i]
+        traj[1, :, i] = s * dy[i]
+        traj[2, :, i] = s * dz[i]
+
+    print(f"[info] Traj built from grad.output with max |k| ≈ {np.abs(traj).max():.2f}")
+    return traj
+
+
+# ---------------- FID / k-space loading ---------------- #
+
+def factor_fid(total_points: int, true_ro: int, coils_hint: Optional[int]):
+    block_candidates = [true_ro]
+    for b in (128, 96, 64, 256, 192, 384, 512):
+        if b != true_ro:
+            block_candidates.append(b)
+
+    if coils_hint is not None:
+        coil_candidates = [coils_hint] + [c for c in range(1, 33) if c != coils_hint]
+    else:
+        coil_candidates = list(range(1, 33))
+
+    best = None
+    best_score = -1
+
+    for stored_ro in block_candidates:
+        for c in coil_candidates:
+            denom = stored_ro * c
+            if denom <= 0:
+                continue
+            if total_points % denom != 0:
+                continue
+            spokes = total_points // denom
+
+            score = 0
+            if stored_ro >= true_ro:
+                score += 2
+            if abs(stored_ro - true_ro) <= 10:
+                score += 2
+            if spokes > 100:
+                score += 1
+            if coils_hint is not None and c == coils_hint:
+                score += 2
+
+            if score > best_score:
+                best_score = score
+                best = (stored_ro, c, spokes)
+
+    if best is None:
+        raise ValueError(
+            f"Could not factor FID: total={total_points}, true_ro={true_ro}, coils_hint={coils_hint}"
+        )
+    return best  # (stored_ro, coils, spokes)
+
+
+def load_bruker_kspace_simple(
+    fid_path: Path,
+    true_ro: int,
+    coils_hint: Optional[int],
+    endian: str,
+    base_kind: str,
+    fid_layout: str,
+):
+    """
+    Your prior “simple” loader: read raw interleaved re/im, factor into (stored_ro, spokes, coils),
+    trim to true_ro, return ksp (true_ro, spokes, coils).
+    """
+    if not fid_path.exists():
+        raise FileNotFoundError(f"FID not found: {fid_path}")
+
+    np_dtype = np.dtype(endian + base_kind)
+    raw = np.fromfile(fid_path, dtype=np_dtype).astype(np.float32)
+    if raw.size % 2 != 0:
+        raise ValueError(f"FID length {raw.size} not even (real/imag pairs).")
+
+    cplx = raw[0::2] + 1j * raw[1::2]
+    total_points = cplx.size
+
+    stored_ro, coils, spokes = factor_fid(total_points, true_ro, coils_hint)
+
+    if coils_hint is not None and coils != coils_hint:
+        print(f"[warn] FID suggests coils={coils}, header said {coils_hint}; using {coils}.", file=sys.stderr)
+
+    print(f"[info] Loaded k-space with stored_ro={stored_ro}, true_ro={true_ro}, spokes={spokes}, coils={coils}")
+
+    if fid_layout == "ro_spokes_coils":
+        ksp = cplx.reshape(stored_ro, spokes, coils)
+    elif fid_layout == "ro_coils_spokes":
+        ksp = cplx.reshape(stored_ro, coils, spokes).transpose(0, 2, 1)
+    else:
+        raise ValueError(f"Unknown fid_layout: {fid_layout}")
+
+    if stored_ro != true_ro:
+        if stored_ro < true_ro:
+            raise ValueError(f"stored_ro={stored_ro} < true_ro={true_ro}")
+        ksp = ksp[:true_ro]
+        print(f"[info] Trimmed k-space from stored_ro={stored_ro} to true_ro={true_ro}")
+
+    return ksp.astype(np.complex64, copy=False), stored_ro, spokes, coils
+
+
+def load_bruker_kspace_matlab_blocktrim_i4(
+    fid_path: Path,
+    *,
+    n_read: int,
+    n_coils: int,
+    npro: Optional[int],
+    endian: str = "<",
+    block_bytes: int = 1024,
+):
+    """
+    MATLAB-faithful block-trim path for int32 LE/BE.
+
+    Mirrors:
+      x = fread(..., int32, ieee-le)
+      n_ray = n_coils * n_read * 2
+      n_blocks = ceil(n_ray*4 / 1024)
+      n_block_samples = n_blocks*1024 / 4
+      x = reshape(x, n_block_samples, [])
+      x = x(1:n_ray,:)
+      x = x(:)
+      x = reshape(x, 2, n_read, n_coils, [], n_vols)
+
+    We infer:
+      total_rays = raw.size / n_block_samples
+      spokes_total = total_rays
+      if npro provided and divisible: n_vols = spokes_total / npro, spokes_per_vol = npro
+      else: n_vols = 1, spokes_per_vol = spokes_total
+    """
+    if not fid_path.exists():
+        raise FileNotFoundError(f"FID not found: {fid_path}")
+
+    raw = np.fromfile(fid_path, dtype=np.dtype(endian + "i4"))
+
+    n_ray = int(n_coils * n_read * 2)
+    bytes_per_sample = 4
     n_blocks = int(np.ceil((n_ray * bytes_per_sample) / float(block_bytes)))
     n_block_samples = int((n_blocks * block_bytes) // bytes_per_sample)
 
@@ -197,482 +582,450 @@ def read_fid_matlab_like(
     if raw.size % n_block_samples != 0:
         raise ValueError(
             f"FID size {raw.size} not divisible by n_block_samples={n_block_samples} "
-            f"(n_blocks={n_blocks}, block_bytes={block_bytes}, bytes/sample={bytes_per_sample})."
+            f"(n_blocks={n_blocks}, block_bytes={block_bytes})."
         )
 
-    # MATLAB reshape is column-major; mirror with order='F'
-    raw2 = raw.reshape(n_block_samples, -1, order="F")
-    raw2 = raw2[:n_ray, :]
-    raw2 = raw2.reshape(-1, order="F")  # x(:)
+    total_rays = raw.size // n_block_samples
 
-    denom = 2 * n_read * n_coils * n_vols
-    if raw2.size % denom != 0:
+    # column-major reshape like MATLAB
+    x = raw.reshape(n_block_samples, total_rays, order="F")
+    x = x[:n_ray, :]
+    x = x.reshape(-1, order="F")
+
+    denom = 2 * n_read * n_coils
+    if x.size % denom != 0:
         raise ValueError(
-            "FID size after trim does not factor into "
-            f"(2, n_read={n_read}, n_coils={n_coils}, n_vols={n_vols}). "
-            f"Have {raw2.size} samples, denom={denom}."
+            f"After block trim, sample count {x.size} not divisible by (2*n_read*n_coils)={denom}."
         )
+    spokes_total = x.size // denom
 
-    n_spokes = raw2.size // denom
-
-    x = raw2.reshape(2, n_read, n_coils, n_spokes, n_vols, order="F")
-    cplx = x[0, ...].astype(np.float32) + 1j * x[1, ...].astype(np.float32)
-    return cplx.astype(np.complex64, copy=False)
-
-
-def read_traj_matlab_like(
-    traj_file: Path,
-    *,
-    n_read: int,
-    endian: str = "<",              # MATLAB: ieee-le
-    dtype: str = "f8",              # MATLAB: float64
-    traj_scaling: float = 96.0,
-) -> np.ndarray:
-    """
-    Returns float32 array shaped (3, n_read, n_spokes), mirroring MATLAB reshape scaling.
-    """
-    traj_file = Path(traj_file)
-    v = np.fromfile(traj_file, dtype=np.dtype(endian + dtype))
-
-    if v.size % (3 * n_read) != 0:
-        raise ValueError(
-            f"traj length {v.size} not divisible by (3*n_read)={3*n_read}. "
-            f"n_read={n_read}"
-        )
-
-    n_spokes = v.size // (3 * n_read)
-    traj = v.reshape(3, n_read, n_spokes, order="F")
-    traj = (traj * float(traj_scaling)).astype(np.float32, copy=False)
-    return traj
-
-
-# ----------------------------
-# Gradient delay / readout shift correction
-# ----------------------------
-
-def spoke_directions_from_traj(traj: np.ndarray) -> np.ndarray:
-    """
-    traj: (3, RO, spokes) float/complex
-    returns u: (spokes, 3) unit directions from endpoints
-    """
-    tx = np.real(traj[0]).astype(np.float64, copy=False)
-    ty = np.real(traj[1]).astype(np.float64, copy=False)
-    tz = np.real(traj[2]).astype(np.float64, copy=False)
-
-    dx = tx[-1, :] - tx[0, :]
-    dy = ty[-1, :] - ty[0, :]
-    dz = tz[-1, :] - tz[0, :]
-
-    dn = np.sqrt(dx * dx + dy * dy + dz * dz)
-    dn[dn == 0] = 1.0
-    dx /= dn
-    dy /= dn
-    dz /= dn
-
-    return np.stack([dx, dy, dz], axis=1)
-
-
-def find_opposed_pairs(u: np.ndarray, dot_threshold: float = 0.98) -> list[tuple[int, int]]:
-    """
-    Approx fast pairing: for each i, choose best match to -u[i].
-    Accept if dot >= dot_threshold, then dedup.
-    """
-    n = u.shape[0]
-    pairs = []
-
-    UT = u.T  # (3, n)
-    for i in range(n):
-        target = -u[i]
-        dots = target @ UT
-        j = int(np.argmax(dots))
-        if j != i and float(dots[j]) >= dot_threshold:
-            a, b = (i, j) if i < j else (j, i)
-            pairs.append((a, b))
-
-    return sorted(set(pairs))
-
-
-def estimate_shift_samples(a: np.ndarray, b: np.ndarray, *, max_shift: Optional[int] = None) -> float:
-    """
-    Cross-correlation peak shift estimate (integer shift).
-    """
-    a = np.asarray(a)
-    b = np.asarray(b)
-    if a.shape != b.shape:
-        raise ValueError(f"a.shape {a.shape} != b.shape {b.shape}")
-
-    n = a.size
-    A = np.fft.fft(a)
-    B = np.fft.fft(b)
-    cc = np.fft.ifft(A * np.conj(B))
-    cc = np.fft.fftshift(cc)
-    mag = np.abs(cc)
-
-    if max_shift is not None and max_shift < (n // 2):
-        mid = n // 2
-        lo = mid - max_shift
-        hi = mid + max_shift + 1
-        mag_win = mag[lo:hi]
-        k = int(np.argmax(mag_win)) + lo
+    if npro is not None and npro > 0 and (spokes_total % npro == 0):
+        n_vols = spokes_total // npro
+        spokes_per_vol = npro
     else:
-        k = int(np.argmax(mag))
+        n_vols = 1
+        spokes_per_vol = spokes_total
 
-    return float(k - (n // 2))
+    # shape: (2, n_read, n_coils, spokes_per_vol, n_vols)
+    x2 = x.reshape(2, n_read, n_coils, spokes_per_vol, n_vols, order="F").astype(np.float32, copy=False)
+    cplx = x2[0, ...] + 1j * x2[1, ...]  # (n_read, n_coils, spokes_per_vol, n_vols)
 
+    # convert to (n_read, spokes_total, n_coils) by stacking vols along spokes
+    if n_vols == 1:
+        ksp = cplx[:, :, :, 0].transpose(0, 2, 1)  # (n_read, spokes, n_coils)
+        spokes_all = spokes_per_vol
+    else:
+        # (n_read, n_coils, spokes, vols) -> (n_read, n_coils, spokes*vols) -> (n_read, spokes_all, n_coils)
+        cplx2 = cplx.reshape(n_read, n_coils, spokes_per_vol * n_vols, order="F")
+        ksp = cplx2.transpose(0, 2, 1)
+        spokes_all = spokes_per_vol * n_vols
 
-def estimate_gradient_delay_from_opposed_pairs(
-    ksp: np.ndarray,
-    traj: np.ndarray,
-    *,
-    dot_threshold: float = 0.98,
-    use_coils_sum: bool = True,
-    max_shift: Optional[int] = None,
-    max_pairs: Optional[int] = 5000,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    ksp: (RO, spokes, coils)
-    traj: (3, RO, spokes)
-    Returns:
-      us: (n_pairs, 3) unit directions for spoke i
-      shifts: (n_pairs,) shift samples
-      coeffs: (3,) least squares coeffs [ax, ay, az]
-    """
-    RO, spokes, coils = ksp.shape
-    u = spoke_directions_from_traj(traj)
-    pairs = find_opposed_pairs(u, dot_threshold=dot_threshold)
+    print(f"[info] MATLAB-blocktrim FID: n_read={n_read}, coils={n_coils}, spokes_all={spokes_all}, n_vols={n_vols}, n_block_samples={n_block_samples}")
 
-    if len(pairs) == 0:
-        raise RuntimeError("No opposed pairs found (try lowering --dot-threshold).")
-
-    if max_pairs is not None and len(pairs) > max_pairs:
-        pairs = pairs[:max_pairs]
-
-    shifts = []
-    us = []
-
-    for i, j in pairs:
-        if use_coils_sum:
-            a = np.sum(ksp[:, i, :], axis=1)
-            b = np.sum(ksp[:, j, :], axis=1)
-        else:
-            a = ksp[:, i, 0]
-            b = ksp[:, j, 0]
-
-        b_cr = np.conj(b[::-1])
-        s = estimate_shift_samples(a, b_cr, max_shift=max_shift)
-
-        shifts.append(s)
-        us.append(u[i])
-
-    shifts = np.asarray(shifts, dtype=np.float64)
-    us = np.asarray(us, dtype=np.float64)
-
-    coeffs, *_ = np.linalg.lstsq(us, shifts, rcond=None)
-    return us, shifts, coeffs
+    return ksp.astype(np.complex64, copy=False), spokes_all, n_vols
 
 
-def predict_shifts_from_coeffs(traj: np.ndarray, coeffs: np.ndarray) -> np.ndarray:
-    u = spoke_directions_from_traj(traj)
-    return (u @ coeffs.reshape(3, 1)).ravel()
+# ---------------- traj source selection ---------------- #
 
+def find_traj_candidates(series_path: Path) -> List[Path]:
+    cands: List[Path] = []
 
-def apply_ro_shift_per_spoke(ksp: np.ndarray, shifts: np.ndarray) -> np.ndarray:
-    """
-    Fractional RO shift per spoke using Fourier shift theorem along RO.
-    ksp: (RO, spokes, coils)
-    shifts: (spokes,)
-    """
-    RO, spokes, coils = ksp.shape
-    if shifts.shape[0] != spokes:
-        raise ValueError(f"shifts len {shifts.shape[0]} != spokes {spokes}")
+    p0 = series_path / "traj"
+    if p0.exists() and p0.is_file():
+        cands.append(p0)
 
-    f = np.fft.fftfreq(RO)  # cycles/sample
-    out = np.empty_like(ksp)
+    pdata = series_path / "pdata"
+    if pdata.exists():
+        for p in pdata.rglob("traj"):
+            if p.exists() and p.is_file():
+                cands.append(p)
 
-    for s in range(spokes):
-        phase = np.exp(-1j * 2.0 * np.pi * f * float(shifts[s])).astype(np.complex64)
-        for c in range(coils):
-            X = np.fft.fft(ksp[:, s, c])
-            X *= phase
-            out[:, s, c] = np.fft.ifft(X)
-
+    seen = set()
+    out = []
+    for p in cands:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
     return out
 
 
-# ----------------------------
-# Recon
-# ----------------------------
-
-def run_bart_nufft(
-    bart_bin: str,
-    *,
+def load_traj_auto(
+    series_path: Path,
+    method: Path,
+    acqp: Path,
+    spokes_all: int,
     NX: int,
-    NY: int,
-    NZ: int,
-    traj: np.ndarray,               # (3, RO, spokes) complex64
-    ksp: np.ndarray,                # (RO, spokes, coils) complex64
+    true_ro: int,
+    spoke_order: str,
+    traj_source: str,
+    traj_file: Optional[Path],
+) -> Tuple[np.ndarray, str]:
+    """
+    Returns traj_full (3, RO, spokes_all), description.
+    trajfile path uses MATLAB-faithful parsing and will infer RO from the file itself.
+    """
+
+    def _from_gradoutput() -> np.ndarray:
+        grad_path = series_path / "grad.output"
+        if not grad_path.exists():
+            raise RuntimeError(f"grad.output not found in {series_path}")
+        dirs = load_grad_output_dirs(grad_path, normalize=True)
+        dirs_full = expand_spoke_dirs(dirs, spokes_all, spoke_order)
+        traj = build_traj_from_dirs(true_ro, dirs_full, NX)
+        return traj
+
+    def _from_trajfile(p: Path) -> Tuple[np.ndarray, str]:
+        npro = infer_npro(method, acqp)
+        if npro is None:
+            raise RuntimeError("trajfile parsing requires NPro, but could not read ##$NPro from method/acqp.")
+
+        traj, n_read, tag = parse_trajfile_matlab_faithful(p, npro=int(npro), nx=int(NX))
+
+        # Sanity logs
+        print(f"[info] trajfile parsed (MATLAB-faithful): {tag} (NPro={npro}, RO={n_read})")
+        traj_radial_profile_debug(traj, label="trajfile raw")
+
+        # Recenter if centered (kmin to mid)
+        traj2, _shift = recenter_ro_by_kmin_if_centered(traj, label="trajfile")
+        if _shift != 0:
+            traj_radial_profile_debug(traj2, label="trajfile after_recenter_kmin")
+
+        # Expand spokes if needed
+        traj2 = expand_traj_spokes(traj2, target_spokes=spokes_all, order=spoke_order)
+
+        traj_radial_profile_debug(traj2, label="trajfile final")
+        return traj2, f"trajfile:{tag}:(NPro={npro},RO={n_read},3)"
+
+    if traj_source == "gradoutput":
+        return _from_gradoutput(), "gradoutput"
+
+    if traj_file is not None:
+        if not traj_file.exists():
+            raise RuntimeError(f"--traj-file does not exist: {traj_file}")
+        traj, mode = _from_trajfile(traj_file)
+        return traj, mode
+
+    if traj_source in ("trajfile", "auto"):
+        cands = find_traj_candidates(series_path)
+        if traj_source == "trajfile" and not cands:
+            raise RuntimeError(f"--traj-source trajfile requested, but no traj candidate found under {series_path} or pdata/*")
+
+        last_err = None
+        for p in cands:
+            try:
+                traj, mode = _from_trajfile(p)
+                return traj, mode
+            except Exception as e:
+                last_err = e
+
+        if traj_source == "trajfile":
+            raise RuntimeError(
+                f"--traj-source trajfile requested, but no candidate trajectory could be parsed.\nLast error: {last_err}"
+            )
+
+        return _from_gradoutput(), "gradoutput(fallback)"
+
+    raise ValueError(f"Unknown traj-source: {traj_source}")
+
+
+# ---------------- Core recon ---------------- #
+
+def run_bart(
+    series_path: Path,
+    method: Path,
+    acqp: Path,
+    fid: Path,
     out_base: Path,
-    gpu: bool,
-    rss: bool,
-) -> Path:
-    """
-    Writes traj/ksp CFLs and runs bart nufft. Returns base path of output image (CFL/HDR).
-    """
+    NX: int, NY: int, NZ: int,
+    true_ro: int,
+    coils_hint: int,
+    spokes_per_frame: int,
+    frame_shift: int,
+    qa_first: Optional[int],
+    export_nifti: bool,
+    use_gpu: bool,
+    spoke_order: str,
+    traj_source: str,
+    traj_file: Optional[Path],
+    fid_dtype: str,
+    fid_endian: str,
+    fid_layout: str,
+):
+    bart_bin = "bart"
+
+    # --------------------------
+    # Load trajectory first (trajfile mode infers its own RO)
+    # --------------------------
+    # We still need spokes_all from kspace; load kspace first in a way that doesn't require manual params.
+
+    npro = infer_npro(method, acqp)
+
+    if fid_dtype == "i4" and traj_source in ("trajfile", "auto"):
+        # Use trajfile to infer n_read, then use MATLAB block-trim on FID
+        # (This is the most faithful path when your MATLAB code is verified.)
+        # We need n_read from trajfile parse; do that with spokes_all placeholder first? No:
+        # parse trajfile without spokes_all (only needs NPro + NX).
+        if npro is None:
+            raise RuntimeError("For fid-dtype i4 + trajfile, need NPro in method/acqp.")
+
+        traj_tmp, n_read_traj, tag = parse_trajfile_matlab_faithful((traj_file or (series_path / "traj")), npro=int(npro), nx=int(NX))
+        # Now parse FID using n_read_traj + coils_hint
+        ksp, spokes_all, n_vols = load_bruker_kspace_matlab_blocktrim_i4(
+            fid,
+            n_read=int(n_read_traj),
+            n_coils=int(coils_hint),
+            npro=int(npro) if npro is not None else None,
+            endian=fid_endian,
+        )
+
+        # Trajectory for reconstruction must match ksp RO (= n_read_traj) and spokes_all
+        traj_full, traj_used = load_traj_auto(
+            series_path=series_path,
+            method=method,
+            acqp=acqp,
+            spokes_all=spokes_all,
+            NX=NX,
+            true_ro=true_ro,        # only used for gradoutput fallback
+            spoke_order=spoke_order,
+            traj_source=traj_source,
+            traj_file=traj_file,
+        )
+
+        # But trajfile RO may differ from true_ro; ensure RO matches ksp RO
+        if traj_full.shape[1] != ksp.shape[0]:
+            raise ValueError(f"traj RO={traj_full.shape[1]} does not match ksp RO={ksp.shape[0]} (MATLAB-faithful path)")
+        print(f"[info] Trajectory source used: {traj_used}")
+
+    else:
+        # Fallback: old simple parser for fid (i2/i4/f4) based on true_ro
+        ksp, stored_ro, spokes_all, coils = load_bruker_kspace_simple(
+            fid_path=fid,
+            true_ro=true_ro,
+            coils_hint=coils_hint,
+            endian=fid_endian,
+            base_kind=fid_dtype,
+            fid_layout=fid_layout,
+        )
+        traj_full, traj_used = load_traj_auto(
+            series_path=series_path,
+            method=method,
+            acqp=acqp,
+            spokes_all=spokes_all,
+            NX=NX,
+            true_ro=true_ro,
+            spoke_order=spoke_order,
+            traj_source=traj_source,
+            traj_file=traj_file,
+        )
+        print(f"[info] Trajectory source used: {traj_used}")
+
+        if traj_full.shape[1] != ksp.shape[0]:
+            # If trajfile inferred a different RO than ACQ_size path, that's a big mismatch.
+            # In that case, user should run with fid-dtype i4 + trajfile for MATLAB-faithful.
+            raise ValueError(f"traj RO={traj_full.shape[1]} does not match ksp RO={ksp.shape[0]}")
+
+    have_gpu = False
+    if use_gpu:
+        have_gpu = bart_supports_gpu(bart_bin)
+        if not have_gpu:
+            print("[warn] BART has no GPU support; falling back to CPU.", file=sys.stderr)
+
+    if spokes_per_frame <= 0:
+        spokes_per_frame = spokes_all
+    if frame_shift <= 0:
+        frame_shift = spokes_per_frame
+
+    frame_starts = list(range(0, max(1, spokes_all - spokes_per_frame + 1), frame_shift))
+    print(f"[info] Sliding window: spokes-per-frame={spokes_per_frame}, frame-shift={frame_shift}")
+    print(f"[info] Will reconstruct {len(frame_starts)} frame(s).")
+
     out_dir = out_base.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    traj_base = out_dir / f"{out_base.name}_traj"
-    ksp_base = out_dir / f"{out_base.name}_ksp"
-    img_base = out_dir / f"{out_base.name}_img"
+    frame_paths: list[Path] = []
+    qa_written = False
+    first_dims_reported = False
 
-    # BART expects ksp dims[0]==1
-    ksp_bart = ksp[np.newaxis, :, :, :]  # (1, RO, spokes, coils)
+    rss_mask = str(1 << 3)  # coil dim=3 => 8
 
-    writecfl(str(traj_base), traj.astype(np.complex64, copy=False))
-    writecfl(str(ksp_base), ksp_bart.astype(np.complex64, copy=False))
+    for i, start in enumerate(frame_starts):
+        stop = min(spokes_all, start + spokes_per_frame)
+        nsp = stop - start
 
-    cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
-    if gpu:
-        cmd.insert(2, "-g")
-    cmd += [str(traj_base), str(ksp_base), str(img_base)]
-    print("[bart]", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+        tag = f"vol{i:05d}"
+        traj_base = out_dir / f"{out_base.name}_{tag}_traj"
+        ksp_base = out_dir / f"{out_base.name}_{tag}_ksp"
+        coil_base = out_dir / f"{out_base.name}_{tag}_coil"
+        sos_base = out_dir / f"{out_base.name}_{tag}"
 
-    if rss:
-        # If you run nufft directly into img, BART will keep coil dim if present.
-        # Here we assume coil dim is dim=3 (mask 1<<3 = 8) IF it exists.
-        # For safety, try rss and if it fails, just leave img as-is.
-        rss_base = out_dir / f"{out_base.name}_rss"
-        rss_mask = str(1 << 3)
-        cmd2 = [bart_bin, "rss", rss_mask, str(img_base), str(rss_base)]
+        frame_paths.append(sos_base)
+
+        if sos_base.with_suffix(".cfl").exists():
+            print(f"[info] Frame {i} already reconstructed -> {sos_base}, skipping.")
+            continue
+
+        print(f"[info] Frame {i} spokes [{start}:{stop}] (n={nsp})")
+
+        ksp_frame = ksp[:, start:stop, :]         # (ro, spokes, coils)
+        traj_frame = traj_full[:, :, start:stop]  # (3, ro, spokes)
+
+        ksp_bart = ksp_frame[np.newaxis, :, :, :]  # (1, ro, spokes, coils)
+
+        writecfl(str(traj_base), traj_frame)
+        writecfl(str(ksp_base), ksp_bart)
+
+        cmd = [bart_bin, "nufft", "-i", "-d", f"{NX}:{NY}:{NZ}"]
+        if use_gpu and have_gpu:
+            cmd.insert(2, "-g")
+        cmd += [str(traj_base), str(ksp_base), str(coil_base)]
+        print("[bart]", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+        cmd2 = [bart_bin, "rss", rss_mask, str(coil_base), str(sos_base)]
         print("[bart]", " ".join(cmd2))
-        p = subprocess.run(cmd2)
-        if p.returncode == 0:
-            return rss_base
-        print("[warn] bart rss failed; leaving coil image.", file=sys.stderr)
+        subprocess.run(cmd2, check=True)
 
-    return img_base
+        if not first_dims_reported:
+            dims_traj = bart_image_dims(bart_bin, traj_base)
+            dims_ksp = bart_image_dims(bart_bin, ksp_base)
+            dims_coil = bart_image_dims(bart_bin, coil_base)
+            dims_sos = bart_image_dims(bart_bin, sos_base)
+            if dims_traj is not None:
+                print(f"[debug] BART dims traj vol0: {dims_traj}")
+            if dims_ksp is not None:
+                print(f"[debug] BART dims ksp  vol0: {dims_ksp}")
+            if dims_coil is not None:
+                print(f"[debug] BART dims coil vol0: {dims_coil}")
+            if dims_sos is not None:
+                print(f"[debug] BART dims SoS  vol0: {dims_sos}")
+            first_dims_reported = True
+
+        if qa_first is not None and not qa_written and len(frame_paths) >= qa_first:
+            qa_base = out_dir / f"{out_base.name}_QA_first{qa_first}"
+            write_qa_nifti(frame_paths[:qa_first], qa_base)
+            qa_written = True
+
+    sos_existing = [p for p in frame_paths if p.with_suffix(".cfl").exists()]
+    if not sos_existing:
+        print("[warn] No SoS frames exist; skipping 4D stack.", file=sys.stderr)
+        return
+
+    stack_base = out_dir / out_base.name
+    join_cmd = ["bart", "join", "3"] + [str(p) for p in sos_existing] + [str(stack_base)]
+    print("[bart]", " ".join(join_cmd))
+    subprocess.run(join_cmd, check=True)
+
+    if export_nifti:
+        out_nii = stack_base.with_suffix(".nii.gz")
+        bart_cfl_to_nifti(stack_base, out_nii)
+        print(f"[info] Wrote final 4D NIfTI {out_nii}")
+
+    print(f"[info] Done. 4D result base: {stack_base}")
 
 
-# ----------------------------
-# CLI
-# ----------------------------
+# ---------------- CLI ---------------- #
 
-def main() -> None:
+def main():
     ap = argparse.ArgumentParser(
-        description="Bruker 3D radial -> BART NUFFT using MATLAB-faithful fid/traj parsing.",
+        description="Bruker 3D radial → BART NUFFT recon driver (trajfile MATLAB-faithful or grad.output).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\
-            Example (match MATLAB):
-              python bruker_radial_bart_matlab.py \\
-                --series /path/to/21 \\
-                --out /tmp/recon \\
-                --n-read 61 --n-coils 4 --n-vols 15 \\
-                --traj-scaling 96 \\
-                --vol-idx 15 \\
-                --export-nifti --voxel-mm 0.20833
+            Examples:
 
-            With gradient-delay fit + correction:
-              python bruker_radial_bart_matlab.py \\
-                --series /path/to/21 \\
-                --out /tmp/recon \\
-                --n-read 61 --n-coils 4 --n-vols 15 \\
-                --traj-scaling 96 \\
-                --vol-idx 15 \\
-                --delay-fit --dot-threshold 0.98 --max-shift 20
+              Use trajectory file (Bruker writes <series>/traj):
+                python bruker_radial_bart.py --series /path/to/21 --traj-source trajfile --fid-dtype i4 --export-nifti --out /tmp/out
+
+              Use grad.output:
+                python bruker_radial_bart.py --series /path/to/29 --traj-source gradoutput --fid-dtype i2 --export-nifti --out /tmp/out
             """
         ),
     )
 
-    ap.add_argument("--series", required=True, help="Bruker series directory containing fid/method/acqp/traj")
-    ap.add_argument("--out", required=True, help="Output base path (no extension).")
+    ap.add_argument("--series", required=True)
+    ap.add_argument("--out", required=True)
 
-    ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX", "NY", "NZ"),
-                    help="Override matrix (default from PVM_Matrix).")
+    ap.add_argument("--matrix", nargs=3, type=int, metavar=("NX", "NY", "NZ"))
+    ap.add_argument("--readout", type=int)
+    ap.add_argument("--coils", type=int)
 
-    # MATLAB-faithful inputs
-    ap.add_argument("--n-read", type=int, default=0, help="Readout samples used by MATLAB (n_read).")
-    ap.add_argument("--n-coils", type=int, default=0, help="Number of coils used by MATLAB (n_coils).")
-    ap.add_argument("--n-vols", type=int, default=1, help="Number of volumes (n_vols).")
-    ap.add_argument("--traj-scaling", type=float, default=96.0, help="Trajectory scaling multiplier (MATLAB traj_scaling).")
+    ap.add_argument("--spokes-per-frame", type=int, default=0)
+    ap.add_argument("--frame-shift", type=int, default=0)
 
-    ap.add_argument("--fid-endian", choices=["<", ">"], default="<")
-    ap.add_argument("--traj-endian", choices=["<", ">"], default="<")
+    ap.add_argument("--fid-dtype", choices=["i2", "i4", "f4"], default="i2")
+    ap.add_argument("--fid-endian", choices=[">", "<"], default="<")
+    ap.add_argument("--fid-layout", choices=["ro_spokes_coils", "ro_coils_spokes"], default="ro_spokes_coils")
 
-    ap.add_argument("--vol-idx", type=int, default=1,
-                    help="1-based volume index to reconstruct (MATLAB example uses vol_idx=15). Use 0 to reconstruct ALL vols.")
+    ap.add_argument("--spoke-order", choices=["tile", "repeat"], default="tile")
 
-    # Gradient delay / readout shift correction
-    ap.add_argument("--delay-fit", action="store_true",
-                    help="Estimate and apply readout shift correction using opposed spoke pairs.")
-    ap.add_argument("--dot-threshold", type=float, default=0.98,
-                    help="Opposed-pair threshold for dot(-u_i, u_j) >= dot_threshold.")
-    ap.add_argument("--max-shift", type=int, default=0,
-                    help="Max shift (samples) search window for correlation peak (0 means full).")
-    ap.add_argument("--max-pairs", type=int, default=5000,
-                    help="Cap number of pairs used in fit (speed control).")
-    ap.add_argument("--no-coils-sum", action="store_true",
-                    help="Use only coil 0 for shift estimation (default sums coils).")
+    ap.add_argument("--traj-source", choices=["auto", "trajfile", "gradoutput"], default="auto")
+    ap.add_argument("--traj-file", default=None, help="Explicit traj file path (defaults to <series>/traj or pdata/**/traj)")
 
-    # BART / outputs
-    ap.add_argument("--bart-bin", default="bart")
-    ap.add_argument("--gpu", action="store_true")
-    ap.add_argument("--rss", action="store_true", help="Run bart rss after nufft if possible.")
+    ap.add_argument("--qa-first", type=int, default=0)
     ap.add_argument("--export-nifti", action="store_true")
-    ap.add_argument("--voxel-mm", type=float, default=0.0, help="Voxel size (mm) for NIfTI affine diag.")
+
+    ap.add_argument("--gpu", action="store_true")
+
     args = ap.parse_args()
 
-    series = Path(args.series).resolve()
+    series_path = Path(args.series).resolve()
     out_base = Path(args.out).resolve()
+    out_base.parent.mkdir(parents=True, exist_ok=True)
 
-    method = series / "method"
-    acqp = series / "acqp"
-    fid = series / "fid"
-    traj_path = series / "traj"
-
+    method = series_path / "method"
+    acqp = series_path / "acqp"
+    fid = series_path / "fid"
     if not (method.exists() and acqp.exists() and fid.exists()):
-        ap.error(f"Could not find method/acqp/fid under {series}")
-    if not traj_path.exists():
-        ap.error(f"Could not find traj under {series} (expected {traj_path})")
+        ap.error(f"Could not find method/acqp/fid under {series_path}")
 
     if args.matrix is not None:
         NX, NY, NZ = map(int, args.matrix)
-        print(f"[info] Matrix overridden: {NX}x{NY}x{NZ}")
+        print(f"[info] Matrix overridden from CLI: {NX}x{NY}x{NZ}")
     else:
         NX, NY, NZ = infer_matrix(method)
-        print(f"[info] Matrix from PVM_Matrix: {NX}x{NY}x{NZ}")
+        print(f"[info] Matrix inferred from PVM_Matrix: {NX}x{NY}x{NZ}")
 
-    header_coils = infer_coils(method)
-    header_ro = infer_true_ro(acqp)
-
-    # If user doesn't supply n_read/n_coils, we pick header values and warn loudly.
-    n_read = int(args.n_read) if args.n_read and args.n_read > 0 else int(header_ro)
-    n_coils = int(args.n_coils) if args.n_coils and args.n_coils > 0 else int(header_coils)
-    n_vols = int(args.n_vols) if args.n_vols and args.n_vols > 0 else 1
-
-    if args.n_read <= 0:
-        print(f"[warn] --n-read not provided; defaulting to ACQ_size RO={n_read}. "
-              f"If MATLAB used a different n_read (e.g. 61 vs 126), pass --n-read explicitly.",
-              file=sys.stderr)
-    if args.n_coils <= 0:
-        print(f"[warn] --n-coils not provided; defaulting to PVM_EncNReceivers={n_coils}. "
-              f"If MATLAB used a different n_coils, pass --n-coils explicitly.",
-              file=sys.stderr)
-
-    print(f"[info] MATLAB-faithful parse config: n_read={n_read}, n_coils={n_coils}, n_vols={n_vols}, traj_scaling={args.traj_scaling}")
-
-    # Read data
-    x = read_fid_matlab_like(
-        fid,
-        n_vols=n_vols,
-        n_coils=n_coils,
-        n_read=n_read,
-        endian=args.fid_endian,
-        dtype="i4",
-        block_bytes=1024,
-    )  # (RO, coils, spokes, vols)
-    traj_f = read_traj_matlab_like(
-        traj_path,
-        n_read=n_read,
-        endian=args.traj_endian,
-        dtype="f8",
-        traj_scaling=args.traj_scaling,
-    )  # (3, RO, spokes)
-
-    # Consistency
-    RO, coils, spokes, vols = x.shape
-    if traj_f.shape[1] != RO:
-        raise ValueError(f"traj RO={traj_f.shape[1]} != fid RO={RO}")
-    if traj_f.shape[2] != spokes:
-        # In your MATLAB snippet, traj was reshaped (3, n_read, []) and used directly for that ksp.
-        # So spokes must match for a clean nufft call.
-        raise ValueError(f"traj spokes={traj_f.shape[2]} != fid spokes={spokes}")
-
-    print(f"[info] Parsed fid: shape (RO,coils,spokes,vols)=({RO},{coils},{spokes},{vols})")
-    print(f"[info] Parsed traj: shape (3,RO,spokes)=({traj_f.shape[0]},{traj_f.shape[1]},{traj_f.shape[2]})")
-
-    # Make traj complex for BART CFL writer (imag=0)
-    traj = np.asfortranarray(traj_f.astype(np.float32)).astype(np.complex64)
-
-    # Which volumes?
-    if args.vol_idx == 0:
-        vol_indices = list(range(vols))  # 0-based all
+    if args.readout is not None:
+        true_ro = int(args.readout)
+        print(f"[info] Readout overridden from CLI: RO={true_ro}")
     else:
-        vi = int(args.vol_idx) - 1
-        if vi < 0 or vi >= vols:
-            raise ValueError(f"--vol-idx {args.vol_idx} out of range [1..{vols}]")
-        vol_indices = [vi]
+        true_ro = infer_true_ro(acqp)
+        print(f"[info] Readout (true RO) from ACQ_size: RO={true_ro}")
 
-    # For each volume: build ksp (RO, spokes, coils) and optionally correct
-    out_dir = out_base.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    img_bases = []
-
-    for vi in vol_indices:
-        # x is (RO, coils, spokes, vols) => rearrange to (RO, spokes, coils)
-        ksp = x[:, :, :, vi].transpose(0, 2, 1).astype(np.complex64, copy=False)
-
-        print(f"[info] Volume {vi+1}/{vols}: ksp shape (RO,spokes,coils)={ksp.shape}")
-
-        if args.delay_fit:
-            print("[info] Delay fit enabled: estimating opposed-pair shifts...")
-            max_shift = int(args.max_shift) if args.max_shift and args.max_shift > 0 else None
-            us, shifts_pairs, coeffs = estimate_gradient_delay_from_opposed_pairs(
-                ksp=ksp,
-                traj=traj,
-                dot_threshold=float(args.dot_threshold),
-                use_coils_sum=(not args.no_coils_sum),
-                max_shift=max_shift,
-                max_pairs=int(args.max_pairs) if args.max_pairs and args.max_pairs > 0 else None,
-            )
-            print(f"[info] Fit coeffs (samples): ax={coeffs[0]:.6g}, ay={coeffs[1]:.6g}, az={coeffs[2]:.6g}")
-            print(f"[info] Pair shifts (samples): median={np.median(shifts_pairs):.6g}, "
-                  f"p5={np.percentile(shifts_pairs,5):.6g}, p95={np.percentile(shifts_pairs,95):.6g}, n_pairs={shifts_pairs.size}")
-
-            shifts_all = predict_shifts_from_coeffs(traj, coeffs)
-            print(f"[info] Pred shifts (samples): median={np.median(shifts_all):.6g}, "
-                  f"p5={np.percentile(shifts_all,5):.6g}, p95={np.percentile(shifts_all,95):.6g}")
-
-            ksp = apply_ro_shift_per_spoke(ksp, shifts_all.astype(np.float64))
-            print("[info] Applied fractional RO shift correction to k-space.")
-
-        vol_tag = f"v{vi+1:03d}"
-        this_out = out_dir / f"{out_base.name}_{vol_tag}"
-
-        img_base = run_bart_nufft(
-            args.bart_bin,
-            NX=NX, NY=NY, NZ=NZ,
-            traj=traj,
-            ksp=ksp,
-            out_base=this_out,
-            gpu=args.gpu,
-            rss=args.rss,
-        )
-        img_bases.append(img_base)
-
-        if args.export_nifti:
-            nii = img_base.with_suffix(".nii.gz")
-            voxel = float(args.voxel_mm) if args.voxel_mm and args.voxel_mm > 0 else None
-            bart_cfl_to_nifti(img_base, nii, voxel_mm=voxel)
-            print(f"[info] Wrote NIfTI: {nii}")
-
-    # If multiple vols, join to 4D stack (dim=3 in BART is the 4th axis in many conventions)
-    if len(img_bases) > 1:
-        stack_base = out_dir / f"{out_base.name}_4d"
-        join_cmd = [args.bart_bin, "join", "3"] + [str(b) for b in img_bases] + [str(stack_base)]
-        print("[bart]", " ".join(join_cmd))
-        subprocess.run(join_cmd, check=True)
-
-        if args.export_nifti:
-            nii = stack_base.with_suffix(".nii.gz")
-            voxel = float(args.voxel_mm) if args.voxel_mm and args.voxel_mm > 0 else None
-            bart_cfl_to_nifti(stack_base, nii, voxel_mm=voxel)
-            print(f"[info] Wrote 4D NIfTI: {nii}")
-
-        print(f"[info] Done. 4D base: {stack_base}")
+    if args.coils is not None:
+        coils_hint = int(args.coils)
+        print(f"[info] Coils overridden from CLI: {coils_hint}")
     else:
-        print("[info] Done.")
+        coils_hint = infer_coils(method)
+        print(f"[info] Coils inferred from PVM_EncNReceivers: {coils_hint}")
+
+    spf = args.spokes_per_frame
+    shift = args.frame_shift
+    qa_first = args.qa_first if args.qa_first > 0 else None
+    traj_file = Path(args.traj_file).resolve() if args.traj_file else None
+
+    run_bart(
+        series_path=series_path,
+        method=method,
+        acqp=acqp,
+        fid=fid,
+        out_base=out_base,
+        NX=NX, NY=NY, NZ=NZ,
+        true_ro=true_ro,
+        coils_hint=coils_hint,
+        spokes_per_frame=spf,
+        frame_shift=shift,
+        qa_first=qa_first,
+        export_nifti=args.export_nifti,
+        use_gpu=args.gpu,
+        spoke_order=args.spoke_order,
+        traj_source=args.traj_source,
+        traj_file=traj_file,
+        fid_dtype=args.fid_dtype,
+        fid_endian=args.fid_endian,
+        fid_layout=args.fid_layout,
+    )
 
 
 if __name__ == "__main__":
