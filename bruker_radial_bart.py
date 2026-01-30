@@ -72,7 +72,11 @@ _BRUKER_KV_RE = re.compile(r"^\s*##\$(?P<key>[^=]+)=(?P<val>.*)\s*$")
 def read_bruker_params(path: Path) -> Dict[str, str]:
     """
     Read a Bruker parameter file (method/acqp/reco) into a dict of raw strings.
-    Keeps the value as the rest of the line; multi-line values are concatenated.
+
+    Rules:
+    - Lines begin with ##$KEY=VALUE
+    - Multi-line values continue until the next ##$KEY=... line
+    - Stop continuation if we hit a '$$' line (Bruker metadata / @vis etc)
     """
     if not path.exists():
         return {}
@@ -90,20 +94,60 @@ def read_bruker_params(path: Path) -> Dict[str, str]:
         key = m.group("key").strip()
         val = m.group("val").strip()
 
-        # If value starts with '(' it may span multiple lines until a line that
-        # doesn't look like continuation; but Bruker is inconsistent.
-        # We'll append subsequent lines that do NOT start with "##$".
         j = i + 1
         chunks = [val]
-        while j < len(lines) and not lines[j].lstrip().startswith("##$"):
-            # Stop on blank line? keep it anyway; but usually continuation.
-            chunks.append(lines[j].strip())
+
+        while j < len(lines):
+            nxt = lines[j].strip()
+
+            # new parameter begins
+            if nxt.startswith("##$"):
+                break
+
+            # Bruker "comment/metadata" region begins (don't append these)
+            if nxt.startswith("$$"):
+                break
+
+            # keep continuation lines
+            if nxt != "":
+                chunks.append(nxt)
+
             j += 1
 
-        out[key] = " ".join([c for c in chunks if c != ""])
+        out[key] = " ".join(chunks).strip()
         i = j
 
     return out
+
+def bruker_array_ints(raw: str) -> List[int]:
+    """
+    Parse Bruker array-like values, e.g.:
+
+      '( 3 ) 126 31324 1'
+      or with newlines already flattened by read_bruker_params.
+
+    Returns the actual array values (length N), NOT the leading N.
+    If format doesn't match, falls back to parsing all ints.
+    """
+    s = raw.strip()
+    ints = parse_ints(s)
+    if not ints:
+        return []
+
+    # Detect "( N ) ..." pattern by checking if string starts with '('
+    if s.startswith("(") and len(ints) >= 1:
+        n = ints[0]
+        vals = ints[1:1 + n]
+        # If file is malformed and we don't have enough, just return what we have
+        return vals
+
+    return ints
+
+
+def get_array_ints(params: Dict[str, str], key: str) -> List[int]:
+    if key not in params:
+        return []
+    return bruker_array_ints(params[key])
 
 
 def parse_ints(s: str) -> List[int]:
@@ -127,15 +171,11 @@ def get_first_float(params: Dict[str, str], key: str) -> Optional[float]:
     vals = parse_floats(params[key])
     return vals[0] if vals else None
 
-
 def infer_matrix_xyz(method: Dict[str, str]) -> Optional[Tuple[int, int, int]]:
-    if "PVM_Matrix" not in method:
-        return None
-    ints = parse_ints(method["PVM_Matrix"])
-    if len(ints) >= 3:
-        return (ints[0], ints[1], ints[2])
+    vals = get_array_ints(method, "PVM_Matrix")
+    if len(vals) >= 3:
+        return (vals[0], vals[1], vals[2])
     return None
-
 
 def infer_ncoils(method: Dict[str, str], acqp: Dict[str, str]) -> Optional[int]:
     # Bruker varies: method has PVM_EncNReceivers, acqp has ACQ_ReceiverSelect/ACQ_nReceivers, etc.
@@ -161,10 +201,10 @@ def infer_ncoils(method: Dict[str, str], acqp: Dict[str, str]) -> Optional[int]:
 
 
 def infer_acq_size_words(acqp: Dict[str, str]) -> Optional[int]:
-    # ACQ_size is in "words", and for complex int32 it's typically 2*n_read (re,im)
-    v = get_first_int(acqp, "ACQ_size")
-    return v
-
+    vals = get_array_ints(acqp, "ACQ_size")
+    if len(vals) >= 1:
+        return int(vals[0])  # first value is the readout length in "words"
+    return None
 
 def infer_npro(method: Dict[str, str], acqp: Dict[str, str]) -> Optional[int]:
     # You’ve been using ##$NPro from method/acqp in your earlier code.
@@ -930,3 +970,4 @@ def read_cfl_simple(base: Path) -> np.ndarray:
 
 if __name__ == "__main__":
     main()
+	
