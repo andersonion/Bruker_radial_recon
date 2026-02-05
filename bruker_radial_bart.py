@@ -359,7 +359,7 @@ def read_trajfile(
     traj[1, :, :] *= float(NY)
     traj[2, :, :] *= float(NZ)
 
-	traj = np.asarray(traj, dtype=np.complex64)
+    traj = np.asarray(traj, dtype=np.complex64)
     return traj
 
 
