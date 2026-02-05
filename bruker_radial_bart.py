@@ -355,9 +355,9 @@ def read_trajfile(
     # MATLAB-faithful scaling to BART pixel units
     NX, NY, NZ = matrix_xyz
     traj = traj.astype(np.float64, copy=False)
-    traj[0, :, :] *= float(NX)
-    traj[1, :, :] *= float(NY)
-    traj[2, :, :] *= float(NZ)
+    traj[0, :, :] /= float(NX)
+    traj[1, :, :] /= float(NY)
+    traj[2, :, :] /= float(NZ)
 
     traj = np.asarray(traj, dtype=np.complex64)
     return traj
