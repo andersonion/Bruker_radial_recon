@@ -359,9 +359,7 @@ def read_trajfile(
     traj[1, :, :] *= float(NY)
     traj[2, :, :] *= float(NZ)
 
-    # Downcast for BART
-    traj = traj.astype(np.float32, copy=False)
-
+	traj = np.asarray(traj, dtype=np.complex64)
     return traj
 
 
@@ -380,10 +378,11 @@ def writecfl(base: Path, arr: np.ndarray) -> None:
     cfl = base.with_suffix(".cfl")
 
     a = np.asarray(arr)
+
     if not np.iscomplexobj(a):
-        a = a.astype(np.complex64)
-    else:
-        a = a.astype(np.complex64)
+        raise ValueError("writecfl expects complex array (complex64)")
+
+    a = np.asarray(a, dtype=np.complex64, order="F")
 
     # BART uses up to 16 dims in header; pad with 1s
     dims = list(a.shape)
@@ -391,15 +390,12 @@ def writecfl(base: Path, arr: np.ndarray) -> None:
         die(f"Too many dims for CFL: shape={a.shape}")
     dims16 = dims + [1] * (16 - len(dims))
 
-    hdr_txt = "# Dimensions\n" + " ".join(str(d) for d in dims16) + "\n"
-    hdr.write_text(hdr_txt)
+    hdr.write_text("# Dimensions\n" + " ".join(map(str, dims16)) + "\n")
 
-    # Interleave complex float32 (real, imag)
-    inter = np.empty((a.size * 2,), dtype=np.float32)
-    inter[0::2] = np.real(a).ravel(order="F")
-    inter[1::2] = np.imag(a).ravel(order="F")
-    inter.tofile(str(cfl))
-
+    inter = np.empty(a.size * 2, dtype=np.float32)
+    inter[0::2] = a.real.ravel(order="F")
+    inter[1::2] = a.imag.ravel(order="F")
+    inter.tofile(cfl)
 
 # ----------------------------
 # Debug helpers
@@ -908,8 +904,8 @@ def main() -> None:
     qa_n = max(0, int(args.qa_first))
 
     with tempfile.TemporaryDirectory(prefix="bruker_radial_bart_") as td:
-        td = Path(td)
-
+        #td = Path(td)
+		td = outdir
         for fi, (a, b) in enumerate(frames):
             print(f"[info] Frame {fi} spokes [{a}:{b}] (n={b-a})")
 
