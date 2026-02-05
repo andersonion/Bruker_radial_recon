@@ -905,7 +905,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="bruker_radial_bart_") as td:
         #td = Path(td)
-		td = outdir
+        td = outdir
         for fi, (a, b) in enumerate(frames):
             print(f"[info] Frame {fi} spokes [{a}:{b}] (n={b-a})")
 
