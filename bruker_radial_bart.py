@@ -321,23 +321,20 @@ def read_trajfile(
     ro: int,
     npro: int,
     endian: str,
-    method,
-    acqp,
+    matrix_xyz: tuple[int, int, int],
 ) -> np.ndarray:
     """
     Read Bruker traj file as float64 and reshape to (3, RO, NPro).
-
     MATLAB does:
         traj = fread(f, Inf, "float64", "ieee-le");
         traj = reshape(traj, 3, n_read, []);
         traj = traj * traj_scaling;
+
+    Here, traj_scaling is taken from PVM_Matrix = (NX,NY,NZ) (per-axis scaling).
     """
     if not traj_path.exists():
         die(f"traj file not found: {traj_path}")
 
-    # ------------------------------------------------------------
-    # Read raw float64 trajectory (MATLAB-faithful)
-    # ------------------------------------------------------------
     dt = np.dtype(np.float64).newbyteorder("<" if endian == "LE" else ">")
     raw = np.fromfile(str(traj_path), dtype=dt)
     if raw.size == 0:
@@ -346,44 +343,27 @@ def read_trajfile(
     expected = 3 * int(ro) * int(npro)
     if raw.size < expected:
         die(
-            f"traj too small: got {raw.size} float64, "
-            f"expected at least {expected} (=3*RO*NPro)"
+            f"traj too small: got {raw.size} float64, expected at least {expected} (=3*RO*NPro)"
         )
     if raw.size != expected:
-        eprint(
-            f"[warn] traj size {raw.size} != expected {expected}; trimming to expected."
-        )
+        eprint(f"[warn] traj size {raw.size} != expected {expected}; trimming to expected.")
         raw = raw[:expected]
 
-    # ------------------------------------------------------------
-    # Reshape exactly like MATLAB (column-major)
-    # ------------------------------------------------------------
+    # MATLAB-faithful reshape (column-major)
     traj = raw.reshape(3, int(ro), int(npro), order="F")
 
-    # ------------------------------------------------------------
     # MATLAB-faithful scaling to BART pixel units
-    # ------------------------------------------------------------
-    NX, NY, NZ = infer_matrix_xyz(method, acqp)
-
+    NX, NY, NZ = matrix_xyz
     traj = traj.astype(np.float64, copy=False)
     traj[0, :, :] *= float(NX)
     traj[1, :, :] *= float(NY)
     traj[2, :, :] *= float(NZ)
 
-    # Optional sanity print (highly recommended)
-    k_mag = np.sqrt(traj[0] ** 2 + traj[1] ** 2 + traj[2] ** 2)
-    kmax = float(np.percentile(k_mag, 99.9))
-    print(
-        f"[info] trajfile: scaled using PVM_Matrix=({NX},{NY},{NZ}); "
-        f"kmax(p99.9)≈{kmax:.3f} (expect ~{max(NX,NY,NZ)/2:.1f})"
-    )
-
-    # ------------------------------------------------------------
     # Downcast for BART
-    # ------------------------------------------------------------
     traj = traj.astype(np.float32, copy=False)
 
     return traj
+
 
 
 # ----------------------------
@@ -858,7 +838,14 @@ def main() -> None:
         nvols = spokes_total // npro
 
     # Read traj (3, RO, NPro) and expand to total spokes via repeat
-    traj_vol = read_trajfile(traj_path, ro=ro_complex, npro=npro, endian=endian)
+    traj_vol = read_trajfile(
+    traj_path,
+    ro=ro_complex,
+    npro=npro,
+    endian=endian,
+    matrix_xyz=(NX, NY, NZ),
+)
+
     print(f"[info] trajfile parsed (MATLAB-faithful): f8_{endian.lower()} (NPro={npro}, RO={ro_complex})")
 	
     traj_debug_stats(traj_vol, "trajfile raw")
