@@ -252,7 +252,50 @@ def fid_dtype_and_endian(acqp: Dict[str, str]) -> Tuple[np.dtype, str]:
         dt = np.dtype(base).newbyteorder(">")
 
     return dt, endian
+def debug_kspace_sanity(ksp: np.ndarray, label: str = "ksp") -> None:
+    """
+    ksp expected shape: (RO, spokes, coils) complex64/complex128
+    """
+    import numpy as np
 
+    ro, sp, nc = ksp.shape
+    mag = np.abs(ksp)
+
+    # 1) Is almost everything zero?
+    frac_nonzero = float(np.mean(mag > 0))
+    print(f"[debug] {label}: shape={ksp.shape}, dtype={ksp.dtype}, frac_nonzero={frac_nonzero:.6f}")
+
+    # 2) Energy distribution along RO (median over spokes+coils)
+    ro_med = np.median(mag.reshape(ro, -1), axis=1)
+    print(
+        f"[debug] {label}: |k| mag median at RO[0],RO[mid],RO[-1]: "
+        f"{ro_med[0]:.6g}, {ro_med[ro//2]:.6g}, {ro_med[-1]:.6g}"
+    )
+    print(f"[debug] {label}: mag median max at RO={int(np.argmax(ro_med))} val={float(np.max(ro_med)):.6g}")
+
+    # 3) “Constant k-space” detector: variance across samples
+    # If k-space is nearly constant -> image becomes a spike.
+    flat = ksp.reshape(-1)
+    print(
+        f"[debug] {label}: overall mean|.|={float(np.mean(np.abs(flat))):.6g}, "
+        f"std|.|={float(np.std(np.abs(flat))):.6g}"
+    )
+
+    # 4) Per-spoke variation along RO (median across coils)
+    # If every spoke looks the same along RO, something is fishy.
+    spoke_profiles = np.median(mag, axis=2)          # (RO, spokes)
+    spoke_std = np.std(spoke_profiles, axis=0)       # (spokes,)
+    print(
+        f"[debug] {label}: per-spoke std(RO profile) p5/p50/p95 = "
+        f"{np.percentile(spoke_std,5):.6g}, {np.percentile(spoke_std,50):.6g}, {np.percentile(spoke_std,95):.6g}"
+    )
+
+    # 5) Quick spot-check: first spoke, first coil
+    s0 = mag[:, 0, 0]
+    print(
+        f"[debug] {label}: spoke0 coil0 mag RO[0:8] = "
+        + " ".join(f"{v:.3g}" for v in s0[:8])
+    )
 
 # ----------------------------
 # MATLAB-faithful FID parsing
@@ -351,13 +394,15 @@ def read_trajfile(
 
     # MATLAB-faithful reshape (column-major)
     traj = raw.reshape(3, int(ro), int(npro), order="F")
+    
+    debug_kspace_sanity(ksp, label="ksp loaded (pre-gdelay)")
 
     # MATLAB-faithful scaling to BART pixel units
     NX, NY, NZ = matrix_xyz
     traj = traj.astype(np.float64, copy=False)
-    #traj[0, :, :] /= float(NX)
-    #traj[1, :, :] /= float(NY)
-   # traj[2, :, :] /= float(NZ)
+    traj[0, :, :] *= float(NX)
+    traj[1, :, :] *= float(NY)
+    traj[2, :, :] *= float(NZ)
 
     traj = np.asarray(traj, dtype=np.complex64)
     return traj
@@ -650,7 +695,8 @@ def apply_gradient_delay_shift(
             X = np.fft.fft(x, axis=0)
             y = np.fft.ifft(X * phase, axis=0)
             out[:, c, s0] = y.astype(np.complex64, copy=False)
-
+    
+    debug_kspace_sanity(out, label="ksp after gdelay")
     return out
 
 
