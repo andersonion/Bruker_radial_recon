@@ -315,8 +315,13 @@ def main():
                              "Set to 'none' to skip writing.")
 
     # Boundary normalization (ROI-based) at img1 -> img2
-    parser.add_argument("--norm-method", choices=["none", "projections", "slope", "both"], default="none",
-                        help="Normalization applied at the img1->img2 boundary (ROI-based), after baseline scaling.")
+    parser.add_argument(
+        "--norm-method",
+        choices=["none", "lastfirst", "projections", "slope", "both"],
+        default="none",
+        help="Normalization applied at the img1->img2 boundary (ROI-based), after baseline scaling. "
+             "'lastfirst' scales img2 so img1[-1] == img2[0].",
+    )
     parser.add_argument("--norm-n", type=int, default=5, help="Window size for slope/both at img1 tail / img2 head.")
 
     parser.add_argument("--time-unit", choices=["s", "min"], default="s",
@@ -519,6 +524,16 @@ def main():
         labels.append("img2_ROI" + ("(scaled)" if datab is not None else ""))
 
         # Boundary normalization on ROI only (optional)
+        scale_lastfirst = 1.0
+
+        if args.norm_method == "lastfirst":
+            y1_last = float(y1_roi[-1])
+            y2_first = float(segments_y[-1][0])
+            if abs(y2_first) < 1e-12:
+                raise ValueError("lastfirst normalization: img2 first ROI value is ~0; cannot scale.")
+            scale_lastfirst = y1_last / y2_first
+            segments_y[-1] = segments_y[-1] * scale_lastfirst
+
         if args.norm_method in ("projections", "both"):
             scale_proj = float(get_npro(img1_path) / get_npro(img2_path))
             segments_y[-1] = segments_y[-1] * scale_proj
@@ -564,7 +579,9 @@ def main():
             title += f"\nimg2 ROI affine: y2={alpha:.6g}*y2+{beta:.6g} (slope, n={args.norm_n})"
         elif args.norm_method == "both":
             title += f"\nimg2 ROI proj={scale_proj:.6g}, then affine y2={alpha:.6g}*y2+{beta:.6g} (both, n={args.norm_n})"
-
+        elif args.norm_method == "lastfirst":
+            title += f"\nimg2 ROI scaled by {scale_lastfirst:.6g} (lastfirst)"
+            print(f"       lastfirst scale={scale_lastfirst:.6g} (y1[-1]/y2[0])")
     plt.title(title)
     plt.tight_layout()
     plt.savefig(out_plot, dpi=150)
