@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
 """
 Collect selected Bruker-derived NIfTI+method files into a single folder and
-emit a CSV with the discovered scan numbers (scannos).
+emit a CSV with discovered scan numbers (scannos).
 
-Assumptions / behaviors:
-- Excel row 1 is headers.
-- Required columns:
-    - 'Bruker_folder'   (read into bfolder)
-    - 'Scan Date'       (converted to date=MMDDYY)
-    - 'Arunno_or_Crunno' (rows with a value are processed)
-- Data directory pattern:
+Key features:
+- Reads an inventory file with headers in row 1.
+- Accepts CSV directly.
+- If given Excel-like input (.xlsx/.xls/.ods), auto-converts to CSV using LibreOffice
+  (headless) and reads that CSV, avoiding pandas/openpyxl dependency issues.
+
+Required columns:
+    - 'Bruker_folder'
+    - 'Scan Date'
+    - 'Arunno_or_Crunno'
+
+Data dir pattern:
     data_dir = {study_dir}/{date}/{nii_subdir}/*{bfolder}*1_1
-  (where {nii_subdir} defaults to "nii")
-- For each file type, we search within data_dir for candidates matching patterns below,
-  but we IGNORE any files whose basename does NOT start with 1–2 digits + '_' (e.g. '7_...', '12_...').
-- If multiple candidates match, we choose the one with the LOWER leading number.
-- For each chosen candidate, we copy BOTH:
-    - *.nii.gz
-    - *.method
-  into {study_dir}/all_niis (or override via CLI), renaming to:
-    - {Arunno_or_Crunno}_DCE_baseline.*
-    - {Arunno_or_Crunno}_DCE_block1.*
-    - {Arunno_or_Crunno}_DCE_block2.*
-    - {Arunno_or_Crunno}_T2.*
 
-Outputs:
-- Copies into all_niis (created if missing)
-- A CSV suitable to paste back into Excel, INCLUDING skipped rows, with scannos for:
-    Baseline, Block1, Block2, T2
+For each row where 'Arunno_or_Crunno' has a value, we search data_dir and copy:
+    *_1_UTE3D_DT_Test_UTE3D_DT_block2_baseline.* -> {runno}_DCE_baseline.{nii.gz|method}
+    *_1_UTE3D_DT_Test_UTE3D_DT_block1.*          -> {runno}_DCE_block1.{nii.gz|method}
+    *_1_UTE3D_DT_Test_UTE3D_DT_block2.*          -> {runno}_DCE_block2.{nii.gz|method}
+    *1_T2_weighted_3D_TurboRare.*                -> {runno}_T2.{nii.gz|method}
 
-Example:
-  python collect_niis.py /path/to/sheet.xlsx --out_csv scan_lookup.csv --dry_run
+Rules:
+- Ignore any candidate files whose basename does not begin with 1–2 digits + '_' (e.g. '7_...')
+- If multiple matches exist, choose the one with the LOWER leading number (scanno).
+- Copy both .nii.gz and .method (if present); note missing in status.
+
+Output:
+- Copies into {study_dir}/all_niis (or override)
+- Writes an output CSV with scannos for Baseline/Block1/Block2/T2, including skipped rows
 """
 
 import argparse
@@ -38,6 +38,8 @@ import csv
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from glob import glob
 from typing import Dict, List, Optional, Tuple
@@ -45,14 +47,14 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 
-LEADING_SCANNO_RE = re.compile(r"^(?P<scanno>\d{1,2})_")  # must be 1–2 digits then underscore
+LEADING_SCANNO_RE = re.compile(r"^(?P<scanno>\d{1,2})_")
 
 
 @dataclass
 class PatternSpec:
-    key: str            # used for CSV column and status
-    src_glob: str       # glob pattern within data_dir
-    dest_stem: str      # destination base name (without extension)
+    key: str
+    src_glob: str
+    dest_stem: str
 
 
 PATTERNS: List[PatternSpec] = [
@@ -79,11 +81,14 @@ PATTERNS: List[PatternSpec] = [
 ]
 
 
+EXCEL_LIKE_EXTS = {".xlsx", ".xls", ".ods"}
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Collect Bruker-derived NIfTI/method files and emit scanno CSV."
     )
-    ap.add_argument("excel_path", help="Input Excel sheet (e.g., .xlsx)")
+    ap.add_argument("inventory_path", help="Input inventory (.csv, .xlsx, .xls, .ods)")
     ap.add_argument(
         "--study_dir",
         default="/mnt/newStor/paros/paros_MRI/DennisTurner",
@@ -107,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--sheet_name",
         default=None,
-        help="Excel sheet name (default: first sheet)",
+        help="Excel sheet name (default: first sheet). Ignored if CSV.",
     )
     ap.add_argument(
         "--dry_run",
@@ -119,14 +124,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print per-row details.",
     )
+    ap.add_argument(
+        "--libreoffice_cmd",
+        default="libreoffice",
+        help="LibreOffice command (default: %(default)s). Use 'soffice' if needed.",
+    )
     return ap.parse_args()
 
 
 def scan_date_to_mmddyy(val) -> Optional[str]:
-    """
-    Convert an Excel date-ish value to MMDDYY.
-    Returns None if parsing fails.
-    """
     if pd.isna(val):
         return None
     try:
@@ -139,10 +145,6 @@ def scan_date_to_mmddyy(val) -> Optional[str]:
 
 
 def list_data_dirs(study_dir: str, date_mmddyy: str, nii_subdir: str, bfolder: str) -> List[str]:
-    """
-    Return matching directories for:
-      {study_dir}/{date}/{nii_subdir}/*{bfolder}*1_1
-    """
     base = os.path.join(study_dir, date_mmddyy, nii_subdir)
     pattern = os.path.join(base, f"*{bfolder}*1_1")
     matches = [p for p in glob(pattern) if os.path.isdir(p)]
@@ -150,52 +152,37 @@ def list_data_dirs(study_dir: str, date_mmddyy: str, nii_subdir: str, bfolder: s
 
 
 def pick_best_candidate(files: List[str]) -> Tuple[Optional[int], Optional[str]]:
-    """
-    From a list of file paths, keep only those with basename starting with 1–2 digits + '_'.
-    Return (lowest_scanno, representative_file_path) where representative is the file
-    (any extension) belonging to the lowest scanno group.
-    """
     by_scanno: Dict[int, List[str]] = {}
-    for f in files:
-        bn = os.path.basename(f)
+    for fpath in files:
+        bn = os.path.basename(fpath)
         m = LEADING_SCANNO_RE.match(bn)
         if not m:
             continue
         sc = int(m.group("scanno"))
-        by_scanno.setdefault(sc, []).append(f)
+        by_scanno.setdefault(sc, []).append(fpath)
 
     if not by_scanno:
         return None, None
 
     best_sc = min(by_scanno.keys())
-    # pick a stable representative (sorted) for that scanno
     rep = sorted(by_scanno[best_sc])[0]
     return best_sc, rep
 
 
 def find_pair_for_rep(rep_any_ext: str) -> Dict[str, str]:
-    """
-    Given a representative file path (with some extension), attempt to locate both:
-      - .nii.gz
-      - .method
-    by using a shared stem prefix up to the first '.' in basename.
-
-    Returns dict ext_key -> path for ext_key in {"nii.gz","method"} if found.
-    """
     d = os.path.dirname(rep_any_ext)
     bn = os.path.basename(rep_any_ext)
-
-    # Shared prefix: everything before first dot
-    # e.g. "12_1_UTE3D...baseline" from "12_1_UTE3D...baseline.nii.gz"
     stem = bn.split(".", 1)[0]
 
     out: Dict[str, str] = {}
     nii = os.path.join(d, stem + ".nii.gz")
     method = os.path.join(d, stem + ".method")
+
     if os.path.isfile(nii):
         out["nii.gz"] = nii
     if os.path.isfile(method):
         out["method"] = method
+
     return out
 
 
@@ -206,6 +193,115 @@ def copy_with_rename(src: str, dst: str, dry_run: bool) -> None:
     shutil.copy2(src, dst)
 
 
+def convert_to_csv_with_libreoffice(
+    input_path: str,
+    output_dir: str,
+    libreoffice_cmd: str,
+    verbose: bool = False,
+) -> str:
+    """
+    Convert an Excel-like file to CSV using LibreOffice headless mode.
+    Returns the path to the generated CSV.
+
+    Note: LibreOffice will place the output CSV in output_dir. The output file name
+    is generally the input basename with .csv extension.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    cmd = [
+        libreoffice_cmd,
+        "--headless",
+        "--convert-to",
+        "csv",
+        "--outdir",
+        output_dir,
+        input_path,
+    ]
+
+    if verbose:
+        print("Running:", " ".join(cmd))
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"LibreOffice command not found: '{libreoffice_cmd}'. "
+            f"Try --libreoffice_cmd soffice, or ensure libreoffice is in PATH."
+        ) from e
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "LibreOffice conversion failed.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}\n"
+        )
+
+    base = os.path.splitext(os.path.basename(input_path))[0]
+    out_csv = os.path.join(output_dir, base + ".csv")
+
+    if not os.path.isfile(out_csv):
+        # LibreOffice sometimes emits slightly different naming; search output_dir for newest csv
+        candidates = sorted(
+            glob(os.path.join(output_dir, "*.csv")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        if not candidates:
+            raise RuntimeError(
+                f"LibreOffice reported success but no CSV found in: {output_dir}\n"
+                f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}\n"
+            )
+        out_csv = candidates[0]
+
+    return out_csv
+
+
+def read_inventory_to_dataframe(
+    inventory_path: str,
+    sheet_name: Optional[str],
+    libreoffice_cmd: str,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    If input is CSV: read directly.
+    If input is Excel-like: auto-convert to CSV (LibreOffice) then read CSV.
+
+    Returns pandas DataFrame.
+    """
+    inv_path = os.path.abspath(inventory_path)
+    ext = os.path.splitext(inv_path)[1].lower()
+
+    if ext == ".csv":
+        if verbose:
+            print(f"Reading CSV inventory: {inv_path}")
+        return pd.read_csv(inv_path)
+
+    if ext in EXCEL_LIKE_EXTS:
+        with tempfile.TemporaryDirectory(prefix="collect_niis_lo_") as tmpdir:
+            out_csv = convert_to_csv_with_libreoffice(
+                input_path=inv_path,
+                output_dir=tmpdir,
+                libreoffice_cmd=libreoffice_cmd,
+                verbose=verbose,
+            )
+            if verbose:
+                print(f"Converted inventory to CSV: {out_csv}")
+            df = pd.read_csv(out_csv)
+            return df
+
+    # If you want to support TSV or other delimited text, add here.
+    raise ValueError(
+        f"Unsupported inventory extension '{ext}'. Use .csv, .xlsx, .xls, or .ods."
+    )
+
+
 def main() -> int:
     args = parse_args()
 
@@ -213,15 +309,19 @@ def main() -> int:
     if not args.dry_run:
         os.makedirs(all_niis_dir, exist_ok=True)
 
-    # Read Excel
-    df = pd.read_excel(args.excel_path, sheet_name=args.sheet_name)
+    df = read_inventory_to_dataframe(
+        inventory_path=args.inventory_path,
+        sheet_name=args.sheet_name,
+        libreoffice_cmd=args.libreoffice_cmd,
+        verbose=args.verbose,
+    )
 
     required_cols = ["Bruker_folder", "Scan Date", "Arunno_or_Crunno"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise SystemExit(f"Missing required column(s) in Excel: {missing}")
+        raise SystemExit(f"Missing required column(s) in inventory: {missing}")
 
-    results_rows = []
+    results_rows: List[Dict[str, str]] = []
 
     for idx, row in df.iterrows():
         runno = row.get("Arunno_or_Crunno")
@@ -229,8 +329,8 @@ def main() -> int:
         scan_date_raw = row.get("Scan Date")
         date_mmddyy = scan_date_to_mmddyy(scan_date_raw)
 
-        out_row = {
-            "row_index_0based": idx,
+        out_row: Dict[str, str] = {
+            "row_index_0based": str(idx),
             "Arunno_or_Crunno": "" if pd.isna(runno) else str(runno),
             "Bruker_folder": "" if pd.isna(bfolder) else str(bfolder),
             "Scan Date": "" if pd.isna(scan_date_raw) else str(scan_date_raw),
@@ -242,7 +342,6 @@ def main() -> int:
             "status": "",
         }
 
-        # Always include skipped rows for clean reinsertion into Excel
         if pd.isna(runno) or str(runno).strip() == "":
             out_row["status"] = "SKIP: Arunno_or_Crunno empty"
             results_rows.append(out_row)
@@ -261,7 +360,6 @@ def main() -> int:
         runno = str(runno).strip()
         bfolder = str(bfolder).strip()
 
-        # Find data_dir (may match multiple; we try them in order until we find hits)
         data_dirs = list_data_dirs(args.study_dir, date_mmddyy, args.nii_subdir, bfolder)
         if not data_dirs:
             out_row["status"] = "MISS: no matching data_dir"
@@ -271,21 +369,19 @@ def main() -> int:
         if args.verbose:
             print(f"[row {idx}] runno={runno} date={date_mmddyy} bfolder={bfolder}")
             for dd in data_dirs:
-                print(f"  data_dir: {dd}")
+                print(f"    data_dir: {dd}")
 
-        status_bits = []
+        status_bits: List[str] = []
 
-        # For each pattern, search across candidate data_dirs; take the first data_dir that yields a match.
         for spec in PATTERNS:
             chosen_scanno: Optional[int] = None
             chosen_rep: Optional[str] = None
-            chosen_dir: Optional[str] = None
 
             for dd in data_dirs:
-                cand = glob(os.path.join(dd, spec.src_glob))
-                sc, rep = pick_best_candidate(cand)
+                candidates = glob(os.path.join(dd, spec.src_glob))
+                sc, rep = pick_best_candidate(candidates)
                 if sc is not None and rep is not None:
-                    chosen_scanno, chosen_rep, chosen_dir = sc, rep, dd
+                    chosen_scanno, chosen_rep = sc, rep
                     break
 
             col_name = f"{spec.key}_scanno"
@@ -296,20 +392,17 @@ def main() -> int:
 
             out_row[col_name] = str(chosen_scanno)
 
-            # Find both .nii.gz and .method for the chosen scan
             pair = find_pair_for_rep(chosen_rep)
             missing_exts = [e for e in ("nii.gz", "method") if e not in pair]
 
-            # Copy any that exist; still record missing ext(s) in status
             for ext_key, src_path in pair.items():
-                # destination naming
                 if ext_key == "nii.gz":
                     dst_name = f"{runno}_{spec.dest_stem}.nii.gz"
                 elif ext_key == "method":
                     dst_name = f"{runno}_{spec.dest_stem}.method"
                 else:
-                    # shouldn't happen
                     continue
+
                 dst_path = os.path.join(all_niis_dir, dst_name)
                 copy_with_rename(src_path, dst_path, args.dry_run)
 
@@ -319,15 +412,14 @@ def main() -> int:
                 status_bits.append(f"{spec.key}:OK")
 
             if args.verbose:
-                print(f"  {spec.key}: scanno={chosen_scanno} dir={chosen_dir}")
-                for ext_key in ("nii.gz", "method"):
-                    print(f"    {ext_key}: {pair.get(ext_key, 'MISSING')}")
+                print(f"    {spec.key}: scanno={chosen_scanno}")
+                print(f"        nii.gz: {pair.get('nii.gz', 'MISSING')}")
+                print(f"        method: {pair.get('method', 'MISSING')}")
 
         out_row["status"] = "; ".join(status_bits)
         results_rows.append(out_row)
 
-    # Write CSV
-    fieldnames = list(results_rows[0].keys()) if results_rows else [
+    fieldnames = [
         "row_index_0based",
         "Arunno_or_Crunno",
         "Bruker_folder",
@@ -345,12 +437,11 @@ def main() -> int:
         w.writeheader()
         w.writerows(results_rows)
 
-    if args.verbose or True:
-        print(f"\nWrote CSV: {args.out_csv}")
-        if args.dry_run:
-            print("Dry run: no files copied.")
-        else:
-            print(f"Files copied into: {all_niis_dir}")
+    print(f"\nWrote CSV: {args.out_csv}")
+    if args.dry_run:
+        print("Dry run: no files copied.")
+    else:
+        print(f"Files copied into: {all_niis_dir}")
 
     return 0
 
