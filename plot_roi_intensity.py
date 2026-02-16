@@ -294,6 +294,18 @@ def main():
 
     parser.add_argument("--stable-n", type=int, default=8,
                         help="Number of initial points of img_1 assumed stable for baseline scaling (default 8).")
+    parser.add_argument(
+        "--title-tag",
+        default=None,
+        help="Optional custom tag to include in the plot title (e.g., subject/run/sequence label).",
+    )
+    parser.add_argument(
+        "--title-mode",
+        choices=["full", "compact"],
+        default="full",
+        help="Title style. 'full' includes verbose normalization/global details. "
+             "'compact' shows only --title-tag (or default) and a small second line '(x,y,z;r=R)'.",
+    )
 
     # Global signal controls
     parser.add_argument("--global-mode", choices=["mean", "median"], default="mean",
@@ -600,29 +612,63 @@ def main():
     plt.xlabel(x_label)
     plt.ylabel("Mean ROI intensity")
 
-    title = f"ROI mean intensity (r={args.radius:g}, center={center_label})"
-    if datab is not None:
-        title += f"\nGLOBAL baseline scale={baseline_scale:.6g} using mean(baseline_global) and mean(img1_global[:{args.stable_n}])"
-        title += f"\n(global-mode={args.global_mode}, global-mask={global_mask_note})"
-    if data2 is not None:
-        if args.norm_method == "projections":
-            title += f"\nimg2 ROI scaled by {scale_proj:.6g} (projections)"
-        elif args.norm_method == "slope":
-            title += f"\nimg2 ROI affine: y2={alpha:.6g}*y2+{beta:.6g} (slope, n={args.norm_n})"
-        elif args.norm_method == "both":
-            title += f"\nimg2 ROI proj={scale_proj:.6g}, then affine y2={alpha:.6g}*y2+{beta:.6g} (both, n={args.norm_n})"
-        elif args.norm_method == "lastfirst" and datab is not None:
-            title += (
-                f"\nlastfirst avg scale={scale_lastfirst_final:.6g} "
-                f"(left={scale_lastfirst_left:.6g}, right={scale_lastfirst_right:.6g})"
-            )
-        elif args.norm_method == "lastfirst" and datab is None:
-            title += f"\nimg2 ROI scaled by {scale_lastfirst_final:.6g} (lastfirst)"
-        elif args.norm_method == "lastfirst":
-            title += f"\nimg2 ROI scaled by {scale_lastfirst:.6g} (lastfirst)"
-            print(f"       lastfirst scale={scale_lastfirst:.6g} (y1[-1]/y2[0])")
-            
-    plt.title(title)
+    # ---------------- Title handling ----------------
+    # Title tag (user override) or default label
+    if args.title_tag is not None and args.title_tag.strip() != "":
+        title_tag = args.title_tag.strip()
+    else:
+        title_tag = "ROI intensity"
+
+    # Compact coordinate line requested format: "($x,$y,$z;r=$radius)"
+    if args.center is None:
+        # If center not specified, we used image center; keep label consistent
+        coord_line = f"({center_label};r={args.radius:g})"
+    else:
+        coord_line = f"({int(round(cx))},{int(round(cy))},{int(round(cz))};r={args.radius:g})"
+
+    ax = plt.gca()
+
+    if args.title_mode == "compact":
+        # Main title is just the custom tag (or default)
+        ax.set_title(title_tag, fontsize=12)
+
+        # Small second line right under the title
+        ax.text(
+            0.5,
+            1.01,
+            coord_line,
+            transform=ax.transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    else:
+        # FULL title mode: keep your existing verbose behavior, but prefix with tag
+        title = title_tag + "\n" + f"ROI mean intensity (r={args.radius:g}, center={center_label})"
+
+        # (keep all your existing title += ... lines below this point)
+        # Example: baseline/global/norm method annotations
+        if baseline_path is not None:
+            title += f"\nGLOBAL baseline scale={baseline_scale:.6g} using mean(baseline_global) and mean(img1_global[:{args.stable_n}])"
+            title += f"\n(global-mode={args.global_mode}, global-mask={global_mask_note})"
+
+        if data2 is not None:
+            if args.norm_method == "lastfirst" and datab is not None:
+                title += (
+                    f"\nlastfirst avg scale={scale_lastfirst_final:.6g} "
+                    f"(left={scale_lastfirst_left:.6g}, right={scale_lastfirst_right:.6g})"
+                )
+            elif args.norm_method == "lastfirst" and datab is None:
+                title += f"\nimg2 ROI scaled by {scale_lastfirst_final:.6g} (lastfirst)"
+            elif args.norm_method == "projections":
+                title += f"\nimg2 ROI scaled by {scale_proj:.6g} (projections)"
+            elif args.norm_method == "slope":
+                title += f"\nimg2 ROI affine: y2={alpha:.6g}*y2+{beta:.6g} (slope, n={args.norm_n})"
+            elif args.norm_method == "both":
+                title += f"\nimg2 ROI proj={scale_proj:.6g}, then affine y2={alpha:.6g}*y2+{beta:.6g} (both, n={args.norm_n})"
+
+        ax.set_title(title, fontsize=12)
     plt.tight_layout()
     plt.savefig(out_plot, dpi=150)
 
