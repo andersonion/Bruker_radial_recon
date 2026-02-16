@@ -402,6 +402,14 @@ def main():
     out_plot = args.out or f"roi_intensity_{roi_tag}.png"
     mask_out = args.mask_out or f"roi_mask_{roi_tag}.nii.gz"
 
+    out_plot = _prefix_path(out_plot)
+    mask_out = _prefix_path(mask_out)
+    if args.csv_out is not None:
+        args.csv_out = _prefix_path(args.csv_out)
+    if args.auto_mask_out is not None and str(args.auto_mask_out).lower() not in ("none",):
+        args.auto_mask_out = _prefix_path(args.auto_mask_out)
+
+
     # ROI mask
     roi_mask = make_spherical_mask((nx, ny, nz), radius_vox=args.radius, center_xyz=(cx, cy, cz))
     nib.save(nib.Nifti1Image(roi_mask, img1.affine), mask_out)
@@ -444,12 +452,11 @@ def main():
 
             # Write it (unless disabled)
             if args.auto_mask_out is None:
-                auto_out = src_path.parent / f"auto_global_mask_from_{_strip_nii_extensions(src_path)}.nii.gz"
-            elif args.auto_mask_out.lower() == "none":
+                auto_out = src_path.parent / f"{file_prefix}auto_global_mask_from_{_strip_nii_extensions(src_path)}.nii.gz"
+            elif str(args.auto_mask_out).lower() == "none":
                 auto_out = None
             else:
-                auto_out = Path(args.auto_mask_out)
-
+                auto_out = Path(_prefix_path(str(args.auto_mask_out)))
             if auto_out is not None:
                 nib.save(nib.Nifti1Image(global_mask.astype(np.uint8), src_aff), str(auto_out))
         else:
@@ -619,6 +626,31 @@ def main():
     else:
         title_tag = "ROI intensity"
 
+    # ---------------- Filename prefixing from title tag ----------------
+    def _slugify(s: str) -> str:
+        # Safe filename prefix: keep alnum, dash, underscore; collapse others to underscore
+        out = []
+        for ch in s.strip():
+            if ch.isalnum() or ch in ("-", "_"):
+                out.append(ch)
+            else:
+                out.append("_")
+        slug = "".join(out)
+        while "__" in slug:
+            slug = slug.replace("__", "_")
+        return slug.strip("_")
+
+    file_prefix = _slugify(title_tag) + "_" if (args.title_tag is not None and args.title_tag.strip() != "") else ""
+
+    def _prefix_path(p: str | None) -> str | None:
+        if p is None:
+            return None
+        pp = Path(p)
+        if pp.name.startswith(file_prefix) or file_prefix == "":
+            return str(pp)
+        return str(pp.with_name(file_prefix + pp.name))
+
+
     # Compact coordinate line requested format: "($x,$y,$z;r=$radius)"
     if args.center is None:
         # If center not specified, we used image center; keep label consistent
@@ -628,27 +660,17 @@ def main():
 
     ax = plt.gca()
 
-    if args.title_mode == "compact":
-        # Main title is just the custom tag (or default)
-        ax.set_title(title_tag, fontsize=12)
+    ax = plt.gca()
 
-        # Small second line right under the title
-        ax.text(
-            0.5,
-            1.01,
-            coord_line,
-            transform=ax.transAxes,
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
+    if args.title_mode == "compact":
+        # Main title is just the tag (or default) with coords appended on the same line
+        ax.set_title(f"{title_tag} {coord_line}", fontsize=12)
 
     else:
-        # FULL title mode: keep your existing verbose behavior, but prefix with tag
-        title = title_tag + "\n" + f"ROI mean intensity (r={args.radius:g}, center={center_label})"
+        # FULL title mode: keep verbose details, but put coords on the FIRST line after the tag
+        title = f"{title_tag} {coord_line}\n" + f"ROI mean intensity (r={args.radius:g}, center={center_label})"
 
         # (keep all your existing title += ... lines below this point)
-        # Example: baseline/global/norm method annotations
         if baseline_path is not None:
             title += f"\nGLOBAL baseline scale={baseline_scale:.6g} using mean(baseline_global) and mean(img1_global[:{args.stable_n}])"
             title += f"\n(global-mode={args.global_mode}, global-mask={global_mask_note})"
@@ -668,7 +690,7 @@ def main():
             elif args.norm_method == "both":
                 title += f"\nimg2 ROI proj={scale_proj:.6g}, then affine y2={alpha:.6g}*y2+{beta:.6g} (both, n={args.norm_n})"
 
-        ax.set_title(title, fontsize=12)
+        ax.set_title(title, fontsize=12)   
     plt.tight_layout()
     plt.savefig(out_plot, dpi=150)
 
