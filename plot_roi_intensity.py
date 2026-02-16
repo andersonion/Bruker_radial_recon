@@ -319,8 +319,9 @@ def main():
         "--norm-method",
         choices=["none", "lastfirst", "projections", "slope", "both"],
         default="none",
-        help="Normalization applied at the img1->img2 boundary (ROI-based), after baseline scaling. "
-             "'lastfirst' scales img2 so img1[-1] == img2[0].",
+        help="Normalization at img1->img2 boundary (ROI-based), after any baseline scaling. "
+             "'lastfirst' can also use baseline (if provided) by averaging scale implied by "
+             "baseline->img1 and img1->img2 joins.",
     )
     parser.add_argument("--norm-n", type=int, default=5, help="Window size for slope/both at img1 tail / img2 head.")
 
@@ -469,6 +470,9 @@ def main():
 
     # Baseline scaling using GLOBAL signal
     baseline_scale = 1.0
+    scale_lastfirst_left = 1.0
+    scale_lastfirst_right = 1.0
+    scale_lastfirst_final = 1.0
     yb_roi_scaled = None
 
     if datab is not None:
@@ -480,17 +484,45 @@ def main():
         if args.stable_n < 1 or args.stable_n > len(y1_glob):
             raise ValueError(f"--stable-n must be in [1..len(img1)] = [1..{len(y1_glob)}], got {args.stable_n}")
 
-        mu_b = float(np.mean(yb_glob))                  # all baseline points
-        mu_1 = float(np.mean(y1_glob[:args.stable_n]))  # first n stable points of img1
+        mu_b = float(np.mean(yb_glob))
+        mu_1 = float(np.mean(y1_glob[:args.stable_n]))
 
         if abs(mu_b) < 1e-12:
             raise ValueError("Baseline global mean is ~0; cannot compute baseline scale.")
         baseline_scale = mu_1 / mu_b
 
-        # Apply global-derived scale to ROI traces in img2-space (baseline ROI + img2 ROI)
+        # Default behavior: apply GLOBAL-derived baseline scaling to img2-space ROI traces
         yb_roi_scaled = yb_roi * baseline_scale
         if y2_roi is not None:
             y2_roi = y2_roi * baseline_scale
+
+        # If requested, override with ROI-based last/first scaling averaged across BOTH boundaries
+        # (baseline->img1) and (img1->img2). This keeps baseline as a sanity check.
+        if args.norm_method == "lastfirst":
+            B = float(np.mean(yb_roi))  # baseline stable by assumption
+            I1_first = float(np.mean(y1_roi[:args.stable_n]))
+
+            if abs(B) < 1e-12:
+                raise ValueError("lastfirst (with baseline): baseline ROI mean is ~0; cannot scale.")
+
+            scale_lastfirst_left = I1_first / B
+
+            # Right boundary requires img2
+            if y2_roi is None:
+                raise ValueError("lastfirst (with baseline averaging) requires img2 as well.")
+
+            I1_last = float(y1_roi[-1])
+            I2_first = float((y2_roi / baseline_scale)[0])  # undo prior scaling so boundary uses raw img2 ROI
+
+            if abs(I2_first) < 1e-12:
+                raise ValueError("lastfirst (with baseline): img2 first ROI value is ~0; cannot scale.")
+
+            scale_lastfirst_right = I1_last / I2_first
+            scale_lastfirst_final = 0.5 * (scale_lastfirst_left + scale_lastfirst_right)
+
+            # Re-apply FINAL scale to img2-space traces (baseline + img2)
+            yb_roi_scaled = yb_roi * scale_lastfirst_final
+            y2_roi = (y2_roi / baseline_scale) * scale_lastfirst_final
 
     # If only img1 (and maybe baseline), we can still plot baseline->img1 QA
     segments_t = []
@@ -579,9 +611,17 @@ def main():
             title += f"\nimg2 ROI affine: y2={alpha:.6g}*y2+{beta:.6g} (slope, n={args.norm_n})"
         elif args.norm_method == "both":
             title += f"\nimg2 ROI proj={scale_proj:.6g}, then affine y2={alpha:.6g}*y2+{beta:.6g} (both, n={args.norm_n})"
+        elif args.norm_method == "lastfirst" and datab is not None:
+            title += (
+                f"\nlastfirst avg scale={scale_lastfirst_final:.6g} "
+                f"(left={scale_lastfirst_left:.6g}, right={scale_lastfirst_right:.6g})"
+            )
+        elif args.norm_method == "lastfirst" and datab is None:
+            title += f"\nimg2 ROI scaled by {scale_lastfirst_final:.6g} (lastfirst)"
         elif args.norm_method == "lastfirst":
             title += f"\nimg2 ROI scaled by {scale_lastfirst:.6g} (lastfirst)"
             print(f"       lastfirst scale={scale_lastfirst:.6g} (y1[-1]/y2[0])")
+            
     plt.title(title)
     plt.tight_layout()
     plt.savefig(out_plot, dpi=150)
