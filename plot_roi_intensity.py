@@ -479,7 +479,7 @@ def main():
 
             # Write it (unless disabled)
             if args.auto_mask_out is None:
-                auto_out = src_path.parent / f"{file_prefix}auto_global_mask_from_{_strip_nii_extensions(src_path)}.nii.gz"
+                auto_out = src_path.parent / f"{_prefix}auto_global_mask_from_{_strip_nii_extensions(src_path)}.nii.gz"
             elif str(args.auto_mask_out).lower() == "none":
                 auto_out = None
             else:
