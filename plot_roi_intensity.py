@@ -645,7 +645,7 @@ def main():
         plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
 
     	# img2 post-normalization fit ONLY (for continuity QA)
-    	plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
+        plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
 
     plt.xlabel(x_label)
     plt.ylabel("Mean ROI intensity")
