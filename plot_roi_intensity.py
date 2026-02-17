@@ -590,12 +590,12 @@ def main():
         t_cursor = tb[-1] + trb
 
     t1_abs = t_cursor + t1
+    segments_t.append(t1_abs)
     segments_y.append(y1_roi)
     if img1_scale != 1.0:
         labels.append(f"img1_ROI×{img1_scale:.6g}")
     else:
         labels.append("img1_ROI")
-    labels.append("img1_ROI")
     t_cursor = t1_abs[-1] + tr1
 
     dbg = None
@@ -650,10 +650,7 @@ def main():
 
         # img2 post-normalization fit ONLY (for continuity QA)
         plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
-
-    	# img2 post-normalization fit ONLY (for continuity QA)
-        plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
-
+        
     plt.xlabel(x_label)
     plt.ylabel("Mean ROI intensity")
 
@@ -683,9 +680,15 @@ def main():
 
         # (keep all your existing title += ... lines below this point)
         if baseline_path is not None:
-            title += f"\nGLOBAL baseline scale={baseline_scale:.6g} using mean(baseline_global) and mean(img1_global[:{args.stable_n}])"
+            title += (
+                f"\nimg1 scale (left)={scale_lastfirst_left:.6g} using mean(baseline_global)/mean(img1_global[:{args.stable_n}])"
+            )
+            if data2 is not None:
+                title += f"\nimg1 scale (right)={scale_lastfirst_right:.6g} using img2_global_first/img1_global_last"
+            if args.norm_method == "lastfirst" and datab is not None and data2 is not None:
+                title += f"\nimg1 scale (final avg)={img1_scale:.6g}"
             title += f"\n(global-mode={args.global_mode}, global-mask={global_mask_note})"
-
+            
         if data2 is not None:
             if args.norm_method == "lastfirst" and datab is not None:
                 title += (
@@ -731,10 +734,14 @@ def main():
             print(f"[img1-scale-final] avg(left,right)={img1_scale:.6g}")
             
         # ROI means (helps explain your “ROI baselines nearly match if scaled differently” observation)
-        mu_b_roi = float(np.mean(yb_roi_scaled))
+        mu_b_roi = float(np.mean(yb_roi))
         mu_1_roi = float(np.mean(y1_roi[:args.stable_n]))
-        print(f"[QA ROI means] mean(baseline_ROI_scaled)={mu_b_roi:.6g}  mean(img1_ROI_stable)={mu_1_roi:.6g}  ratio(img1/baseline_scaled)={mu_1_roi/mu_b_roi:.6g}")
-
+        if abs(mu_b_roi) < 1e-12:
+            ratio = float("nan")
+        else:
+            ratio = mu_1_roi / mu_b_roi
+        print(f"[QA ROI means] mean(baseline_ROI)={mu_b_roi:.6g}  mean(img1_ROI_stable_scaled)={mu_1_roi:.6g}  ratio(img1/baseline)={ratio:.6g}")
+        
     if data2 is not None:
         print(f"[norm] img1->img2 method={args.norm_method}")
         if args.norm_method in ("projections", "both"):
