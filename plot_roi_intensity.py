@@ -346,6 +346,33 @@ def main():
 
     args = parser.parse_args()
 
+
+    # ---------------- Filename prefixing from title tag ----------------
+    def _slugify(s: str) -> str:
+        # Safe filename prefix: keep alnum, dash, underscore; collapse others to underscore
+        out = []
+        for ch in s.strip():
+            if ch.isalnum() or ch in ("-", "_"):
+                out.append(ch)
+            else:
+                out.append("_")
+        slug = "".join(out)
+        while "__" in slug:
+            slug = slug.replace("__", "_")
+        return slug.strip("_")
+
+    file_prefix = _slugify(title_tag) + "_" if (args.title_tag is not None and args.title_tag.strip() != "") else ""
+
+    def _prefix_path(p: str | None) -> str | None:
+        if p is None:
+            return None
+        pp = Path(p)
+        if pp.name.startswith(file_prefix) or file_prefix == "":
+            return str(pp)
+        return str(pp.with_name(file_prefix + pp.name))
+
+
+
     # Load img1
     img1_path = Path(args.img_1)
     img1 = nib.load(str(img1_path))
@@ -625,31 +652,6 @@ def main():
         title_tag = args.title_tag.strip()
     else:
         title_tag = "ROI intensity"
-
-    # ---------------- Filename prefixing from title tag ----------------
-    def _slugify(s: str) -> str:
-        # Safe filename prefix: keep alnum, dash, underscore; collapse others to underscore
-        out = []
-        for ch in s.strip():
-            if ch.isalnum() or ch in ("-", "_"):
-                out.append(ch)
-            else:
-                out.append("_")
-        slug = "".join(out)
-        while "__" in slug:
-            slug = slug.replace("__", "_")
-        return slug.strip("_")
-
-    file_prefix = _slugify(title_tag) + "_" if (args.title_tag is not None and args.title_tag.strip() != "") else ""
-
-    def _prefix_path(p: str | None) -> str | None:
-        if p is None:
-            return None
-        pp = Path(p)
-        if pp.name.startswith(file_prefix) or file_prefix == "":
-            return str(pp)
-        return str(pp.with_name(file_prefix + pp.name))
-
 
     # Compact coordinate line requested format: "($x,$y,$z;r=$radius)"
     if args.center is None:
