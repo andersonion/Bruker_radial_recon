@@ -515,62 +515,67 @@ def main():
         y2_roi = mean_roi_timeseries(data2, roi_mask)
         tr2 = get_tr_seconds(img2_path, args.tr2)
 
-    # Baseline scaling using GLOBAL signal
-    baseline_scale = 1.0
+    # ---------------- Scaling: baseline/img2 fixed, scale img1 only ----------------
+    img1_scale = 1.0
     scale_lastfirst_left = 1.0
     scale_lastfirst_right = 1.0
     scale_lastfirst_final = 1.0
-    yb_roi_scaled = None
+
+    # Optional baseline signals (kept UNCHANGED)
+    yb_roi = None
+    yb_glob = None
+    trb = None
+
+    # Optional img2 global (kept UNCHANGED) for right-boundary scaling with global signal
+    y2_glob = None
 
     if datab is not None:
         yb_roi = mean_roi_timeseries(datab, roi_mask)
         yb_glob = global_timeseries(datab, global_mask, args.global_mode)
         trb = get_tr_seconds(baseline_path, args.trb) if not baseline_is_3d else tr1
 
-
         if args.stable_n < 1 or args.stable_n > len(y1_glob):
             raise ValueError(f"--stable-n must be in [1..len(img1)] = [1..{len(y1_glob)}], got {args.stable_n}")
 
+        # Left boundary scale (GLOBAL): make early img1 match baseline (baseline is stable)
         mu_b = float(np.mean(yb_glob))
         mu_1 = float(np.mean(y1_glob[:args.stable_n]))
+        if abs(mu_1) < 1e-12:
+            raise ValueError("Stable img1 global mean is ~0; cannot compute scale.")
+        scale_lastfirst_left = mu_b / mu_1
 
-        if abs(mu_b) < 1e-12:
-            raise ValueError("Baseline global mean is ~0; cannot compute baseline scale.")
-        baseline_scale = mu_1 / mu_b
+    if data2 is not None:
+        y2_glob = global_timeseries(data2, global_mask, args.global_mode)
 
-        # Default behavior: apply GLOBAL-derived baseline scaling to img2-space ROI traces
-        yb_roi_scaled = yb_roi * baseline_scale
-        if y2_roi is not None:
-            y2_roi = y2_roi * baseline_scale
+        # Right boundary scale (GLOBAL): enforce last(img1) == first(img2)
+        mu_2_first = float(y2_glob[0])
+        mu_1_last = float(y1_glob[-1])
+        if abs(mu_1_last) < 1e-12:
+            raise ValueError("Last img1 global value is ~0; cannot compute scale.")
+        scale_lastfirst_right = mu_2_first / mu_1_last
 
-        # If requested, override with ROI-based last/first scaling averaged across BOTH boundaries
-        # (baseline->img1) and (img1->img2). This keeps baseline as a sanity check.
-        if args.norm_method == "lastfirst":
-            B = float(np.mean(yb_roi))  # baseline stable by assumption
-            I1_first = float(np.mean(y1_roi[:args.stable_n]))
-
-            if abs(B) < 1e-12:
-                raise ValueError("lastfirst (with baseline): baseline ROI mean is ~0; cannot scale.")
-
-            scale_lastfirst_left = I1_first / B
-
-            # Right boundary requires img2
-            if y2_roi is None:
-                raise ValueError("lastfirst (with baseline averaging) requires img2 as well.")
-
-            I1_last = float(y1_roi[-1])
-            I2_first = float((y2_roi / baseline_scale)[0])  # undo prior scaling so boundary uses raw img2 ROI
-
-            if abs(I2_first) < 1e-12:
-                raise ValueError("lastfirst (with baseline): img2 first ROI value is ~0; cannot scale.")
-
-            scale_lastfirst_right = I1_last / I2_first
+    # Choose how to scale img1
+    if args.norm_method == "lastfirst":
+        if datab is not None and data2 is not None:
+            # Use BOTH boundaries (baseline->img1 and img1->img2)
             scale_lastfirst_final = 0.5 * (scale_lastfirst_left + scale_lastfirst_right)
+            img1_scale = scale_lastfirst_final
+        elif datab is not None and data2 is None:
+            # Only baseline boundary available
+            img1_scale = scale_lastfirst_left
+        elif datab is None and data2 is not None:
+            # Only img1->img2 boundary available
+            img1_scale = scale_lastfirst_right
+        else:
+            img1_scale = 1.0
+    else:
+        # For other norm methods, keep your existing behavior (img1 unscaled here)
+        img1_scale = 1.0
 
-            # Re-apply FINAL scale to img2-space traces (baseline + img2)
-            yb_roi_scaled = yb_roi * scale_lastfirst_final
-            y2_roi = (y2_roi / baseline_scale) * scale_lastfirst_final
-
+    # Apply scaling to img1 ONLY (both ROI + global)
+    if img1_scale != 1.0:
+        y1_roi = y1_roi * img1_scale
+        y1_glob = y1_glob * img1_scale
     # If only img1 (and maybe baseline), we can still plot baseline->img1 QA
     segments_t = []
     segments_y = []
@@ -578,16 +583,18 @@ def main():
     t_cursor = 0.0
 
     if datab is not None:
-        trb = get_tr_seconds(baseline_path, args.trb)
-        tb = t_cursor + np.arange(len(yb_roi_scaled), dtype=float) * trb
+        tb = t_cursor + np.arange(len(yb_roi), dtype=float) * trb
         segments_t.append(tb)
-        segments_y.append(yb_roi_scaled)
-        labels.append(f"baseline_ROI×{baseline_scale:.6g}")
+        segments_y.append(yb_roi)
+        labels.append("baseline_ROI")
         t_cursor = tb[-1] + trb
 
     t1_abs = t_cursor + t1
-    segments_t.append(t1_abs)
     segments_y.append(y1_roi)
+    if img1_scale != 1.0:
+        labels.append(f"img1_ROI×{img1_scale:.6g}")
+    else:
+        labels.append("img1_ROI")
     labels.append("img1_ROI")
     t_cursor = t1_abs[-1] + tr1
 
@@ -715,8 +722,14 @@ def main():
         yb_glob = global_timeseries(datab, global_mask, args.global_mode)
         mu_b = float(np.mean(yb_glob))
         mu_1 = float(np.mean(y1_glob[:args.stable_n]))
-        print(f"[baseline-scale] mu_baseline_global={mu_b:.6g}  mu_img1_global_stable={mu_1:.6g}  scale={baseline_scale:.6g}")
-
+        print(f"[img1-scale-left]  mu_baseline_global={mu_b:.6g}  mu_img1_global_stable={mu_1:.6g}  scale={scale_lastfirst_left:.6g}")
+        if data2 is not None:
+            mu_2_first = float(y2_glob[0])
+            mu_1_last = float((y1_glob / img1_scale)[-1]) if img1_scale != 0 else float("nan")
+            print(f"[img1-scale-right] img2_global_first={mu_2_first:.6g}  img1_global_last_raw={mu_1_last:.6g}  scale={scale_lastfirst_right:.6g}")
+        if args.norm_method == "lastfirst" and datab is not None and data2 is not None:
+            print(f"[img1-scale-final] avg(left,right)={img1_scale:.6g}")
+            
         # ROI means (helps explain your “ROI baselines nearly match if scaled differently” observation)
         mu_b_roi = float(np.mean(yb_roi_scaled))
         mu_1_roi = float(np.mean(y1_roi[:args.stable_n]))
