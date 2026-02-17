@@ -515,7 +515,7 @@ def main():
         y2_roi = mean_roi_timeseries(data2, roi_mask)
         tr2 = get_tr_seconds(img2_path, args.tr2)
 
-    # ---------------- Scaling: baseline/img2 fixed, scale img1 only ----------------
+     # ---------------- Scaling: baseline/img2 fixed, scale img1 only ----------------
     img1_scale = 1.0
     scale_lastfirst_left = 1.0
     scale_lastfirst_right = 1.0
@@ -526,7 +526,7 @@ def main():
     yb_glob = None
     trb = None
 
-    # Optional img2 global (kept UNCHANGED) for right-boundary scaling with global signal
+    # Optional img2 global (kept UNCHANGED) for reporting only
     y2_glob = None
 
     if datab is not None:
@@ -534,48 +534,46 @@ def main():
         yb_glob = global_timeseries(datab, global_mask, args.global_mode)
         trb = get_tr_seconds(baseline_path, args.trb) if not baseline_is_3d else tr1
 
-        if args.stable_n < 1 or args.stable_n > len(y1_glob):
-            raise ValueError(f"--stable-n must be in [1..len(img1)] = [1..{len(y1_glob)}], got {args.stable_n}")
+        if args.stable_n < 1 or args.stable_n > len(y1_roi):
+            raise ValueError(f"--stable-n must be in [1..len(img1)] = [1..{len(y1_roi)}], got {args.stable_n}")
 
-        # Left boundary scale (GLOBAL): make early img1 match baseline (baseline is stable)
-        mu_b = float(np.mean(yb_glob))
-        mu_1 = float(np.mean(y1_glob[:args.stable_n]))
-        if abs(mu_1) < 1e-12:
-            raise ValueError("Stable img1 global mean is ~0; cannot compute scale.")
-        scale_lastfirst_left = mu_b / mu_1
+        # Left boundary scale (ROI): make early img1 ROI match baseline ROI (baseline is stable)
+        mu_b_roi = float(np.mean(yb_roi))
+        mu_1_roi = float(np.mean(y1_roi[:args.stable_n]))
+        if abs(mu_1_roi) < 1e-12:
+            raise ValueError("Stable img1 ROI mean is ~0; cannot compute scale.")
+        scale_lastfirst_left = mu_b_roi / mu_1_roi
 
     if data2 is not None:
-        y2_glob = global_timeseries(data2, global_mask, args.global_mode)
+        y2_glob = global_timeseries(data2, global_mask, args.global_mode)  # reporting only
 
-        # Right boundary scale (GLOBAL): enforce last(img1) == first(img2)
-        mu_2_first = float(y2_glob[0])
-        mu_1_last = float(y1_glob[-1])
-        if abs(mu_1_last) < 1e-12:
-            raise ValueError("Last img1 global value is ~0; cannot compute scale.")
-        scale_lastfirst_right = mu_2_first / mu_1_last
+        # Right boundary scale (ROI): enforce last(img1 ROI) == first(img2 ROI)
+        mu_2_first_roi = float(y2_roi[0])
+        mu_1_last_roi = float(y1_roi[-1])
+        if abs(mu_1_last_roi) < 1e-12:
+            raise ValueError("Last img1 ROI value is ~0; cannot compute scale.")
+        scale_lastfirst_right = mu_2_first_roi / mu_1_last_roi
 
-    # Choose how to scale img1
+    # Choose how to scale img1 (ROI-based lastfirst)
     if args.norm_method == "lastfirst":
         if datab is not None and data2 is not None:
-            # Use BOTH boundaries (baseline->img1 and img1->img2)
             scale_lastfirst_final = 0.5 * (scale_lastfirst_left + scale_lastfirst_right)
             img1_scale = scale_lastfirst_final
         elif datab is not None and data2 is None:
-            # Only baseline boundary available
             img1_scale = scale_lastfirst_left
         elif datab is None and data2 is not None:
-            # Only img1->img2 boundary available
             img1_scale = scale_lastfirst_right
         else:
             img1_scale = 1.0
     else:
-        # For other norm methods, keep your existing behavior (img1 unscaled here)
         img1_scale = 1.0
 
-    # Apply scaling to img1 ONLY (both ROI + global)
+    # Apply scaling to img1 ONLY
     if img1_scale != 1.0:
         y1_roi = y1_roi * img1_scale
         y1_glob = y1_glob * img1_scale
+        
+        
     # If only img1 (and maybe baseline), we can still plot baseline->img1 QA
     segments_t = []
     segments_y = []
@@ -607,7 +605,7 @@ def main():
         t2_abs = t_cursor + np.arange(len(y2_roi), dtype=float) * tr2
         segments_t.append(t2_abs)
         segments_y.append(y2_roi)
-        labels.append("img2_ROI" + ("(scaled)" if datab is not None else ""))
+        labels.append("img2_ROI")
 
         # Boundary normalization on ROI only (optional)
         scale_lastfirst = 1.0
