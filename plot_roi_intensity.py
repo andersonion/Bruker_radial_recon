@@ -361,8 +361,9 @@ def main():
             slug = slug.replace("__", "_")
         return slug.strip("_")
 
-    file_prefix = _slugify(title_tag) + "_" if (args.title_tag is not None and args.title_tag.strip() != "") else ""
-
+    file_prefix = _slugify(args.title_tag.strip()) + "_" if (args.title_tag is not None and args.title_tag.strip() != "") else ""
+    _prefix = file_prefix
+    
     def _prefix_path(p: str | None) -> str | None:
         if p is None:
             return None
@@ -604,14 +605,14 @@ def main():
         # Boundary normalization on ROI only (optional)
         scale_lastfirst = 1.0
 
-        if args.norm_method == "lastfirst":
+        if args.norm_method == "lastfirst" and datab is None:
             y1_last = float(y1_roi[-1])
             y2_first = float(segments_y[-1][0])
             if abs(y2_first) < 1e-12:
                 raise ValueError("lastfirst normalization: img2 first ROI value is ~0; cannot scale.")
             scale_lastfirst = y1_last / y2_first
             segments_y[-1] = segments_y[-1] * scale_lastfirst
-
+            
         if args.norm_method in ("projections", "both"):
             scale_proj = float(get_npro(img1_path) / get_npro(img2_path))
             segments_y[-1] = segments_y[-1] * scale_proj
@@ -637,9 +638,12 @@ def main():
 
     # slope debug overlays (img1->img2)
     if data2 is not None and args.norm_method in ("slope", "both") and dbg is not None:
-    	# img1 tail fit (reference)
-    	plt.plot(dbg["t1_tail"] / x_scale, dbg["y1_fit_tail"], linestyle="--", alpha=0.7)
-    
+        # img1 tail fit (reference)
+        plt.plot(dbg["t1_tail"] / x_scale, dbg["y1_fit_tail"], linestyle="--", alpha=0.7)
+
+        # img2 post-normalization fit ONLY (for continuity QA)
+        plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
+
     	# img2 post-normalization fit ONLY (for continuity QA)
     	plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
 
@@ -659,8 +663,6 @@ def main():
         coord_line = f"({center_label};r={args.radius:g})"
     else:
         coord_line = f"({int(round(cx))},{int(round(cy))},{int(round(cz))};r={args.radius:g})"
-
-    ax = plt.gca()
 
     ax = plt.gca()
 
