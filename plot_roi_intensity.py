@@ -322,9 +322,9 @@ def main():
                         help="Compute a_expected = NPro(img2)/NPro(img1) (requires method sidecars).")
     parser.add_argument("--a-expected", type=float, default=None,
                         help="Override expected a (e.g., 3.0).")
-    parser.add_argument("--a-bound-scale", type=float, default=2.0,
+    parser.add_argument("--a-bound-scale", type=float, default=25.0,
                         help="Bounds factor for a around expected: [a_expected/scale, a_expected*scale]. "
-                             "Only applied if a_expected is available. Default 2.0.")
+                             "Only applied if a_expected is available. Default 25.0 (essentially turned off...more reasonable values are 2-4).")
 
     args = parser.parse_args()
 
