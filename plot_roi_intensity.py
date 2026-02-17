@@ -31,6 +31,28 @@ def find_method_sidecar(img_path: Path) -> Path | None:
     return cand if cand.exists() else None
 
 
+def _slugify(s: str) -> str:
+    out = []
+    for ch in s.strip():
+        if ch.isalnum() or ch in ("-", "_"):
+            out.append(ch)
+        else:
+            out.append("_")
+    slug = "".join(out)
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug.strip("_")
+
+
+def _prefix_path(p: str | None, file_prefix: str) -> str | None:
+    if p is None:
+        return None
+    pp = Path(p)
+    if file_prefix == "" or pp.name.startswith(file_prefix):
+        return str(pp)
+    return str(pp.with_name(file_prefix + pp.name))
+
+
 # ----------------------------- helpers: method parsing ----------------------------- #
 
 def _parse_method_value(method_text: str, key: str, method_path: Path) -> float:
@@ -39,6 +61,7 @@ def _parse_method_value(method_text: str, key: str, method_path: Path) -> float:
         raise ValueError(f"Could not find {key} in {method_path}")
     val = m.group(1).strip()
 
+    # Bruker style: key=( ... ) then values on next line(s)
     if val.startswith("("):
         after = method_text[m.end():]
         m2 = re.search(r"([-+]?\d+(\.\d+)?)", after)
@@ -90,15 +113,15 @@ def get_npro(img_path: Path) -> float:
     method_path = find_method_sidecar(img_path)
     if method_path is None:
         raise FileNotFoundError(
-            f"Projection normalization requires method sidecars. "
+            "Projection normalization requires method sidecars. "
             f"Could not find {_strip_nii_extensions(img_path)}.method next to {img_path}."
         )
     return parse_bruker_method_for_npro(method_path)
 
 
-# ----------------------------- ROI + global signals ----------------------------- #
+# ----------------------------- ROI + signal extraction ----------------------------- #
 
-def make_spherical_mask(shape_xyz, radius_vox: float, center_xyz: tuple[float, float, float]):
+def make_spherical_mask(shape_xyz, radius_vox: float, center_xyz: tuple[float, float, float]) -> np.ndarray:
     nx, ny, nz = shape_xyz
     cx, cy, cz = center_xyz
     x = np.arange(nx)
@@ -109,64 +132,87 @@ def make_spherical_mask(shape_xyz, radius_vox: float, center_xyz: tuple[float, f
     return (dist2 <= radius_vox ** 2).astype(np.uint8)
 
 
-def mean_roi_timeseries(data_4d: np.ndarray, mask_3d: np.ndarray) -> np.ndarray:
-    if data_4d.ndim != 4:
-        raise ValueError(f"Expected 4D data, got shape {data_4d.shape}")
-    if mask_3d.shape != data_4d.shape[:3]:
-        raise ValueError(f"Mask shape {mask_3d.shape} != data spatial shape {data_4d.shape[:3]}")
-    if mask_3d.sum() == 0:
-        raise RuntimeError("ROI mask is empty.")
-    roi = data_4d[mask_3d == 1, :]
-    return np.nanmean(roi, axis=0)
-
-
-def global_timeseries(data_4d: np.ndarray, global_mask_3d: np.ndarray | None, mode: str) -> np.ndarray:
-    if data_4d.ndim != 4:
-        raise ValueError(f"Expected 4D data, got shape {data_4d.shape}")
-
-    if global_mask_3d is not None:
-        if global_mask_3d.shape != data_4d.shape[:3]:
-            raise ValueError(f"Global mask shape {global_mask_3d.shape} != data spatial shape {data_4d.shape[:3]}")
-        vox = data_4d[global_mask_3d > 0, :]
-    else:
-        vox = data_4d.reshape(-1, data_4d.shape[3])
-
-    if vox.size == 0:
-        raise RuntimeError("Global mask selected 0 voxels.")
-
+def _reduce_timeseries(vox_by_t: np.ndarray, mode: str) -> np.ndarray:
     if mode == "mean":
-        return np.nanmean(vox, axis=0)
+        return np.nanmean(vox_by_t, axis=0)
     if mode == "median":
-        return np.nanmedian(vox, axis=0)
+        return np.nanmedian(vox_by_t, axis=0)
+    raise ValueError(f"Unknown mode: {mode}")
 
-    raise ValueError(f"Unknown global mode: {mode}")
+
+def timeseries_from_source(
+    data_4d: np.ndarray,
+    *,
+    source: str,
+    roi_mask_3d: np.ndarray,
+    global_mask_3d: np.ndarray | None,
+    global_mode: str,
+    nonzero_eps: float
+) -> np.ndarray:
+    if data_4d.ndim != 4:
+        raise ValueError(f"Expected 4D data, got shape {data_4d.shape}")
+
+    if source == "roi":
+        if roi_mask_3d.shape != data_4d.shape[:3]:
+            raise ValueError("ROI mask shape mismatch.")
+        vox = data_4d[roi_mask_3d > 0, :]
+        if vox.size == 0:
+            raise RuntimeError("ROI mask selected 0 voxels.")
+        return _reduce_timeseries(vox, global_mode)
+
+    if source == "global":
+        vox = data_4d.reshape(-1, data_4d.shape[3])
+        if vox.size == 0:
+            raise RuntimeError("Global selected 0 voxels.")
+        return _reduce_timeseries(vox, global_mode)
+
+    if source == "nonzero":
+        mean_vol = np.nanmean(data_4d, axis=3)
+        m = np.isfinite(mean_vol) & (mean_vol > nonzero_eps)
+        vox = data_4d[m, :]
+        if vox.size == 0:
+            raise RuntimeError(f"Nonzero mask selected 0 voxels (eps={nonzero_eps}).")
+        return _reduce_timeseries(vox, global_mode)
+
+    if source == "mask":
+        if global_mask_3d is None:
+            raise ValueError("source='mask' requested but global_mask_3d is None.")
+        if global_mask_3d.shape != data_4d.shape[:3]:
+            raise ValueError("Global mask shape mismatch.")
+        vox = data_4d[global_mask_3d > 0, :]
+        if vox.size == 0:
+            raise RuntimeError("Global mask selected 0 voxels.")
+        return _reduce_timeseries(vox, global_mode)
+
+    raise ValueError(f"Unknown source: {source}")
 
 
-# ----------------------------- auto brain mask (global scaling) ----------------------------- #
+# ----------------------------- auto brain mask (optional) ----------------------------- #
+
+def _require_scipy():
+    if ndi is None:
+        raise RuntimeError(
+            "This script needs scipy for the requested morphology/CC steps. "
+            "Install scipy or run in an environment that has it."
+        )
+
 
 def otsu_threshold(vol: np.ndarray, nbins: int = 256) -> float:
-    """
-    Otsu threshold on a 3D volume (ignores NaNs, flattens).
-    Returns threshold in the same intensity units as vol.
-    """
     x = vol[np.isfinite(vol)].ravel()
     if x.size == 0:
         raise ValueError("Otsu: volume has no finite values.")
     x_min = float(np.min(x))
     x_max = float(np.max(x))
     if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
-        # degenerate
         return x_min
 
     hist, bin_edges = np.histogram(x, bins=nbins, range=(x_min, x_max))
     hist = hist.astype(np.float64)
-
     prob = hist / np.sum(hist)
     omega = np.cumsum(prob)
     mu = np.cumsum(prob * (bin_edges[:-1] + bin_edges[1:]) * 0.5)
     mu_t = mu[-1]
 
-    # between-class variance
     denom = omega * (1.0 - omega)
     denom[denom == 0] = np.nan
     sigma_b2 = (mu_t * omega - mu) ** 2 / denom
@@ -176,47 +222,34 @@ def otsu_threshold(vol: np.ndarray, nbins: int = 256) -> float:
     return thr
 
 
-def _require_scipy():
-    if ndi is None:
-        raise RuntimeError(
-            "This script needs scipy for the requested morphology/CC steps. "
-            "On your cluster/venv, install scipy or run in an environment that has it."
-        )
-
-
-def generate_auto_brain_mask_from_mean(data_4d: np.ndarray, *, erosions: int = 3, dilations: int = 3,
-                                      nbins: int = 256) -> np.ndarray:
-    """
-    Build a quick brain-ish mask from the time-mean volume:
-      - Otsu threshold
-      - binary erosion (erosions times)
-      - keep largest connected component
-      - binary dilation (dilations times)
-    Returns uint8 mask (0/1).
-    """
+def generate_auto_brain_mask_from_mean(
+    data_4d: np.ndarray,
+    *,
+    erosions: int = 3,
+    dilations: int = 3,
+    nbins: int = 256
+) -> np.ndarray:
     _require_scipy()
 
     mean_vol = np.nanmean(data_4d, axis=3)
     thr = otsu_threshold(mean_vol, nbins=nbins)
     m = mean_vol > thr
 
-    # Use 3D 26-connected struct
-    struct = ndi.generate_binary_structure(3, 2)
+    struct = ndi.generate_binary_structure(3, 2)  # 26-connected
 
     if erosions > 0:
         m = ndi.binary_erosion(m, structure=struct, iterations=erosions)
 
-    # Keep largest blob
     lbl, n = ndi.label(m, structure=struct)
     if n < 1:
-        # Fallback: if erosion killed everything, relax by skipping erosion
+        # fallback: remove erosions
         m = mean_vol > thr
         lbl, n = ndi.label(m, structure=struct)
         if n < 1:
             raise RuntimeError("Auto mask failed: no components found after thresholding.")
 
     counts = np.bincount(lbl.ravel())
-    counts[0] = 0  # ignore background
+    counts[0] = 0
     keep = int(np.argmax(counts))
     m = (lbl == keep)
 
@@ -226,7 +259,7 @@ def generate_auto_brain_mask_from_mean(data_4d: np.ndarray, *, erosions: int = 3
     return m.astype(np.uint8)
 
 
-# ----------------------------- boundary normalization (ROI) ----------------------------- #
+# ----------------------------- boundary normalization ----------------------------- #
 
 def fit_line(t: np.ndarray, y: np.ndarray):
     A = np.vstack([t, np.ones_like(t)]).T
@@ -260,121 +293,116 @@ def affine_match_img1_tail_to_img2_head(t1, y1, t2, y2, n: int):
         "t1_tail": t1_tail,
         "y1_fit_tail": a1 * t1_tail + b1,
         "t2_head": t2_head,
-        "L1_target": L1,
-        "L2_pre": L2,
-        "L2_post": alpha * L2 + beta,
+        "L2_post": alpha * (a2 * t2_head + b2) + beta,
         "alpha": alpha,
         "beta": beta,
     }
     return alpha, beta, dbg
 
 
+def _window_mean(y: np.ndarray, start: int, stop: int) -> float:
+    if stop <= start:
+        raise ValueError("Invalid window for mean.")
+    return float(np.mean(y[start:stop]))
+
+
+def solve_affine_two_boundaries(mu_left_target: float, mu_right_target: float, mu_left_src: float, mu_right_src: float):
+    denom = (mu_left_src - mu_right_src)
+    if abs(denom) < 1e-12:
+        raise ValueError(
+            "Affine2bound degenerate: mu_left_src == mu_right_src (or too close). "
+            "Try different windows or use lastfirst."
+        )
+    a = (mu_left_target - mu_right_target) / denom
+    c = mu_left_target - a * mu_left_src
+    return float(a), float(c)
+
+
 # ----------------------------------- main ----------------------------------- #
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot ROI intensity while computing baseline scaling from GLOBAL signal. "
-                    "Global mask can be provided, or auto-generated from mean(img2)."
+        description="Plot ROI mean intensity across baseline/img1/img2. "
+                    "Baseline and img2 are held fixed; normalization is applied to img1 only."
     )
-    parser.add_argument("img_1", help="4D NIfTI (main run)")
-    parser.add_argument("img_2", nargs="?", default=None, help="Second 4D NIfTI (optional)")
+    parser.add_argument("img_1", help="4D NIfTI (main run, img1)")
+    parser.add_argument("img_2", nargs="?", default=None, help="Second 4D NIfTI (img2, optional)")
 
-    parser.add_argument("--img2-baseline", default=None,
-                        help="Baseline 4D NIfTI acquired with same params as img_2 (and before img_1). "
-                             "Used ONLY to compute stable scaling (img2-space -> img1-space) using GLOBAL signal.")
+    parser.add_argument(
+        "--img2-baseline",
+        default=None,
+        help="Baseline NIfTI acquired with same params as img2 (before img1). 3D or 4D allowed."
+    )
 
     parser.add_argument("--radius", type=float, required=True, help="ROI radius in voxels")
-    parser.add_argument("--center", nargs=3, type=float, default=None,
-                        metavar=("X", "Y", "Z"),
-                        help="ROI center in voxel indices (0-based). If omitted, uses image center.")
-
-    parser.add_argument("--tr1", type=float, default=None, help="TR seconds for img_1 (optional if method exists)")
-    parser.add_argument("--tr2", type=float, default=None, help="TR seconds for img_2 (optional if method exists)")
-    parser.add_argument("--trb", type=float, default=None, help="TR seconds for --img2-baseline (optional if method exists)")
-
-    parser.add_argument("--stable-n", type=int, default=8,
-                        help="Number of initial points of img_1 assumed stable for baseline scaling (default 8).")
     parser.add_argument(
-        "--title-tag",
+        "--center",
+        nargs=3,
+        type=float,
         default=None,
-        help="Optional custom tag to include in the plot title (e.g., subject/run/sequence label).",
+        metavar=("X", "Y", "Z"),
+        help="ROI center in voxel indices (0-based). If omitted, uses image center."
     )
+
+    parser.add_argument("--tr1", type=float, default=None, help="TR seconds for img1 (optional if .method exists)")
+    parser.add_argument("--tr2", type=float, default=None, help="TR seconds for img2 (optional if .method exists)")
+    parser.add_argument("--trb", type=float, default=None, help="TR seconds for baseline (optional if .method exists)")
+
+    parser.add_argument("--stable-n", type=int, default=8, help="Initial points of img1 assumed baseline-like (default 8)")
+    parser.add_argument("--norm-n", type=int, default=5, help="Tail/head window size for boundary (default 5)")
+
     parser.add_argument(
-        "--title-mode",
-        choices=["full", "compact"],
-        default="full",
-        help="Title style. 'full' includes verbose normalization/global details. "
-             "'compact' shows only --title-tag (or default) and a small second line '(x,y,z;r=R)'.",
+        "--norm-method",
+        choices=["none", "lastfirst", "affine2bound", "projections", "slope", "both"],
+        default="none",
+        help="Normalization method. Baseline+img2 held constant; normalization is applied to img1 only.\n"
+             "  none        : no scaling\n"
+             "  lastfirst   : multiplicative img1 scaling; uses BOTH boundaries when possible\n"
+             "  affine2bound: affine img1 transform (a*y + c) solving to match BOTH boundaries (window means)\n"
+             "  projections/slope/both: apply ONLY at img1->img2 (for legacy behavior); these do NOT change baseline->img1"
     )
 
-    # Global signal controls
+    # Affine/scale source controls
+    parser.add_argument(
+        "--affine-source",
+        choices=["roi", "global", "nonzero", "mask"],
+        default="roi",
+        help="Where to compute boundary statistics used for lastfirst/affine2bound. "
+             "roi=ROI mean, global=all voxels, nonzero=voxels with mean>eps, mask=--global-mask (file/auto)."
+    )
     parser.add_argument("--global-mode", choices=["mean", "median"], default="mean",
-                        help="How to compute global signal per timepoint (default mean).")
+                        help="Reducer for global/nonzero/mask sources (default mean).")
+    parser.add_argument("--nonzero-eps", type=float, default=0.0,
+                        help="Threshold for --affine-source nonzero (mean volume > eps). Default 0.0")
 
-    # global mask can be a file path OR literal 'auto'
+    # Optional global mask for source=mask
     parser.add_argument("--global-mask", default=None,
-                        help="3D mask NIfTI for global signal, OR 'auto' to generate from mean(img2). "
-                             "If omitted, uses ALL voxels (usually not recommended).")
-
-    # auto-mask params
+                        help="3D mask NIfTI for affine-source=mask, OR 'auto' to generate from a mean volume.")
     parser.add_argument("--auto-mask-source", choices=["img2", "img2_baseline", "img1"], default="img2",
                         help="If --global-mask auto, which image to build it from (default img2).")
     parser.add_argument("--auto-mask-erosions", type=int, default=3, help="Erosion iterations for auto mask (default 3)")
     parser.add_argument("--auto-mask-dilations", type=int, default=3, help="Dilation iterations for auto mask (default 3)")
     parser.add_argument("--auto-mask-hist-bins", type=int, default=256, help="Histogram bins for Otsu (default 256)")
     parser.add_argument("--auto-mask-out", default=None,
-                        help="Where to write the auto-generated global mask (default auto name). "
-                             "Set to 'none' to skip writing.")
+                        help="Where to write the auto-generated mask (default auto name). Set to 'none' to skip writing.")
 
-    # Boundary normalization (ROI-based) at img1 -> img2
-    parser.add_argument(
-        "--norm-method",
-        choices=["none", "lastfirst", "projections", "slope", "both"],
-        default="none",
-        help="Normalization at img1->img2 boundary (ROI-based), after any baseline scaling. "
-             "'lastfirst' can also use baseline (if provided) by averaging scale implied by "
-             "baseline->img1 and img1->img2 joins.",
-    )
-    parser.add_argument("--norm-n", type=int, default=5, help="Window size for slope/both at img1 tail / img2 head.")
-
-    parser.add_argument("--time-unit", choices=["s", "min"], default="s",
-                        help="X axis units for plotting (and CSV if written). Default seconds.")
-
+    # Plot controls
+    parser.add_argument("--time-unit", choices=["s", "min"], default="s", help="X axis units. Default seconds.")
     parser.add_argument("--mask-out", default=None, help="Output ROI mask NIfTI (default auto-named)")
     parser.add_argument("--out", default=None, help="Output plot PNG (default auto-named)")
     parser.add_argument("--csv-out", default=None, help="Optional CSV output")
 
+    # Title controls
+    parser.add_argument("--title-tag", default=None, help="Custom tag prepended to title and filenames.")
+    parser.add_argument("--title-mode", choices=["full", "compact"], default="full",
+                        help="compact: 'tag (x,y,z;r=R)'; full: verbose normalization info too.")
+
     args = parser.parse_args()
 
-
-    # ---------------- Filename prefixing from title tag ----------------
-    def _slugify(s: str) -> str:
-        # Safe filename prefix: keep alnum, dash, underscore; collapse others to underscore
-        out = []
-        for ch in s.strip():
-            if ch.isalnum() or ch in ("-", "_"):
-                out.append(ch)
-            else:
-                out.append("_")
-        slug = "".join(out)
-        while "__" in slug:
-            slug = slug.replace("__", "_")
-        return slug.strip("_")
-
     file_prefix = _slugify(args.title_tag.strip()) + "_" if (args.title_tag is not None and args.title_tag.strip() != "") else ""
-    _prefix = file_prefix
-    
-    def _prefix_path(p: str | None) -> str | None:
-        if p is None:
-            return None
-        pp = Path(p)
-        if pp.name.startswith(file_prefix) or file_prefix == "":
-            return str(pp)
-        return str(pp.with_name(file_prefix + pp.name))
 
+    # ---------------- Load images ----------------
 
-
-    # Load img1
     img1_path = Path(args.img_1)
     img1 = nib.load(str(img1_path))
     data1 = img1.get_fdata()
@@ -382,9 +410,9 @@ def main():
         raise ValueError(f"img_1 must be 4D, got shape {data1.shape}")
     nx, ny, nz = data1.shape[:3]
 
-    # Load img2 (optional)
     img2_path = Path(args.img_2) if args.img_2 else None
     data2 = None
+    img2 = None
     if img2_path is not None:
         img2 = nib.load(str(img2_path))
         data2 = img2.get_fdata()
@@ -393,30 +421,23 @@ def main():
         if data2.shape[:3] != (nx, ny, nz):
             raise ValueError(f"Spatial shapes differ: img_2 {data2.shape[:3]} vs img_1 {(nx, ny, nz)}")
 
-    # Load baseline (optional) - allow 3D or 4D
     baseline_path = Path(args.img2_baseline) if args.img2_baseline else None
     datab = None
     bimg = None
     baseline_is_3d = False
-
     if baseline_path is not None:
         bimg = nib.load(str(baseline_path))
         datab = bimg.get_fdata()
-
         if datab.ndim == 3:
-            # Promote 3D baseline to single-timepoint 4D
             datab = datab[..., np.newaxis]
             baseline_is_3d = True
         elif datab.ndim != 4:
             raise ValueError(f"--img2-baseline must be 3D or 4D, got shape {datab.shape}")
-
         if datab.shape[:3] != (nx, ny, nz):
-            raise ValueError(
-                f"--img2-baseline spatial shape differs: {datab.shape[:3]} vs {(nx, ny, nz)}"
-            )
+            raise ValueError(f"--img2-baseline spatial shape differs: {datab.shape[:3]} vs {(nx, ny, nz)}")
 
+    # ---------------- ROI mask + outputs ----------------
 
-    # ROI center
     if args.center is None:
         cx, cy, cz = (nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0
         center_label = "center"
@@ -430,35 +451,34 @@ def main():
     out_plot = args.out or f"roi_intensity_{roi_tag}.png"
     mask_out = args.mask_out or f"roi_mask_{roi_tag}.nii.gz"
 
-    out_plot = _prefix_path(out_plot)
-    mask_out = _prefix_path(mask_out)
+    out_plot = _prefix_path(out_plot, file_prefix)
+    mask_out = _prefix_path(mask_out, file_prefix)
     if args.csv_out is not None:
-        args.csv_out = _prefix_path(args.csv_out)
+        args.csv_out = _prefix_path(args.csv_out, file_prefix)
     if args.auto_mask_out is not None and str(args.auto_mask_out).lower() not in ("none",):
-        args.auto_mask_out = _prefix_path(args.auto_mask_out)
+        args.auto_mask_out = _prefix_path(args.auto_mask_out, file_prefix)
 
-
-    # ROI mask
     roi_mask = make_spherical_mask((nx, ny, nz), radius_vox=args.radius, center_xyz=(cx, cy, cz))
     nib.save(nib.Nifti1Image(roi_mask, img1.affine), mask_out)
 
-    # Decide / build global mask
+    # ---------------- Optional global mask (for affine-source=mask) ----------------
+
     global_mask = None
     global_mask_note = "OFF"
 
     if args.global_mask is not None:
         if args.global_mask.lower() == "auto":
-            # Choose source volume for auto mask generation
+            # pick source
             if args.auto_mask_source == "img2":
                 if data2 is None:
-                    raise ValueError("--global-mask auto with --auto-mask-source img2 requires img_2 to be provided.")
+                    raise ValueError("--global-mask auto requires img_2 when --auto-mask-source img2.")
                 src_data = data2
                 src_aff = img2.affine
                 src_name = "img2"
                 src_path = img2_path
             elif args.auto_mask_source == "img2_baseline":
                 if datab is None:
-                    raise ValueError("--global-mask auto with --auto-mask-source img2_baseline requires --img2-baseline.")
+                    raise ValueError("--global-mask auto with img2_baseline requires --img2-baseline.")
                 src_data = datab
                 src_aff = bimg.affine
                 src_name = "img2_baseline"
@@ -475,18 +495,18 @@ def main():
                 dilations=args.auto_mask_dilations,
                 nbins=args.auto_mask_hist_bins,
             ).astype(bool)
-
             global_mask_note = f"AUTO({src_name})"
 
-            # Write it (unless disabled)
+            # write it unless disabled
             if args.auto_mask_out is None:
-                auto_out = src_path.parent / f"{_prefix}auto_global_mask_from_{_strip_nii_extensions(src_path)}.nii.gz"
+                auto_out = src_path.parent / f"{file_prefix}auto_global_mask_from_{_strip_nii_extensions(src_path)}.nii.gz"
             elif str(args.auto_mask_out).lower() == "none":
                 auto_out = None
             else:
-                auto_out = Path(_prefix_path(str(args.auto_mask_out)))
+                auto_out = Path(str(args.auto_mask_out))
             if auto_out is not None:
                 nib.save(nib.Nifti1Image(global_mask.astype(np.uint8), src_aff), str(auto_out))
+
         else:
             gm_path = Path(args.global_mask)
             gm_img = nib.load(str(gm_path))
@@ -498,83 +518,176 @@ def main():
             global_mask = (gm > 0)
             global_mask_note = f"FILE({gm_path.name})"
 
-    # Signals for img1
-    y1_roi = mean_roi_timeseries(data1, roi_mask)
-    y1_glob = global_timeseries(data1, global_mask, args.global_mode)
+    # ---------------- Signals (ROI plot always uses ROI) ----------------
+
+    y1_roi = timeseries_from_source(
+        data1,
+        source="roi",
+        roi_mask_3d=roi_mask,
+        global_mask_3d=global_mask,
+        global_mode=args.global_mode,
+        nonzero_eps=args.nonzero_eps,
+    )
+
+    y2_roi = None
+    if data2 is not None:
+        y2_roi = timeseries_from_source(
+            data2,
+            source="roi",
+            roi_mask_3d=roi_mask,
+            global_mask_3d=global_mask,
+            global_mode=args.global_mode,
+            nonzero_eps=args.nonzero_eps,
+        )
+
+    yb_roi = None
+    if datab is not None:
+        yb_roi = timeseries_from_source(
+            datab,
+            source="roi",
+            roi_mask_3d=roi_mask,
+            global_mask_3d=global_mask,
+            global_mode=args.global_mode,
+            nonzero_eps=args.nonzero_eps,
+        )
+
+    # ---------------- Timing ----------------
 
     tr1 = get_tr_seconds(img1_path, args.tr1)
     t1 = np.arange(len(y1_roi), dtype=float) * tr1
 
+    tr2 = None
+    if data2 is not None:
+        tr2 = get_tr_seconds(img2_path, args.tr2)
+
+    if datab is not None:
+        if baseline_is_3d:
+            trb = tr1
+        else:
+            trb = get_tr_seconds(baseline_path, args.trb)
+    else:
+        trb = None
+
     x_scale = 60.0 if args.time_unit == "min" else 1.0
     x_label = "Time (min)" if args.time_unit == "min" else "Time (s)"
 
-    # ROI for img2 (optional)
-    y2_roi = None
-    tr2 = None
+    # ---------------- Boundary stats source ----------------
+
+    affine_source = args.affine_source
+    if affine_source == "mask" and global_mask is None:
+        raise ValueError("--affine-source mask requires --global-mask (file or auto).")
+
+    y1_src = timeseries_from_source(
+        data1,
+        source=("mask" if affine_source == "mask" else affine_source),
+        roi_mask_3d=roi_mask,
+        global_mask_3d=global_mask,
+        global_mode=args.global_mode,
+        nonzero_eps=args.nonzero_eps,
+    )
+
+    y2_src = None
     if data2 is not None:
-        y2_roi = mean_roi_timeseries(data2, roi_mask)
-        tr2 = get_tr_seconds(img2_path, args.tr2)
+        y2_src = timeseries_from_source(
+            data2,
+            source=("mask" if affine_source == "mask" else affine_source),
+            roi_mask_3d=roi_mask,
+            global_mask_3d=global_mask,
+            global_mode=args.global_mode,
+            nonzero_eps=args.nonzero_eps,
+        )
 
-     # ---------------- Scaling: baseline/img2 fixed, scale img1 only ----------------
-    img1_scale = 1.0
-    scale_lastfirst_left = 1.0
-    scale_lastfirst_right = 1.0
-    scale_lastfirst_final = 1.0
-
-    # Optional baseline signals (kept UNCHANGED)
-    yb_roi = None
-    yb_glob = None
-    trb = None
-
-    # Optional img2 global (kept UNCHANGED) for reporting only
-    y2_glob = None
-
+    yb_src = None
     if datab is not None:
-        yb_roi = mean_roi_timeseries(datab, roi_mask)
-        yb_glob = global_timeseries(datab, global_mask, args.global_mode)
-        trb = get_tr_seconds(baseline_path, args.trb) if not baseline_is_3d else tr1
+        yb_src = timeseries_from_source(
+            datab,
+            source=("mask" if affine_source == "mask" else affine_source),
+            roi_mask_3d=roi_mask,
+            global_mask_3d=global_mask,
+            global_mode=args.global_mode,
+            nonzero_eps=args.nonzero_eps,
+        )
 
-        if args.stable_n < 1 or args.stable_n > len(y1_roi):
-            raise ValueError(f"--stable-n must be in [1..len(img1)] = [1..{len(y1_roi)}], got {args.stable_n}")
+    # ---------------- Compute img1 transform (baseline/img2 fixed) ----------------
 
-        # Left boundary scale (ROI): make early img1 ROI match baseline ROI (baseline is stable)
-        mu_b_roi = float(np.mean(yb_roi))
-        mu_1_roi = float(np.mean(y1_roi[:args.stable_n]))
-        if abs(mu_1_roi) < 1e-12:
-            raise ValueError("Stable img1 ROI mean is ~0; cannot compute scale.")
-        scale_lastfirst_left = mu_b_roi / mu_1_roi
+    img1_a = 1.0
+    img1_c = 0.0
+    dbg_norm = {}
 
-    if data2 is not None:
-        y2_glob = global_timeseries(data2, global_mask, args.global_mode)  # reporting only
+    if args.stable_n < 1 or args.stable_n > len(y1_src):
+        raise ValueError(f"--stable-n must be in [1..{len(y1_src)}], got {args.stable_n}")
 
-        # Right boundary scale (ROI): enforce last(img1 ROI) == first(img2 ROI)
-        mu_2_first_roi = float(y2_roi[0])
-        mu_1_last_roi = float(y1_roi[-1])
-        if abs(mu_1_last_roi) < 1e-12:
-            raise ValueError("Last img1 ROI value is ~0; cannot compute scale.")
-        scale_lastfirst_right = mu_2_first_roi / mu_1_last_roi
+    if args.norm_n < 1:
+        raise ValueError("--norm-n must be >= 1")
 
-    # Choose how to scale img1 (ROI-based lastfirst)
+    have_left = (yb_src is not None)
+    have_right = (y2_src is not None)
+
     if args.norm_method == "lastfirst":
-        if datab is not None and data2 is not None:
-            scale_lastfirst_final = 0.5 * (scale_lastfirst_left + scale_lastfirst_right)
-            img1_scale = scale_lastfirst_final
-        elif datab is not None and data2 is None:
-            img1_scale = scale_lastfirst_left
-        elif datab is None and data2 is not None:
-            img1_scale = scale_lastfirst_right
-        else:
-            img1_scale = 1.0
-    else:
-        img1_scale = 1.0
+        # multiplicative only: y' = s*y
+        scales = []
 
-    # Apply scaling to img1 ONLY
-    if img1_scale != 1.0:
-        y1_roi = y1_roi * img1_scale
-        y1_glob = y1_glob * img1_scale
-        
-        
-    # If only img1 (and maybe baseline), we can still plot baseline->img1 QA
+        if have_left:
+            mu_b = float(np.mean(yb_src))
+            mu_1L = float(np.mean(y1_src[:args.stable_n]))
+            if abs(mu_1L) < 1e-12:
+                raise ValueError("lastfirst: img1 left window mean is ~0; cannot scale.")
+            s_left = mu_b / mu_1L
+            scales.append(s_left)
+            dbg_norm["s_left"] = s_left
+
+        if have_right:
+            nR = min(args.norm_n, len(y1_src), len(y2_src))
+            mu_2 = float(np.mean(y2_src[:nR]))
+            mu_1R = float(np.mean(y1_src[-nR:]))
+            if abs(mu_1R) < 1e-12:
+                raise ValueError("lastfirst: img1 right window mean is ~0; cannot scale.")
+            s_right = mu_2 / mu_1R
+            scales.append(s_right)
+            dbg_norm["s_right"] = s_right
+
+        if len(scales) == 0:
+            img1_a = 1.0
+            img1_c = 0.0
+        else:
+            img1_a = float(np.mean(scales))
+            img1_c = 0.0
+        dbg_norm["img1_a"] = img1_a
+        dbg_norm["img1_c"] = img1_c
+
+    elif args.norm_method == "affine2bound":
+        # affine: y' = a*y + c, match BOTH boundaries in window-mean sense
+        if not have_left or not have_right:
+            raise ValueError("affine2bound requires BOTH --img2-baseline and img_2.")
+
+        nR = min(args.norm_n, len(y1_src), len(y2_src))
+        mu_b = float(np.mean(yb_src))
+        mu_2 = float(np.mean(y2_src[:nR]))
+        mu_1L = float(np.mean(y1_src[:args.stable_n]))
+        mu_1R = float(np.mean(y1_src[-nR:]))
+
+        img1_a, img1_c = solve_affine_two_boundaries(mu_b, mu_2, mu_1L, mu_1R)
+
+        dbg_norm["mu_b"] = mu_b
+        dbg_norm["mu_2"] = mu_2
+        dbg_norm["mu_1L"] = mu_1L
+        dbg_norm["mu_1R"] = mu_1R
+        dbg_norm["img1_a"] = img1_a
+        dbg_norm["img1_c"] = img1_c
+
+    else:
+        img1_a = 1.0
+        img1_c = 0.0
+
+    # Apply img1 transform to ROI plot series (and also to y1_src for reporting)
+    if img1_a != 1.0 or img1_c != 0.0:
+        y1_roi = img1_a * y1_roi + img1_c
+        y1_src_post = img1_a * y1_src + img1_c
+    else:
+        y1_src_post = y1_src.copy()
+
+    # ---------------- Build segments for plot ----------------
+
     segments_t = []
     segments_y = []
     labels = []
@@ -590,13 +703,13 @@ def main():
     t1_abs = t_cursor + t1
     segments_t.append(t1_abs)
     segments_y.append(y1_roi)
-    if img1_scale != 1.0:
-        labels.append(f"img1_ROI×{img1_scale:.6g}")
+    if img1_a != 1.0 or img1_c != 0.0:
+        labels.append(f"img1_ROI→a*y+c (a={img1_a:.6g}, c={img1_c:.6g})")
     else:
         labels.append("img1_ROI")
     t_cursor = t1_abs[-1] + tr1
 
-    dbg = None
+    dbg_slope = None
     scale_proj = 1.0
     alpha = 1.0
     beta = 0.0
@@ -607,102 +720,74 @@ def main():
         segments_y.append(y2_roi)
         labels.append("img2_ROI")
 
-        # Boundary normalization on ROI only (optional)
-        scale_lastfirst = 1.0
-
-        if args.norm_method == "lastfirst" and datab is None:
-            y1_last = float(y1_roi[-1])
-            y2_first = float(segments_y[-1][0])
-            if abs(y2_first) < 1e-12:
-                raise ValueError("lastfirst normalization: img2 first ROI value is ~0; cannot scale.")
-            scale_lastfirst = y1_last / y2_first
-            segments_y[-1] = segments_y[-1] * scale_lastfirst
-            
+        # Legacy boundary normalizations on img2 ONLY (optional)
         if args.norm_method in ("projections", "both"):
             scale_proj = float(get_npro(img1_path) / get_npro(img2_path))
             segments_y[-1] = segments_y[-1] * scale_proj
 
         if args.norm_method in ("slope", "both"):
-            alpha, beta, dbg = affine_match_img1_tail_to_img2_head(
-                t1_abs, y1_roi, t2_abs, segments_y[-1], n=args.norm_n
+            alpha, beta, dbg_slope = affine_match_img1_tail_to_img2_head(
+                t1_abs, segments_y[1 if datab is not None else 0], t2_abs, segments_y[-1], n=max(2, args.norm_n)
             )
             segments_y[-1] = alpha * segments_y[-1] + beta
 
-    # Concatenate + plot
+    # ---------------- Plot ----------------
+
     t_all = np.concatenate(segments_t, axis=0)
     y_all = np.concatenate(segments_y, axis=0)
 
     plt.figure()
     plt.plot(t_all / x_scale, y_all)
 
-    # boundaries
+    # boundary lines
     if datab is not None:
-        plt.axvline((t1_abs[0]) / x_scale, linestyle="--")  # baseline->img1
+        plt.axvline((t1_abs[0]) / x_scale, linestyle="--")
     if data2 is not None:
-        plt.axvline((segments_t[-1][0]) / x_scale, linestyle="--")  # img1->img2
+        plt.axvline((segments_t[-1][0]) / x_scale, linestyle="--")
 
-    # slope debug overlays (img1->img2)
-    if data2 is not None and args.norm_method in ("slope", "both") and dbg is not None:
-        # img1 tail fit (reference)
-        plt.plot(dbg["t1_tail"] / x_scale, dbg["y1_fit_tail"], linestyle="--", alpha=0.7)
+    # slope debug overlays (post-normalization only)
+    if data2 is not None and args.norm_method in ("slope", "both") and dbg_slope is not None:
+        plt.plot(dbg_slope["t1_tail"] / x_scale, dbg_slope["y1_fit_tail"], linestyle="--", alpha=0.7)
+        plt.plot(dbg_slope["t2_head"] / x_scale, dbg_slope["L2_post"], linestyle="--", alpha=0.7)
 
-        # img2 post-normalization fit ONLY (for continuity QA)
-        plt.plot(dbg["t2_head"] / x_scale, dbg["L2_post"], linestyle="--", alpha=0.7)
-        
     plt.xlabel(x_label)
     plt.ylabel("Mean ROI intensity")
 
     # ---------------- Title handling ----------------
-    # Title tag (user override) or default label
+
     if args.title_tag is not None and args.title_tag.strip() != "":
         title_tag = args.title_tag.strip()
     else:
         title_tag = "ROI intensity"
 
-    # Compact coordinate line requested format: "($x,$y,$z;r=$radius)"
-    if args.center is None:
-        # If center not specified, we used image center; keep label consistent
-        coord_line = f"({center_label};r={args.radius:g})"
-    else:
-        coord_line = f"({int(round(cx))},{int(round(cy))},{int(round(cz))};r={args.radius:g})"
+    coord_line = f"({int(round(cx))},{int(round(cy))},{int(round(cz))};r={args.radius:g})"
 
     ax = plt.gca()
 
     if args.title_mode == "compact":
-        # Main title is just the tag (or default) with coords appended on the same line
         ax.set_title(f"{title_tag} {coord_line}", fontsize=12)
-
     else:
-        # FULL title mode: keep verbose details, but put coords on the FIRST line after the tag
-        title = f"{title_tag} {coord_line}\n" + f"ROI mean intensity (r={args.radius:g}, center={center_label})"
+        title = f"{title_tag} {coord_line}\nROI mean intensity (r={args.radius:g}, center={center_label})"
+        title += f"\n(affine-source={args.affine_source}, reducer={args.global_mode}, global-mask={global_mask_note}, nonzero-eps={args.nonzero_eps:g})"
+        title += f"\nimg1 transform: y'={img1_a:.6g}*y + {img1_c:.6g} (method={args.norm_method})"
 
-        # (keep all your existing title += ... lines below this point)
-        if baseline_path is not None:
-            title += (
-                f"\nimg1 scale (left)={scale_lastfirst_left:.6g} using mean(baseline_global)/mean(img1_global[:{args.stable_n}])"
-            )
-            if data2 is not None:
-                title += f"\nimg1 scale (right)={scale_lastfirst_right:.6g} using img2_global_first/img1_global_last"
-            if args.norm_method == "lastfirst" and datab is not None and data2 is not None:
-                title += f"\nimg1 scale (final avg)={img1_scale:.6g}"
-            title += f"\n(global-mode={args.global_mode}, global-mask={global_mask_note})"
-            
+        if args.norm_method in ("lastfirst", "affine2bound"):
+            if have_left:
+                title += f"\nleft match uses baseline mean vs img1[:{args.stable_n}]"
+            if have_right and y2_src is not None:
+                nR = min(args.norm_n, len(y1_src), len(y2_src))
+                title += f"\nright match uses img2[:{nR}] vs img1[-{nR}:]"
+
         if data2 is not None:
-            if args.norm_method == "lastfirst" and datab is not None:
-                title += (
-                    f"\nlastfirst avg scale={scale_lastfirst_final:.6g} "
-                    f"(left={scale_lastfirst_left:.6g}, right={scale_lastfirst_right:.6g})"
-                )
-            elif args.norm_method == "lastfirst" and datab is None:
-                title += f"\nimg2 ROI scaled by {scale_lastfirst_final:.6g} (lastfirst)"
-            elif args.norm_method == "projections":
-                title += f"\nimg2 ROI scaled by {scale_proj:.6g} (projections)"
+            if args.norm_method == "projections":
+                title += f"\nimg2 scaled by projections={scale_proj:.6g}"
             elif args.norm_method == "slope":
-                title += f"\nimg2 ROI affine: y2={alpha:.6g}*y2+{beta:.6g} (slope, n={args.norm_n})"
+                title += f"\nimg2 affine: alpha={alpha:.6g}, beta={beta:.6g} (n={args.norm_n})"
             elif args.norm_method == "both":
-                title += f"\nimg2 ROI proj={scale_proj:.6g}, then affine y2={alpha:.6g}*y2+{beta:.6g} (both, n={args.norm_n})"
+                title += f"\nimg2 proj={scale_proj:.6g}, then affine alpha={alpha:.6g}, beta={beta:.6g} (n={args.norm_n})"
 
-        ax.set_title(title, fontsize=12)   
+        ax.set_title(title, fontsize=12)
+
     plt.tight_layout()
     plt.savefig(out_plot, dpi=150)
 
@@ -713,39 +798,28 @@ def main():
             for ti, yi in zip(t_all / x_scale, y_all):
                 f.write(f"{ti:.9g},{yi:.9g}\n")
 
-    # Print useful QA numbers (so you can see if the mismatch is ROI-specific)
-    print("[mode] ROI plot with GLOBAL scaling (optional auto mask)")
+    # ---------------- QA prints ----------------
+
+    print("[mode] ROI plot; baseline+img2 fixed; img1 transformed only")
     print(f"       segments: {labels}")
     print(f"[roi] center={center_label}, radius={args.radius:g}, voxels={int(roi_mask.sum())}")
-    print(f"[global] mode={args.global_mode}, mask={global_mask_note}")
-    if datab is not None:
-        # Global means used for scale
-        yb_glob = global_timeseries(datab, global_mask, args.global_mode)
-        mu_b = float(np.mean(yb_glob))
-        mu_1 = float(np.mean(y1_glob[:args.stable_n]))
-        print(f"[img1-scale-left]  mu_baseline_global={mu_b:.6g}  mu_img1_global_stable={mu_1:.6g}  scale={scale_lastfirst_left:.6g}")
-        if data2 is not None:
-            mu_2_first = float(y2_glob[0])
-            mu_1_last = float((y1_glob / img1_scale)[-1]) if img1_scale != 0 else float("nan")
-            print(f"[img1-scale-right] img2_global_first={mu_2_first:.6g}  img1_global_last_raw={mu_1_last:.6g}  scale={scale_lastfirst_right:.6g}")
-        if args.norm_method == "lastfirst" and datab is not None and data2 is not None:
-            print(f"[img1-scale-final] avg(left,right)={img1_scale:.6g}")
-            
-        # ROI means (helps explain your “ROI baselines nearly match if scaled differently” observation)
-        mu_b_roi = float(np.mean(yb_roi))
-        mu_1_roi = float(np.mean(y1_roi[:args.stable_n]))
-        if abs(mu_b_roi) < 1e-12:
-            ratio = float("nan")
-        else:
-            ratio = mu_1_roi / mu_b_roi
-        print(f"[QA ROI means] mean(baseline_ROI)={mu_b_roi:.6g}  mean(img1_ROI_stable_scaled)={mu_1_roi:.6g}  ratio(img1/baseline)={ratio:.6g}")
-        
-    if data2 is not None:
-        print(f"[norm] img1->img2 method={args.norm_method}")
-        if args.norm_method in ("projections", "both"):
-            print(f"       projections scale={scale_proj:.6g}")
-        if args.norm_method in ("slope", "both"):
-            print(f"       affine alpha={alpha:.6g}, beta={beta:.6g} (norm-n={args.norm_n})")
+
+    print(f"[affine-source] {args.affine_source}  (reducer={args.global_mode}, nonzero-eps={args.nonzero_eps:g}, global-mask={global_mask_note})")
+    print(f"[img1-transform] method={args.norm_method}  a={img1_a:.9g}  c={img1_c:.9g}")
+
+    # show boundary residuals in the SOURCE domain (not ROI), since that’s what drove the transform
+    if have_left:
+        mu_b = float(np.mean(yb_src))
+        mu_1L_pre = float(np.mean(y1_src[:args.stable_n]))
+        mu_1L_post = float(np.mean(y1_src_post[:args.stable_n]))
+        print(f"[left]  baseline_mean={mu_b:.6g}  img1_stable_pre={mu_1L_pre:.6g}  img1_stable_post={mu_1L_post:.6g}  resid(post-baseline)={mu_1L_post - mu_b:.6g}")
+
+    if have_right:
+        nR = min(args.norm_n, len(y1_src), len(y2_src))
+        mu_2 = float(np.mean(y2_src[:nR]))
+        mu_1R_pre = float(np.mean(y1_src[-nR:]))
+        mu_1R_post = float(np.mean(y1_src_post[-nR:]))
+        print(f"[right] img2_head_mean={mu_2:.6g}  img1_tail_pre={mu_1R_pre:.6g}  img1_tail_post={mu_1R_post:.6g}  resid(post-img2)={mu_1R_post - mu_2:.6g}")
 
     print(f"[out] roi-mask: {mask_out}")
     print(f"[out] plot    : {out_plot}")
