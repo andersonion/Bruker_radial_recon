@@ -1,4 +1,57 @@
 #!/usr/bin/env python3
+"""
+plot_roi_intensity.py
+
+Plot ROI mean intensity across (optional) baseline + img1 + (optional) img2,
+with optional affine transform applied to img1 ONLY.
+
+Key features (what you’ve been iterating toward):
+- ROI spherical mask from voxel center + radius
+- Optional GLOBAL mask (FILE or AUTO via Otsu+CC+morphpy) used for global reducers
+- Affine transform modes:
+  - none
+  - affine2boundline:
+      Version 2 ("continuous line well-fit" / C0 at both boundaries using fitted lines)
+      Supports:
+        * With baseline + img2: constrain C0 at left (baseline->img1) and right (img1->img2)
+        * WITHOUT baseline: constrain only right boundary (img1->img2) and choose c by one of:
+            - c = 0 (default)
+            - c = match_left_mean (use img1 head mean after scaling to match itself; effectively no-op for c)
+            - c = preserve_min (choose c so transformed img1 stays nonnegative; requires --nonneg)
+- Optional “robust” selection of (a,c) when bounds or penalties are enabled:
+  - exact: solve constraints exactly (preferred)
+  - robust: 1D search over 'a' within bounds, choose c that satisfies left constraint (if baseline)
+            or c policy (if no baseline), and penalize:
+              * boundary residuals
+              * excessive std inflation relative to TRUE pooled std of (baseline-tail + img2-head)
+                or (img2-head only if no baseline)
+              * negativity if --nonneg is enabled
+- The “TRUE POOLING (A)” change: std_target is computed from pooled samples
+  (baseline tail + img2 head) together when baseline exists, not separately.
+
+Examples:
+  # Normal (baseline + block1 + block2), ROI-based affine source:
+  python plot_roi_intensity.py block1.nii.gz block2.nii.gz \
+      --img2-baseline baseline.nii.gz \
+      --radius 2.5 --center 57 38 49 \
+      --norm-method affine2boundline --affine-source roi \
+      --title-tag "P26012003 CSF" --title-mode compact --time-unit min
+
+  # Same, but affine params derived from NONZERO global reducer (no mask):
+  python plot_roi_intensity.py block1.nii.gz block2.nii.gz \
+      --img2-baseline baseline.nii.gz \
+      --radius 2.5 --center 57 38 49 \
+      --norm-method affine2boundline --affine-source nonzero --reducer mean --nonzero-eps 0 \
+      --title-tag "P26012003 CSF" --title-mode compact --time-unit min
+
+  # affine2boundline WITHOUT baseline (right boundary only), keep c=0, enforce a>0 and nonneg:
+  python plot_roi_intensity.py block1.nii.gz block2.nii.gz \
+      --radius 2.5 --center 57 38 49 \
+      --norm-method affine2boundline --affine-source roi \
+      --no-baseline-ok --c-policy zero --a-positive --nonneg \
+      --title-tag "NoBaseline" --title-mode compact --time-unit min
+"""
+
 import argparse
 import re
 from pathlib import Path
@@ -7,6 +60,7 @@ import numpy as np
 import nibabel as nib
 import matplotlib.pyplot as plt
 
+# Optional scipy for auto-mask
 try:
     import scipy.ndimage as ndi
 except Exception:
@@ -38,7 +92,7 @@ def _parse_method_value(method_text: str, key: str, method_path: Path) -> float:
         raise ValueError(f"Could not find {key} in {method_path}")
     val = m.group(1).strip()
 
-    # Bruker style arrays: "##$X=( 2 )" then values on following lines
+    # Bruker arrays: "##$X=( 2 )" then values on following lines
     if val.startswith("("):
         after = method_text[m.end():]
         m2 = re.search(r"([-+]?\d+(\.\d+)?)", after)
@@ -90,7 +144,7 @@ def get_npro(img_path: Path) -> float:
     method_path = find_method_sidecar(img_path)
     if method_path is None:
         raise FileNotFoundError(
-            f"Projection normalization requires method sidecars. "
+            f"NPro requires method sidecars. "
             f"Could not find {_strip_nii_extensions(img_path)}.method next to {img_path}."
         )
     return parse_bruker_method_for_npro(method_path)
@@ -220,13 +274,11 @@ def generate_auto_brain_mask_from_mean(
 
 # ----------------------------- line fitting + affine solve ----------------------------- #
 
-def fit_line_or_constant(t: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+def fit_line(t: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     if t.size != y.size:
         raise ValueError("fit_line: t and y must be same length")
-    if t.size < 1:
-        raise ValueError("fit_line: need >=1 point")
-    if t.size == 1:
-        return 0.0, float(y[0])
+    if t.size < 2:
+        raise ValueError("fit_line: need >=2 points")
     m, b = np.polyfit(t.astype(np.float64), y.astype(np.float64), 1)
     return float(m), float(b)
 
@@ -244,32 +296,34 @@ def solve_affine_from_two_constraints(y1L_hat: float, yB_hat: float, y1R_hat: fl
     return float(a), float(c)
 
 
-def solve_affine_match_line_right(m1R: float, b1R: float, m2: float, b2: float) -> tuple[float, float]:
-    if abs(m1R) < 1e-12:
-        raise ValueError("Right-only solve ill-conditioned: m1R ~ 0 (flat img1 tail).")
-    a = m2 / m1R
-    c = b2 - a * b1R
-    return float(a), float(c)
-
-
-def robust_std(x: np.ndarray) -> float:
-    """MAD-based robust std estimate."""
-    x = np.asarray(x, dtype=np.float64)
+def pooled_std(values_list: list[np.ndarray]) -> float:
+    # TRUE POOLING (A): one pooled distribution, not separate stds.
+    x = np.concatenate([v.ravel() for v in values_list if v is not None], axis=0)
     x = x[np.isfinite(x)]
-    if x.size == 0:
+    if x.size < 2:
         return float("nan")
-    med = np.median(x)
-    mad = np.median(np.abs(x - med))
-    return float(1.4826 * mad)  # normal-consistent
+    return float(np.std(x, ddof=1))
+
+
+def safe_std(x: np.ndarray) -> float:
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("nan")
+    return float(np.std(x, ddof=1))
+
+
+def frac_negative(y: np.ndarray) -> float:
+    y = y[np.isfinite(y)]
+    if y.size == 0:
+        return 0.0
+    return float(np.mean(y < 0))
 
 
 # ----------------------------------- main ----------------------------------- #
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot ROI intensity across baseline + img1 + img2. "
-                    "Supports affine transform of img1 only, with C0 continuity constraints from fitted lines, "
-                    "optionally penalizing variance blow-up and negative values."
+        description="Plot ROI intensity across baseline + img1 + img2, with optional affine transform on img1 only."
     )
     parser.add_argument("img_1", help="4D NIfTI (block1 / main run)")
     parser.add_argument("img_2", nargs="?", default=None, help="Second 4D NIfTI (block2)")
@@ -285,53 +339,44 @@ def main():
     parser.add_argument("--tr2", type=float, default=None, help="TR seconds for img_2 (optional if method exists)")
     parser.add_argument("--trb", type=float, default=None, help="TR seconds for baseline (optional if method exists)")
 
-    parser.add_argument("--title-tag", default=None,
-                        help="Optional custom tag to include in the plot title.")
-    parser.add_argument("--title-mode", choices=["full", "compact"], default="full",
-                        help="Title style.")
-    parser.add_argument("--time-unit", choices=["s", "min"], default="s",
-                        help="X axis units for plotting (and CSV if written).")
+    # Title/time options (you explicitly wanted these preserved)
+    parser.add_argument("--title-tag", default=None, help="Optional custom tag to include in the plot title.")
+    parser.add_argument("--title-mode", choices=["full", "compact"], default="full", help="Title style.")
+    parser.add_argument("--time-unit", choices=["s", "min"], default="s", help="X axis units (seconds or minutes).")
 
     parser.add_argument("--mask-out", default=None, help="Output ROI mask NIfTI (default auto-named)")
     parser.add_argument("--out", default=None, help="Output plot PNG (default auto-named)")
     parser.add_argument("--csv-out", default=None, help="Optional CSV output")
 
-    # Line windows
-    parser.add_argument("--stable-n", type=int, default=8,
-                        help="Number of initial img1 points for left-line fit (default 8).")
-    parser.add_argument("--tail-n", type=int, default=8,
-                        help="Number of final img1 points for right-line fit (default 8).")
+    # Windows for line fits
+    parser.add_argument("--stable-n", type=int, default=8, help="img1 head window for left-line fit (default 8).")
+    parser.add_argument("--tail-n", type=int, default=8, help="img1 tail window for right-line fit (default 8).")
     parser.add_argument("--base-tail-n", type=int, default=0,
-                        help="Number of final baseline points for baseline-line fit. "
-                             "If 0, uses all baseline points (even if that is 1).")
-    parser.add_argument("--img2-head-n", type=int, default=8,
-                        help="Number of initial img2 points for img2-line fit (default 8).")
+                        help="Baseline tail window for baseline-line fit. If 0, uses all baseline points.")
+    parser.add_argument("--img2-head-n", type=int, default=8, help="img2 head window for img2-line fit (default 8).")
 
     # Transform choice
-    parser.add_argument("--norm-method",
-                        choices=["none", "affine2boundline"],
-                        default="none",
-                        help="Transform applied to img1 only. "
-                             "'affine2boundline' enforces continuity from fitted lines. "
-                             "If baseline is missing, it enforces continuity at the right boundary only.")
+    parser.add_argument("--norm-method", choices=["none", "affine2boundline"], default="none",
+                        help="Transform applied to img1 only. affine2boundline enforces boundary continuity using fitted lines.")
 
-    # Affine source signal (for computing a,c) can be ROI or global-like
-    parser.add_argument("--affine-source",
-                        choices=["roi", "global", "nonzero"],
-                        default="roi",
-                        help="Signal used to compute the affine transform parameters (a,c). "
-                             "roi=ROI mean timeseries; global=masked/global reducer timeseries; "
-                             "nonzero=reducer over >eps voxels for each frame.")
+    # Allow affine2boundline without baseline
+    parser.add_argument("--no-baseline-ok", action="store_true",
+                        help="Allow affine2boundline with no baseline: enforce only right boundary. (Still requires img2.)")
+    parser.add_argument("--c-policy", choices=["zero", "match_left_mean", "preserve_min"], default="zero",
+                        help="When baseline is absent, how to choose c after selecting a. "
+                             "zero: c=0. "
+                             "match_left_mean: choose c so mean(img1 head) stays unchanged after scaling. "
+                             "preserve_min: choose c so min(a*y1) maps to 0 (only meaningful with --nonneg).")
 
-    parser.add_argument("--reducer", choices=["mean", "median"], default="mean",
-                        help="Reducer for global/nonzero sources (default mean).")
-    parser.add_argument("--nonzero-eps", type=float, default=0.0,
-                        help="Threshold for nonzero reducer: keep voxels > eps (default 0).")
+    # Affine source signal
+    parser.add_argument("--affine-source", choices=["roi", "global", "nonzero"], default="roi",
+                        help="Signal used to compute (a,c). roi=ROI mean; global=masked/global reducer; nonzero=reducer over >eps voxels.")
+    parser.add_argument("--reducer", choices=["mean", "median"], default="mean", help="Reducer for global/nonzero sources.")
+    parser.add_argument("--nonzero-eps", type=float, default=0.0, help="nonzero reducer: keep voxels > eps (default 0).")
 
-    # Global mask controls (used if affine-source=global)
+    # Global mask controls (used when affine-source=global). You asked for AUTO explicitly.
     parser.add_argument("--global-mask", default=None,
-                        help="3D mask NIfTI for global reducer OR 'auto' to generate from mean(volume). "
-                             "If omitted, uses ALL voxels.")
+                        help="3D mask NIfTI for global reducer OR 'auto' to generate from mean(volume). If omitted, uses ALL voxels.")
     parser.add_argument("--auto-mask-source", choices=["img2", "img2_baseline", "img1"], default="img2",
                         help="If --global-mask auto, which image to build it from (default img2).")
     parser.add_argument("--auto-mask-erosions", type=int, default=3)
@@ -340,40 +385,33 @@ def main():
     parser.add_argument("--auto-mask-out", default=None,
                         help="Write auto global mask to this path (default auto name). Use 'none' to skip writing.")
 
-    # Solver mode + penalties
-    parser.add_argument("--affine-solver",
-                        choices=["exact", "robust"],
-                        default="robust",
-                        help="How to solve for (a,c). "
-                             "exact = your previous exact continuity solve; "
-                             "robust = soft continuity + penalties (std blowup + negatives).")
-
-    parser.add_argument("--std-max-ratio", type=float, default=1.7,
-                        help="Desired upper bound on std(img1_transformed_window) / std_target. Default 1.7 (~70%% higher).")
-    parser.add_argument("--std-penalty", type=float, default=1e6,
-                        help="Weight for std blow-up penalty. Larger -> stronger suppression.")
-    parser.add_argument("--neg-penalty", type=float, default=1e6,
-                        help="Weight for negative-value penalty (hinge^2). Larger -> pushes transform to keep signal >= 0.")
-    parser.add_argument("--boundary-penalty", type=float, default=1e9,
-                        help="Weight for boundary continuity penalty. Larger -> closer to exact continuity.")
-    parser.add_argument("--use-robust-std", action="store_true",
-                        help="Use MAD-based robust std in penalties instead of classic std.")
-
-    # Constraints / priors on a
-    parser.add_argument("--a-positive", action="store_true",
-                        help="Constrain a >= 0 (recommended).")
-    parser.add_argument("--c-nonneg", action="store_true",
-                        help="Constrain c >= 0 (optional; can be too strict if you truly need an offset).")
-
+    # Expected/bounds for a (from NPro or explicit)
     parser.add_argument("--a-expected-from-npro", action="store_true",
                         help="Compute a_expected = NPro(img2)/NPro(img1) (requires method sidecars).")
-    parser.add_argument("--a-expected", type=float, default=None,
-                        help="Override expected a (e.g., 3.0).")
+    parser.add_argument("--a-expected", type=float, default=None, help="Override expected a (e.g., 3.0).")
     parser.add_argument("--a-bound-scale", type=float, default=0.0,
-                        help="If >0, constrain a to [a_expected/scale, a_expected*scale]. "
-                             "0 disables bounds.")
-    parser.add_argument("--a-prior-penalty", type=float, default=0.0,
-                        help="If >0, add penalty a_prior_penalty * ((a-a_expected)/a_expected)^2.")
+                        help="If >0 and a_expected known: enforce a in [a_expected/scale, a_expected*scale]. "
+                             "Use something like 2-4. Default 0 disables bounds.")
+
+    # Constraints
+    parser.add_argument("--a-positive", action="store_true", help="Force a > 0.")
+    parser.add_argument("--nonneg", action="store_true",
+                        help="Penalize/avoid negative transformed values. "
+                             "If baseline exists, solver will still satisfy left constraint; "
+                             "for no-baseline mode, --c-policy preserve_min is recommended.")
+
+    # Solver
+    parser.add_argument("--affine-solver", choices=["exact", "robust"], default="exact",
+                        help="exact: solve constraints directly. robust: bounded 1D search on a with penalties.")
+
+    # Penalties (robust solver only)
+    parser.add_argument("--std-max-ratio", type=float, default=1.7,
+                        help="Penalty threshold for std inflation: std(img1_trans_head/tail)/std_target <= ratio. (default 1.7)")
+    parser.add_argument("--penalty-w-resid", type=float, default=1.0, help="Weight for boundary residual penalty.")
+    parser.add_argument("--penalty-w-std", type=float, default=10.0, help="Weight for std inflation penalty.")
+    parser.add_argument("--penalty-w-neg", type=float, default=100.0, help="Weight for negativity penalty.")
+    parser.add_argument("--robust-a-grid", type=int, default=2001,
+                        help="Number of grid samples for robust a search (default 2001).")
 
     args = parser.parse_args()
 
@@ -391,6 +429,7 @@ def main():
         return slug.strip("_")
 
     file_prefix = _slugify(args.title_tag.strip()) + "_" if (args.title_tag and args.title_tag.strip()) else ""
+
     def _prefix_path(p: str | None) -> str | None:
         if p is None:
             return None
@@ -407,7 +446,7 @@ def main():
         raise ValueError(f"img_1 must be 4D, got shape {data1.shape}")
     nx, ny, nz = data1.shape[:3]
 
-    # Load img2
+    # Load img2 (optional but required for affine2boundline)
     img2_path = Path(args.img_2) if args.img_2 else None
     data2 = None
     img2 = None
@@ -419,7 +458,7 @@ def main():
         if data2.shape[:3] != (nx, ny, nz):
             raise ValueError(f"Spatial shapes differ: img_2 {data2.shape[:3]} vs img_1 {(nx, ny, nz)}")
 
-    # Load baseline (optional) - allow 3D or 4D
+    # Load baseline (optional; allow 3D or 4D)
     baseline_path = Path(args.img2_baseline) if args.img2_baseline else None
     datab = None
     bimg = None
@@ -454,7 +493,7 @@ def main():
     roi_mask = make_spherical_mask((nx, ny, nz), radius_vox=args.radius, center_xyz=(cx, cy, cz))
     nib.save(nib.Nifti1Image(roi_mask, img1.affine), str(mask_out))
 
-    # Build global mask if requested (used if affine-source=global)
+    # Build global mask if requested
     global_mask = None
     global_mask_note = "OFF"
 
@@ -529,7 +568,6 @@ def main():
     labels = []
     t_cursor = 0.0
 
-    tb_abs = None
     if datab is not None:
         tb_abs = t_cursor + tb
         segments_t.append(tb_abs)
@@ -560,28 +598,41 @@ def main():
             return reduce_timeseries_from_nonzero(data_4d, args.reducer, args.nonzero_eps)
         raise ValueError("Unknown affine source")
 
-    # ---------------- Transform: affine2boundline ---------------- #
+    # ---------------- Transform: affine2boundline (Version 2) ---------------- #
     a = 1.0
     c = 0.0
+    a_expected = None
+    a_bounds = None
     ok = True
     msg = "none"
+
+    # QA (line-based residuals)
     left_resid = None
     right_resid = None
-    penalty_info = {}
+
+    # penalty logging
+    std_target = None
+    stdB = None
+    std2 = None
+    std_head = None
+    std_tail = None
+    std_ratio_maxwin = None
 
     if args.norm_method == "affine2boundline":
         if data2 is None:
-            raise ValueError("affine2boundline requires img_2 (block2) to be provided.")
+            raise ValueError("affine2boundline requires img_2.")
+        if datab is None and not args.no_baseline_ok:
+            raise ValueError("affine2boundline requires --img2-baseline unless --no-baseline-ok is set.")
 
         # affine-source signals
         s1 = get_affine_signal(data1)
         s2 = get_affine_signal(data2)
         sB = get_affine_signal(datab) if datab is not None else None
 
+        # windows
         stable_n = int(args.stable_n)
         tail_n = int(args.tail_n)
         head2_n = int(args.img2_head_n)
-        base_tail_n = int(args.base_tail_n)
 
         if stable_n < 2 or stable_n > s1.size:
             raise ValueError(f"--stable-n must be in [2..len(img1)] got {stable_n}")
@@ -590,193 +641,266 @@ def main():
         if head2_n < 2 or head2_n > s2.size:
             raise ValueError(f"--img2-head-n must be in [2..len(img2)] got {head2_n}")
 
-        if sB is not None:
+        base_tail_n = int(args.base_tail_n)
+        if datab is not None:
             if base_tail_n <= 0:
                 base_tail_n = int(sB.size)
-            if base_tail_n < 1 or base_tail_n > sB.size:
-                raise ValueError(f"--base-tail-n must be in [1..len(baseline)] got {base_tail_n}")
+            if base_tail_n < 2 or base_tail_n > sB.size:
+                raise ValueError(f"--base-tail-n must be in [2..len(baseline)] got {base_tail_n}")
 
-        # boundary times in the concatenated plot
-        tL = float(t1_abs[0])          # baseline -> img1 boundary time (if baseline exists)
-        tR = float(t2_abs[0])          # img1 -> img2 boundary time
+        # absolute times for fitting
+        if datab is not None:
+            tb_abs_fit = segments_t[0]
+            t1_abs_fit = segments_t[1]
+            t2_abs_fit = segments_t[2]
+            tL = float(t1_abs_fit[0])
+            tR = float(t2_abs_fit[0])
+        else:
+            # no baseline segment
+            t1_abs_fit = segments_t[0]
+            t2_abs_fit = segments_t[1]
+            tL = float(t1_abs_fit[0])
+            tR = float(t2_abs_fit[0])
 
-        # fit lines
-        m1L, b1L = fit_line_or_constant(t1_abs[:stable_n], s1[:stable_n])
-        m1R, b1R = fit_line_or_constant(t1_abs[-tail_n:], s1[-tail_n:])
-        m2,  b2  = fit_line_or_constant(t2_abs[:head2_n], s2[:head2_n])
+        # fit img1 head line and tail line (always)
+        t1L_win = t1_abs_fit[:stable_n]
+        y1L_win = s1[:stable_n]
+        m1L, b1L = fit_line(t1L_win, y1L_win)
 
-        # expected a (optional)
-        a_expected = None
+        t1R_win = t1_abs_fit[-tail_n:]
+        y1R_win = s1[-tail_n:]
+        m1R, b1R = fit_line(t1R_win, y1R_win)
+
+        # fit img2 head line
+        t2_win = t2_abs_fit[:head2_n]
+        y2_win = s2[:head2_n]
+        m2, b2 = fit_line(t2_win, y2_win)
+
+        # eval at boundary times
+        y1L_hat = eval_line(m1L, b1L, tL)
+        y1R_hat = eval_line(m1R, b1R, tR)
+        y2_hat = eval_line(m2, b2, tR)
+
+        # baseline line only if baseline exists
+        if datab is not None:
+            tB_win = tb_abs_fit[-base_tail_n:]
+            yB_win = sB[-base_tail_n:]
+            mB, bB = fit_line(tB_win, yB_win)
+            yB_hat = eval_line(mB, bB, tL)
+        else:
+            yB_win = None
+            yB_hat = None
+
+        # expected a from NPro if requested
         if args.a_expected is not None:
             a_expected = float(args.a_expected)
         elif args.a_expected_from_npro:
             a_expected = float(get_npro(img2_path) / get_npro(img1_path))
 
-        a_lo = None
-        a_hi = None
         if a_expected is not None and args.a_bound_scale and args.a_bound_scale > 0:
-            a_lo = a_expected / float(args.a_bound_scale)
-            a_hi = a_expected * float(args.a_bound_scale)
+            a_bounds = (a_expected / float(args.a_bound_scale), a_expected * float(args.a_bound_scale))
 
-        # std target (baseline tail + img2 head)
-        def _std_fn(x):
-            return robust_std(x) if args.use_robust_std else float(np.nanstd(x))
-
-        std2 = _std_fn(s2[:head2_n])
-        if sB is not None:
-            stdB = _std_fn(sB[-base_tail_n:])
-            std_target = float(np.nanmean([stdB, std2]))
-        else:
-            stdB = None
-            std_target = float(std2)
-
-        if not np.isfinite(std_target) or std_target <= 0:
-            std_target = 1.0
-
-        # boundary hats for two-boundary mode
-        if sB is not None:
-            mB, bB = fit_line_or_constant(tb_abs[-base_tail_n:], sB[-base_tail_n:])
-            yB_hat  = eval_line(mB,  bB,  tL)
-            y1L_hat = eval_line(m1L, b1L, tL)
-            y2_hat  = eval_line(m2,  b2,  tR)
-            y1R_hat = eval_line(m1R, b1R, tR)
-
-        # objective in terms of a only; choose c(a) analytically
-        def c_from_a(a_val: float) -> float:
-            # Weighted least squares for c to satisfy boundary constraints as much as possible.
-            wL = float(args.boundary_penalty)
-            wR = float(args.boundary_penalty)
-            if sB is not None:
-                # two constraints: a*y1L+c ~ yB and a*y1R+c ~ y2
-                num = wL * (yB_hat - a_val * y1L_hat) + wR * (y2_hat - a_val * y1R_hat)
-                den = (wL + wR)
-                return float(num / den)
+        if args.a_positive:
+            if a_bounds is None:
+                a_bounds = (1e-12, float("inf"))
             else:
-                # no baseline: match right-boundary line intercept at any t (C0/C1 already in a)
-                # best c is from matching intercepts: a*b1R + c = b2
-                return float(b2 - a_val * b1R)
+                a_bounds = (max(a_bounds[0], 1e-12), a_bounds[1])
 
-        def objective(a_val: float) -> float:
-            # constraints
-            if args.a_positive and a_val < 0:
-                return 1e30
-            if a_lo is not None and a_val < a_lo:
-                return 1e30
-            if a_hi is not None and a_val > a_hi:
-                return 1e30
+        # TRUE POOLING (A) for std_target (baseline tail + img2 head together, if baseline exists)
+        std2 = safe_std(y2_win)
+        stdB = safe_std(yB_win) if yB_win is not None else float("nan")
+        std_target = pooled_std([yB_win, y2_win]) if yB_win is not None else safe_std(y2_win)
+        if not np.isfinite(std_target):
+            # last-ditch fallback
+            std_target = std2 if np.isfinite(std2) else (stdB if np.isfinite(stdB) else float("nan"))
 
-            c_val = c_from_a(a_val)
-            if args.c_nonneg and c_val < 0:
-                return 1e30
+        # Helper to choose c when baseline absent
+        def choose_c_no_baseline(a_try: float) -> float:
+            if args.c_policy == "zero":
+                return 0.0
+            if args.c_policy == "match_left_mean":
+                # keep mean of img1 head window unchanged after scaling
+                mu = float(np.nanmean(y1L_win))
+                return mu - a_try * mu
+            if args.c_policy == "preserve_min":
+                # shift so minimum of transformed img1 is 0 (only makes sense if --nonneg)
+                y_min = float(np.nanmin(s1))
+                return -a_try * y_min
+            raise ValueError("Unknown c-policy")
 
-            # boundary residuals
-            loss = 0.0
-            if sB is not None:
-                rL = (a_val * y1L_hat + c_val) - yB_hat
-                rR = (a_val * y1R_hat + c_val) - y2_hat
-                loss += float(args.boundary_penalty) * (rL * rL + rR * rR)
+        # Exact solve
+        def exact_solution() -> tuple[float, float, str]:
+            if datab is not None:
+                a0, c0 = solve_affine_from_two_constraints(y1L_hat, yB_hat, y1R_hat, y2_hat)
+                return a0, c0, "exact_C0_from_lines"
+            # no baseline: enforce right boundary only -> choose a from lines, then choose c by policy
+            denom = y1R_hat
+            if abs(denom) < 1e-12:
+                raise ValueError("No-baseline exact: y1R_hat ~ 0; cannot determine a from right boundary.")
+            a0 = y2_hat / y1R_hat
+            c0 = choose_c_no_baseline(a0)
+            return float(a0), float(c0), "exact_right_only"
 
-            # std blow-up penalty computed on transformed s1 windows (affine-source signal)
-            # (we penalize the *larger* of the head/tail stds)
-            s1_head = a_val * s1[:stable_n] + c_val
-            s1_tail = a_val * s1[-tail_n:] + c_val
-            std_head = _std_fn(s1_head)
-            std_tail = _std_fn(s1_tail)
-            std_use = float(np.nanmax([std_head, std_tail]))
+        # Robust search
+        def robust_solution() -> tuple[float, float, bool, str]:
+            # Build bounds for search
+            if a_bounds is not None:
+                lo, hi = a_bounds
+                if not np.isfinite(lo):
+                    lo = 1e-12
+                if not np.isfinite(hi):
+                    hi = max(lo * 100.0, 100.0)
+            else:
+                # default broad range centered near expected if available, else [0.1, 20]
+                if a_expected is not None and np.isfinite(a_expected):
+                    lo = max(1e-12, a_expected / 10.0)
+                    hi = a_expected * 10.0
+                else:
+                    lo, hi = (1e-3, 50.0)
 
-            ratio = std_use / std_target if std_target > 0 else float("inf")
-            excess = max(0.0, ratio - float(args.std_max_ratio))
-            loss += float(args.std_penalty) * (excess * excess)
+            if args.a_positive:
+                lo = max(lo, 1e-12)
 
-            # negative penalty computed on transformed *source* windows
-            neg = np.concatenate([s1_head, s1_tail], axis=0)
-            neg_amount = np.clip(-neg, 0.0, None)
-            loss += float(args.neg_penalty) * float(np.mean(neg_amount * neg_amount))
+            if hi <= lo:
+                return lo, (yB_hat - lo * y1L_hat) if datab is not None else choose_c_no_baseline(lo), False, "bad_bounds"
 
-            # optional a prior
-            if a_expected is not None and args.a_prior_penalty and args.a_prior_penalty > 0:
-                rel = (a_val - a_expected) / a_expected if a_expected != 0 else (a_val - a_expected)
-                loss += float(args.a_prior_penalty) * float(rel * rel)
+            # Candidate grid
+            grid_n = int(args.robust_a_grid)
+            grid_n = max(101, grid_n)
+            a_grid = np.linspace(lo, hi, grid_n, dtype=np.float64)
 
-            # stash some debug-ish numbers
-            penalty_info["std_target"] = std_target
-            penalty_info["stdB"] = stdB
-            penalty_info["std2"] = std2
-            penalty_info["std_head"] = std_head
-            penalty_info["std_tail"] = std_tail
-            penalty_info["std_ratio_maxwin"] = ratio
-            penalty_info["c_from_a"] = c_val
+            best = None  # (cost, a, c, msg)
+            for a_try in a_grid:
+                # choose c to satisfy left constraint if baseline exists
+                if datab is not None:
+                    c_try = yB_hat - a_try * y1L_hat
+                else:
+                    c_try = choose_c_no_baseline(a_try)
 
-            return float(loss)
+                # boundary residuals (line-based)
+                if datab is not None:
+                    lr = (a_try * y1L_hat + c_try) - yB_hat  # should be 0 by construction
+                else:
+                    lr = 0.0
 
-        # Solve for a
+                rr = (a_try * y1R_hat + c_try) - y2_hat
+
+                # std inflation check on affine-source windows (head/tail), transformed
+                y_head = a_try * y1L_win + c_try
+                y_tail = a_try * y1R_win + c_try
+                sh = safe_std(y_head)
+                st = safe_std(y_tail)
+
+                # compute ratio vs pooled std_target
+                ratios = []
+                if np.isfinite(sh) and np.isfinite(std_target) and std_target > 0:
+                    ratios.append(sh / std_target)
+                if np.isfinite(st) and np.isfinite(std_target) and std_target > 0:
+                    ratios.append(st / std_target)
+                rmax = max(ratios) if ratios else 1.0
+
+                # penalties
+                cost = 0.0
+                cost += args.penalty_w_resid * (rr ** 2)
+                # penalize std inflation above threshold
+                if np.isfinite(rmax) and rmax > args.std_max_ratio:
+                    cost += args.penalty_w_std * ((rmax - args.std_max_ratio) ** 2)
+
+                # penalize negativity if requested
+                if args.nonneg:
+                    # use transformed img1 ROI (what you actually plot) as the negativity proxy
+                    y_plot = a_try * y1_roi + c_try
+                    neg_frac = frac_negative(y_plot)
+                    if neg_frac > 0:
+                        cost += args.penalty_w_neg * (neg_frac ** 2)
+
+                # keep a near expected (soft) if provided
+                if a_expected is not None and np.isfinite(a_expected) and a_expected > 0:
+                    # very light regularizer (so it doesn't fight actual continuity)
+                    cost += 0.01 * ((a_try - a_expected) / a_expected) ** 2
+
+                if best is None or cost < best[0]:
+                    best = (cost, float(a_try), float(c_try), rmax, rr, lr, sh, st)
+
+            if best is None:
+                return 1.0, 0.0, False, "robust_failed"
+
+            _, a_best, c_best, rmax, rr, lr, sh, st = best
+            # declare ok if residual small-ish and no-neg if requested
+            ok_local = True
+            if abs(rr) > 1e-6 * max(1.0, abs(y2_hat)):
+                ok_local = False
+            if args.nonneg:
+                if frac_negative(a_best * y1_roi + c_best) > 0.0:
+                    ok_local = False
+
+            # stash std logs for printing
+            nonlocal std_head, std_tail, std_ratio_maxwin
+            std_head = sh
+            std_tail = st
+            std_ratio_maxwin = rmax
+
+            return a_best, c_best, ok_local, "robust_penalized_1D"
+
+        # Choose solver
         if args.affine_solver == "exact":
-            if sB is not None:
-                a, c = solve_affine_from_two_constraints(y1L_hat, yB_hat, y1R_hat, y2_hat)
-                msg = "exact_two_boundary_C0"
-            else:
-                a, c = solve_affine_match_line_right(m1R, b1R, m2, b2)
-                msg = "exact_right_line_match"
+            a, c, msg = exact_solution()
+            ok = True
         else:
-            # robust 1D search over a
-            # pick a search bracket
-            if a_lo is not None and a_hi is not None:
-                lo, hi = float(a_lo), float(a_hi)
-            elif a_expected is not None:
-                lo, hi = max(0.0, a_expected / 10.0), a_expected * 10.0
+            a, c, ok, msg = robust_solution()
+
+        # Apply additional hard bounds if specified and exact violated them
+        if a_bounds is not None:
+            lo, hi = a_bounds
+            if a < lo:
+                a = lo
+                if datab is not None:
+                    c = yB_hat - a * y1L_hat
+                else:
+                    c = choose_c_no_baseline(a)
+                ok = False
+                msg = "a_hit_lower_bound"
+            if a > hi:
+                a = hi
+                if datab is not None:
+                    c = yB_hat - a * y1L_hat
+                else:
+                    c = choose_c_no_baseline(a)
+                ok = False
+                msg = "a_hit_upper_bound"
+
+        if args.a_positive and a <= 0:
+            # force positivity
+            a = max(a, 1e-12)
+            if datab is not None:
+                c = yB_hat - a * y1L_hat
             else:
-                # broad but not insane
-                lo, hi = 0.0, 50.0
+                c = choose_c_no_baseline(a)
+            ok = False
+            msg = "a_forced_positive"
 
-            # coarse grid to find a good start
-            grid = np.linspace(lo, hi, 401, dtype=np.float64)
-            vals = np.array([objective(float(av)) for av in grid], dtype=np.float64)
-            k = int(np.nanargmin(vals))
-            a0 = float(grid[k])
-
-            # refine with golden-section style search
-            def golden_section_min(f, aL, aU, iters=80):
-                gr = (np.sqrt(5) + 1) / 2
-                c1 = aU - (aU - aL) / gr
-                c2 = aL + (aU - aL) / gr
-                f1 = f(c1)
-                f2 = f(c2)
-                for _ in range(iters):
-                    if f1 > f2:
-                        aL = c1
-                        c1 = c2
-                        f1 = f2
-                        c2 = aL + (aU - aL) / gr
-                        f2 = f(c2)
-                    else:
-                        aU = c2
-                        c2 = c1
-                        f2 = f1
-                        c1 = aU - (aU - aL) / gr
-                        f1 = f(c1)
-                return (aL + aU) / 2.0
-
-            span = hi - lo
-            aL = max(lo, a0 - 0.1 * span)
-            aU = min(hi, a0 + 0.1 * span)
-            a = float(golden_section_min(objective, aL, aU, iters=100))
-            c = float(c_from_a(a))
-            msg = "robust_penalized_1D"
-
-            if args.a_positive and a < 0:
+        # Optional “nonneg” hard adjustment in no-baseline mode only (since baseline constraint could force negatives)
+        if args.nonneg and datab is None:
+            y_try = a * y1_roi + c
+            if np.nanmin(y_try) < 0:
+                # shift up to make min==0
+                c = c - float(np.nanmin(y_try))
                 ok = False
-            if args.c_nonneg and c < 0:
-                ok = False
+                msg = msg + "+shift_nonneg"
 
-        # QA residuals on the actual line constraints if baseline exists
-        if sB is not None:
-            left_resid = (a * y1L_hat + c) - yB_hat
-            right_resid = (a * y1R_hat + c) - y2_hat
-
-        # Apply affine to plotted img1 ROI curve ONLY
+        # Apply affine transform to img1 ROI segment for plotting
         y1_roi_xform = a * y1_roi + c
-        segments_y[0 if datab is None else 1] = y1_roi_xform
-        labels[0 if datab is None else 1] = f"img1_ROI→a*y+c (a={a:.6g}, c={c:.6g})"
+        # replace plotted img1 segment (index depends on baseline presence)
+        idx_img1 = 1 if datab is not None else 0
+        segments_y[idx_img1] = y1_roi_xform
+        labels[idx_img1] = f"img1_ROI→a*y+c (a={a:.6g}, c={c:.6g})"
+
+        # Line-based residuals (the actual constraints)
+        if datab is not None:
+            left_resid = (a * y1L_hat + c) - yB_hat
+        else:
+            left_resid = None
+        right_resid = (a * y1R_hat + c) - y2_hat
 
     # Concatenate + plot
     t_all = np.concatenate(segments_t, axis=0)
@@ -800,19 +924,24 @@ def main():
     else:
         title_tag = "ROI intensity"
 
-    coord_line = f"({int(round(cx))},{int(round(cy))},{int(round(cz))};r={args.radius:g})" if args.center is not None else f"({center_label};r={args.radius:g})"
+    if args.center is None:
+        coord_line = f"({center_label};r={args.radius:g})"
+    else:
+        coord_line = f"({int(round(cx))},{int(round(cy))},{int(round(cz))};r={args.radius:g})"
+
     ax = plt.gca()
     if args.title_mode == "compact":
         ax.set_title(f"{title_tag} {coord_line}", fontsize=12)
     else:
         title = f"{title_tag} {coord_line}\nROI mean intensity"
-        title += f"\n(mode={args.norm_method}, solver={args.affine_solver}, affine-source={args.affine_source}, reducer={args.reducer}, global-mask={global_mask_note})"
+        title += f"\n(mode={args.norm_method}, affine-source={args.affine_source}, reducer={args.reducer}, global-mask={global_mask_note})"
         if args.norm_method == "affine2boundline":
-            title += f"\na={a:.6g}, c={c:.6g}  ok={ok}  msg={msg}"
-            if left_resid is not None:
-                title += f"\nline-C0 left_resid={left_resid:.3g}  right_resid={right_resid:.3g}"
-            if penalty_info:
-                title += f"\nstd_target={penalty_info.get('std_target', float('nan')):.3g}  std_ratio_maxwin={penalty_info.get('std_ratio_maxwin', float('nan')):.3g}"
+            title += f"\nsolver={args.affine_solver}  a={a:.6g}, c={c:.6g}"
+            if a_expected is not None:
+                title += f"  a_expected={a_expected:.6g}"
+            if a_bounds is not None:
+                title += f"  a_bounds=[{a_bounds[0]:.6g},{a_bounds[1]:.6g}]"
+            title += f"\nstatus ok={ok} msg={msg}"
         ax.set_title(title, fontsize=11)
 
     plt.tight_layout()
@@ -826,29 +955,35 @@ def main():
                 f.write(f"{ti:.9g},{yi:.9g}\n")
 
     # ---------------- prints ----------------
-    if args.norm_method == "affine2boundline":
-        print("[mode] ROI plot; baseline+img2 fixed; img1 transformed only" if datab is not None else "[mode] ROI plot; img2 fixed; img1 transformed only (no baseline)")
-    else:
-        print("[mode] ROI plot (no transform)")
-
+    print("[mode] ROI plot; baseline+img2 fixed; img1 transformed only" if args.norm_method != "none" else "[mode] ROI plot (no transform)")
     print(f"       segments: {labels}")
     print(f"[roi] center={center_label}, radius={args.radius:g}, voxels={int(roi_mask.sum())}")
     print(f"[affine-source] {args.affine_source}  (reducer={args.reducer}, nonzero-eps={args.nonzero_eps:g}, global-mask={global_mask_note})")
 
     if args.norm_method == "affine2boundline":
-        print(f"[img1-transform] method=affine2boundline  solver={args.affine_solver}  a={a:.10g}  c={c:.10g}  ok={ok}  msg={msg}")
-        if left_resid is not None:
-            print(f"[line-C0] left_resid={left_resid:.6g}")
-            print(f"[line-C0] right_resid={right_resid:.6g}")
-        if penalty_info:
-            print(f"[penalty] std_target={penalty_info.get('std_target', float('nan')):.6g}  std2={penalty_info.get('std2', float('nan')):.6g}  stdB={penalty_info.get('stdB', float('nan')):.6g}")
-            print(f"[penalty] std_head={penalty_info.get('std_head', float('nan')):.6g}  std_tail={penalty_info.get('std_tail', float('nan')):.6g}  std_ratio_maxwin={penalty_info.get('std_ratio_maxwin', float('nan')):.6g}")
+        if a_expected is not None:
+            if a_bounds is not None:
+                print(f"[img1-transform] method=affine2boundline  solver={args.affine_solver}  a_expected={a_expected:.10g}  a_bounds=[{a_bounds[0]:.10g},{a_bounds[1]:.10g}]")
+            else:
+                print(f"[img1-transform] method=affine2boundline  solver={args.affine_solver}  a_expected={a_expected:.10g}")
+        else:
+            print(f"[img1-transform] method=affine2boundline  solver={args.affine_solver}")
+        print(f"                a={a:.10g}  c={c:.10g}  ok={ok}  msg={msg}")
 
-    # quick sanity warning if ROI itself has negatives BEFORE transform (this is a data problem, not just fitting)
-    if np.nanmin(y1_roi) < 0:
-        frac_neg = float(np.mean(y1_roi < 0))
-        print(f"[WARN] img1 ROI timeseries has negatives pre-transform: min={np.nanmin(y1_roi):.6g}, frac_neg={frac_neg:.3%}. "
-              f"If these are magnitude images, that suggests a reconstruction/scaling issue upstream.")
+        if left_resid is not None:
+            print(f"[line-C0] left_resid(a*y1Lhat+c - yBhat)={left_resid:.6g}")
+        else:
+            print(f"[line-C0] left_resid=N/A (no baseline)")
+        print(f"[line-C0] right_resid(a*y1Rhat+c - y2hat)={right_resid:.6g}")
+
+        # penalty diagnostics (pooled)
+        if std_target is not None:
+            # compute head/tail std on transformed affine-source windows if exact solver used (for logging)
+            if args.affine_solver == "exact":
+                # we can approximate with ROI-based windows for logging only
+                std_head = std_head if std_head is not None else float("nan")
+                std_tail = std_tail if std_tail is not None else float("nan")
+            print(f"[penalty] std_target(pooled)={std_target:.6g}  std2={std2:.6g}  stdB={stdB:.6g}")
 
     print(f"[out] roi-mask: {mask_out}")
     print(f"[out] plot    : {out_plot}")
