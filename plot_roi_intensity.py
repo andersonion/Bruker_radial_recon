@@ -7,7 +7,7 @@ and (optionally) apply an affine transform to img1 only:
 
     y1' = a * y1 + c
 
-Key normalization mode implemented here:
+Normalization mode implemented:
 
   --norm-method affine2boundline
 
@@ -17,34 +17,29 @@ Key normalization mode implemented here:
     Fit a line to baseline tail and img1 head; fit a line to img1 tail and img2 head.
     Evaluate both at their respective boundary times and solve for (a,c) such that
     img1' hits the baseline line at left boundary and hits img2 line at right boundary.
+    This yields an exact C0 solution (a_exact, c_exact).
+
+    If exact solution violates constraints (bounds / std / positivity), fall back to
+    a robust constrained search that minimizes BOTH boundary residuals, with c(a)
+    chosen by least squares across both boundaries.
 
 - If ONLY baseline exists (no img2):
-    Use left boundary only. If solver=exact: choose a=1, c to match left boundary (C0).
-    If solver=robust: search over a; choose c(a) to match left boundary exactly, optionally
-    penalize std, and enforce nonneg if requested.
+    One boundary only: anchor on left, choose c(a)=yB_hat - a*y1L_hat.
 
 - If ONLY img2 exists (no baseline):
-    Use right boundary only. If solver=exact: choose a=1, c to match right boundary (C0).
-    If solver=robust: search over a; choose c(a) to match right boundary exactly, optionally
-    penalize std, and enforce nonneg if requested.
+    One boundary only: anchor on right, choose c(a)=y2_hat - a*y1R_hat.
 
-Robust solver:
-- Uses a grid search over 'a' within bounds (if available).
-- Enforces std constraint as a HARD feasibility check (reject candidates).
-- Can enforce positivity of a and/or nonnegativity of transformed signal.
-
-STD “true pooling”:
-- std_target is computed from pooled samples of BOTH baseline window and img2 window
+STD constraint (TRUE pooling):
+- std_target is computed from pooled samples of BOTH baseline window and img2 head window
   (whichever are present) using the *same affine-source* signal.
-- If baseline is a single volume (n=1), it contributes to the pool but does not by itself
-  define std; std is computed from the pooled set (needs >=2 total samples).
+- If the pooled set has <2 samples, std_target is NaN and the std constraint is disabled.
 
 Affined-source for solving (a,c) can be:
 - roi       : ROI mean
 - global    : reducer over a mask (file mask or auto mask); if no mask, uses all voxels
 - nonzero   : reducer over voxels > eps for each frame
 
-Your plotting always displays ROI mean curves. The affine parameters (a,c) can be computed
+Plot always displays ROI mean curves. The affine parameters (a,c) can be computed
 from ROI or global/nonzero signals depending on --affine-source.
 """
 
@@ -321,6 +316,16 @@ def solve_affine_from_two_constraints(
     return float(a), float(c)
 
 
+def c_least_squares_two_boundaries(a: float, y1L_hat: float, yB_hat: float, y1R_hat: float, y2_hat: float) -> float:
+    """
+    Given 'a', choose 'c' to minimize:
+      (a*y1L_hat + c - yB_hat)^2 + (a*y1R_hat + c - y2_hat)^2
+    Closed form:
+      c = mean([yB_hat - a*y1L_hat, y2_hat - a*y1R_hat])
+    """
+    return float(0.5 * ((yB_hat - a * y1L_hat) + (y2_hat - a * y1R_hat)))
+
+
 # ----------------------------------- main ----------------------------------- #
 
 def main():
@@ -358,8 +363,8 @@ def main():
     parser.add_argument("--tail-n", type=int, default=8,
                         help="Number of final img1 points for right-line fit (default 8).")
     parser.add_argument("--base-tail-n", type=int, default=0,
-                        help="Number of final baseline points for baseline-line fit. "
-                             "If 0, uses all baseline points.")
+                        help="Number of final baseline points for baseline-line fit. If 0, uses all baseline points. "
+                             "NOTE: if baseline has only 1 volume, we use a constant at the boundary.")
     parser.add_argument("--img2-head-n", type=int, default=8,
                         help="Number of initial img2 points for img2-line fit (default 8).")
 
@@ -404,29 +409,25 @@ def main():
                         help="Bounds factor for a around expected: [a_expected/scale, a_expected*scale]. "
                              "Only applied if a_expected is available. Default 25.0 (very loose).")
 
-    # Robust solver controls
+    # Solver controls
     parser.add_argument("--affine-solver", choices=["exact", "robust"], default="exact",
-                        help="exact: solve (a,c) directly from line C0 constraints when possible; "
-                             "robust: grid search over 'a' with HARD std constraint and optional positivity.")
+                        help="exact: use exact C0 solution when possible; "
+                             "robust: constrained grid search if exact violates constraints.")
     parser.add_argument("--robust-grid-n", type=int, default=401,
                         help="Number of grid points for robust search over a (default 401).")
-    parser.add_argument("--robust-w-resid", type=float, default=1.0,
-                        help="Weight for the *non-anchor* boundary residual term in robust solver (default 1).")
 
     # HARD std constraint (feasibility)
     parser.add_argument("--std-max-ratio", type=float, default=None,
-                        help="HARD constraint: reject candidate a if std(transformed img1) / std_target > this. "
-                             "std_target is TRUE-pooled from baseline+img2 windows (whichever exist). "
-                             "If omitted, no std constraint is applied.")
+                        help="HARD constraint: reject candidate if std(transformed img1)/std_target > this. "
+                             "std_target is TRUE-pooled from baseline_tail + img2_head (as available).")
     parser.add_argument("--std-use", choices=["all", "headtail", "all+headtail"], default="all+headtail",
-                        help="Which transformed img1 region(s) to test against std constraint: "
-                             "all=entire img1; headtail=head+tail windows; all+headtail=max of both (default).")
+                        help="Which transformed img1 region(s) to test against std constraint.")
 
     # Physical-ish constraints
     parser.add_argument("--a-positive", action="store_true",
-                        help="Require a > 0 (robust solver will reject nonpositive; exact solver will error if <=0).")
+                        help="Require a > 0 (reject otherwise).")
     parser.add_argument("--y-positive", action="store_true",
-                        help="Require transformed ROI curve y1' to be >= --y-min (default 0) for all timepoints.")
+                        help="Require transformed ROI curve y1' to be >= --y-min for all timepoints.")
     parser.add_argument("--y-min", type=float, default=0.0,
                         help="Minimum allowed transformed ROI value when --y-positive is set (default 0).")
 
@@ -617,26 +618,26 @@ def main():
     ok = True
     msg = "none"
 
-    # Debug / reporting
     a_expected = None
     a_bounds = None
+    a_exact = None
+    c_exact = None
+
     left_resid = None
     right_resid = None
+
     std_target = None
     std_all = None
     std_head = None
     std_tail = None
     std_ratio_maxwin = None
-    anchor_side = None
 
     if args.norm_method == "affine2boundline":
-        # Need at least one boundary reference
         has_left = datab is not None
         has_right = data2 is not None
         if not (has_left or has_right):
             raise ValueError("affine2boundline requires at least one of: --img2-baseline or img_2")
 
-        # affine-source signals (used for fitting/solving)
         s1 = get_affine_signal(data1)
         sB = get_affine_signal(datab) if has_left else None
         s2 = get_affine_signal(data2) if has_right else None
@@ -650,32 +651,26 @@ def main():
             raise ValueError(f"--stable-n must be in [2..len(img1)] got {stable_n}")
         if tail_n < 2 or tail_n > s1.size:
             raise ValueError(f"--tail-n must be in [2..len(img1)] got {tail_n}")
-
         if has_right:
             if head2_n < 2 or head2_n > s2.size:
                 raise ValueError(f"--img2-head-n must be in [2..len(img2)] got {head2_n}")
-
         if has_left:
             if base_tail_n <= 0:
                 base_tail_n = int(sB.size)
-            # IMPORTANT: allow single-volume baseline; line fit still needs >=2.
-            # If baseline is 1 volume, we cannot fit a line; we’ll fall back to using the single point at tL.
-            if base_tail_n > sB.size:
-                raise ValueError(f"--base-tail-n must be <= len(baseline) got {base_tail_n}")
-            if base_tail_n < 1:
-                raise ValueError(f"--base-tail-n must be >= 1 got {base_tail_n}")
+            if base_tail_n > sB.size or base_tail_n < 1:
+                raise ValueError(f"--base-tail-n must be in [1..len(baseline)] got {base_tail_n}")
 
-        # boundary times in concatenated plot
+        # concatenated time arrays
         if has_left:
             tb_abs_fit = segments_t[0]
             t1_abs_fit = segments_t[1]
             tL = float(t1_abs_fit[0])
         else:
+            tb_abs_fit = None
             t1_abs_fit = segments_t[0]
             tL = None
 
         if has_right:
-            # If baseline present, img2 segment index is 2; else it's 1
             idx2 = 2 if has_left else 1
             t2_abs_fit = segments_t[idx2]
             tR = float(t2_abs_fit[0])
@@ -683,8 +678,7 @@ def main():
             t2_abs_fit = None
             tR = None
 
-        # Fit left boundary lines (baseline tail, img1 head)
-        # If baseline has only 1 point in the chosen window, treat it as a constant (m=0) at that timepoint.
+        # left boundary
         if has_left:
             tB_win = tb_abs_fit[-base_tail_n:]
             yB_win = sB[-base_tail_n:]
@@ -693,18 +687,20 @@ def main():
                 yB_hat = eval_line(mB, bB, tL)
                 left_line_desc = f"line_fit(n={tB_win.size})"
             else:
-                # single point baseline: no slope info
                 mB, bB = 0.0, float(yB_win[-1])
                 yB_hat = float(yB_win[-1])
                 left_line_desc = "single_point_const"
+
             t1L_win = t1_abs_fit[:stable_n]
             y1L_win = s1[:stable_n]
             m1L, b1L = fit_line(t1L_win, y1L_win)
             y1L_hat = eval_line(m1L, b1L, tL)
         else:
-            mB, bB, yB_hat, y1L_hat, left_line_desc = None, None, None, None, None
+            yB_hat = None
+            y1L_hat = None
+            left_line_desc = None
 
-        # Fit right boundary lines (img1 tail, img2 head)
+        # right boundary
         if has_right:
             t1R_win = t1_abs_fit[-tail_n:]
             y1R_win = s1[-tail_n:]
@@ -716,9 +712,10 @@ def main():
             m2, b2 = fit_line(t2_win, y2_win)
             y2_hat = eval_line(m2, b2, tR)
         else:
-            m1R, b1R, y1R_hat, m2, b2, y2_hat = None, None, None, None, None, None
+            y1R_hat = None
+            y2_hat = None
 
-        # a_expected/bounds
+        # a_expected / bounds
         if args.a_expected is not None:
             a_expected = float(args.a_expected)
         elif args.a_expected_from_npro and has_right:
@@ -727,194 +724,194 @@ def main():
         if a_expected is not None and args.a_bound_scale and args.a_bound_scale > 0:
             a_bounds = (a_expected / float(args.a_bound_scale), a_expected * float(args.a_bound_scale))
 
-        # Determine anchor side for robust mode (which boundary we keep exact by construction of c(a))
-        # Preference: if baseline exists, anchor LEFT; else anchor RIGHT.
-        if has_left:
-            anchor_side = "left"
-        else:
-            anchor_side = "right"
-
-        # Compute std_target (TRUE pooled) from available reference windows using affine-source signals
-        # Pool baseline window and img2 head window (both are in "target space", fixed).
-        # If baseline is 1 vol, it can contribute but won't by itself define std (needs >=2 pooled).
+        # TRUE pooled std_target from target-space windows
         pool_parts = []
         if has_left:
             pool_parts.append(yB_win.copy())
         if has_right:
             pool_parts.append(y2_win.copy())
         std_target = pooled_std(*pool_parts)
+        std_constraint_active = (args.std_max_ratio is not None) and np.isfinite(std_target) and (std_target > 0)
 
-        # ---------------- exact solver ----------------
-        if args.affine_solver == "exact":
-            if has_left and has_right:
-                a_raw, c_raw = solve_affine_from_two_constraints(y1L_hat, yB_hat, y1R_hat, y2_hat)
-                a = a_raw
-                c = c_raw
+        # helpers for std tests on transformed affine-source signal
+        s1_head = s1[:stable_n]
+        s1_tail = s1[-tail_n:]
+
+        def compute_std_ratio_maxwin(a_try: float, c_try: float) -> tuple[float, float, float, float]:
+            y_all1 = a_try * s1 + c_try
+            sh = safe_std(a_try * s1_head + c_try)
+            st = safe_std(a_try * s1_tail + c_try)
+            sa = safe_std(y_all1)
+
+            ratios = []
+            if std_target is not None and np.isfinite(std_target) and std_target > 0:
+                if args.std_use in ("all", "all+headtail"):
+                    if np.isfinite(sa):
+                        ratios.append(sa / std_target)
+                if args.std_use in ("headtail", "all+headtail"):
+                    if np.isfinite(sh):
+                        ratios.append(sh / std_target)
+                    if np.isfinite(st):
+                        ratios.append(st / std_target)
+            rmax = max(ratios) if ratios else float("nan")
+            return sa, sh, st, rmax
+
+        def passes_constraints(a_try: float, c_try: float) -> tuple[bool, str, float, float, float, float]:
+            if args.a_positive and a_try <= 0:
+                return False, "a_nonpositive", float("nan"), float("nan"), float("nan"), float("nan")
+
+            if args.y_positive:
+                y1_roi_x = a_try * y1_roi + c_try
+                if np.nanmin(y1_roi_x) < float(args.y_min):
+                    return False, "y_min_violation", float("nan"), float("nan"), float("nan"), float("nan")
+
+            sa, sh, st, rmax = compute_std_ratio_maxwin(a_try, c_try)
+            if std_constraint_active:
+                if not np.isfinite(rmax):
+                    return False, "std_ratio_nan", sa, sh, st, rmax
+                if rmax > float(args.std_max_ratio):
+                    return False, "std_ratio_exceeded", sa, sh, st, rmax
+
+            return True, "ok", sa, sh, st, rmax
+
+        # --- Step 1: exact solution when both boundaries exist ---
+        if has_left and has_right:
+            a_exact, c_exact = solve_affine_from_two_constraints(y1L_hat, yB_hat, y1R_hat, y2_hat)
+            feasible, why, sa, sh, st, rmax = passes_constraints(a_exact, c_exact)
+
+            # enforce bounds if specified (treat bounds as a constraint)
+            if feasible and (a_bounds is not None):
+                lo, hi = a_bounds
+                if not (lo <= a_exact <= hi):
+                    feasible = False
+                    why = "a_out_of_bounds"
+
+            if args.affine_solver == "exact":
+                a, c = a_exact, c_exact
+                ok = True
                 msg = "exact_C0_from_lines_both"
-            elif has_left and not has_right:
-                # One boundary only: choose a=1 and set c to match left line at tL
-                a = 1.0
-                c = yB_hat - a * y1L_hat
-                msg = f"exact_left_only_anchor_{left_line_desc}"
-            elif (not has_left) and has_right:
-                # One boundary only: choose a=1 and set c to match right line at tR
-                a = 1.0
-                c = y2_hat - a * y1R_hat
-                msg = "exact_right_only_anchor"
+                if args.a_positive and a <= 0:
+                    ok = False
+                    msg = "exact_produced_nonpositive_a"
             else:
-                raise RuntimeError("Internal: no boundary available")
-
-            if args.a_positive and a <= 0:
-                raise ValueError(f"a-positive requested, but exact solver produced a={a}")
-
-        # ---------------- robust solver ----------------
-        else:
-            # bounds for a grid
-            if a_bounds is not None:
-                a_lo, a_hi = float(a_bounds[0]), float(a_bounds[1])
-            else:
-                # Default loose range
-                # If a_expected exists, use around it; else use [0.05..50]
-                if a_expected is not None and a_expected > 0:
-                    a_lo, a_hi = a_expected / 25.0, a_expected * 25.0
+                if feasible:
+                    a, c = a_exact, c_exact
+                    ok = True
+                    msg = "robust_used_exact_C0_both"
+                    std_all, std_head, std_tail, std_ratio_maxwin = sa, sh, st, rmax
                 else:
-                    a_lo, a_hi = 0.05, 50.0
-
-            if args.a_positive:
-                a_lo = max(a_lo, 1e-6)
-
-            # grid
-            ngrid = int(args.robust_grid_n)
-            if ngrid < 11:
-                raise ValueError("--robust-grid-n must be >= 11")
-            grid = np.linspace(a_lo, a_hi, ngrid, dtype=np.float64)
-
-            best = None  # (cost, a, c, resid_other, std_ratio_maxwin)
-            rejected_std = 0
-            rejected_nonneg = 0
-            rejected_nonpos_a = 0
-
-            # Precompute reference target std fallback logic
-            # If std_target is NaN (e.g., pool has <2 samples), std constraint cannot be applied.
-            std_constraint_active = (args.std_max_ratio is not None) and np.isfinite(std_target) and (std_target > 0)
-
-            # Define windowed pieces of s1 for std tests
-            s1_head = s1[:stable_n]
-            s1_tail = s1[-tail_n:]
-
-            # Helper for std constraint evaluation on transformed affine-source signal
-            def compute_std_ratio_maxwin(a_try: float, c_try: float) -> tuple[float, float, float, float]:
-                # std_all: whole transformed img1 (affine-source)
-                y_all1 = a_try * s1 + c_try
-                sh = safe_std(a_try * s1_head + c_try)
-                st = safe_std(a_try * s1_tail + c_try)
-                sa = safe_std(y_all1)
-
-                ratios = []
-                if std_target is not None and np.isfinite(std_target) and std_target > 0:
-                    if args.std_use in ("all", "all+headtail"):
-                        if np.isfinite(sa):
-                            ratios.append(sa / std_target)
-                    if args.std_use in ("headtail", "all+headtail"):
-                        if np.isfinite(sh):
-                            ratios.append(sh / std_target)
-                        if np.isfinite(st):
-                            ratios.append(st / std_target)
-                rmax = max(ratios) if ratios else float("nan")
-                return sa, sh, st, rmax
-
-            # Robust search loop
-            for a_try in grid:
-                if args.a_positive and a_try <= 0:
-                    rejected_nonpos_a += 1
-                    continue
-
-                # Construct c(a) to keep ANCHOR boundary exact (C0 using line evals)
-                if anchor_side == "left":
-                    # requires left boundary
-                    c_try = yB_hat - a_try * y1L_hat
-                else:
-                    # anchor right
-                    c_try = y2_hat - a_try * y1R_hat
-
-                # Evaluate other boundary residual (line C0 mismatch)
-                resid_other = 0.0
-                if has_left and has_right:
-                    if anchor_side == "left":
-                        resid_other = (a_try * y1R_hat + c_try) - y2_hat
+                    # --- Step 2: robust constrained search minimizing BOTH residuals ---
+                    # a-grid
+                    if a_bounds is not None:
+                        a_lo, a_hi = float(a_bounds[0]), float(a_bounds[1])
                     else:
-                        resid_other = (a_try * y1L_hat + c_try) - yB_hat
+                        if a_expected is not None and np.isfinite(a_expected) and a_expected > 0:
+                            a_lo, a_hi = a_expected / 25.0, a_expected * 25.0
+                        else:
+                            a_lo, a_hi = 0.05, 50.0
+                    if args.a_positive:
+                        a_lo = max(a_lo, 1e-6)
+
+                    ngrid = int(args.robust_grid_n)
+                    if ngrid < 11:
+                        raise ValueError("--robust-grid-n must be >= 11")
+                    grid = np.linspace(a_lo, a_hi, ngrid, dtype=np.float64)
+
+                    best = None  # (cost, a, c, lres, rres, sa, sh, st, rmax, why)
+                    for a_try in grid:
+                        c_try = c_least_squares_two_boundaries(a_try, y1L_hat, yB_hat, y1R_hat, y2_hat)
+                        feasible2, why2, sa2, sh2, st2, rmax2 = passes_constraints(a_try, c_try)
+                        if not feasible2:
+                            continue
+
+                        lres = (a_try * y1L_hat + c_try) - yB_hat
+                        rres = (a_try * y1R_hat + c_try) - y2_hat
+                        cost = float(lres) ** 2 + float(rres) ** 2
+
+                        # light preference near a_expected (won't override feasibility)
+                        if a_expected is not None and np.isfinite(a_expected) and a_expected > 0:
+                            cost += 1e-6 * ((a_try - a_expected) / a_expected) ** 2
+
+                        if best is None or cost < best[0]:
+                            best = (cost, float(a_try), float(c_try), float(lres), float(rres), sa2, sh2, st2, rmax2, why2)
+
+                    if best is None:
+                        # last-resort fallback: clip exact a into bounds (if any), and balance c
+                        ok = False
+                        msg = f"robust_no_feasible_solution (exact infeasible: {why})"
+                        if a_bounds is not None:
+                            lo, hi = a_bounds
+                            a = float(np.clip(a_exact, lo, hi))
+                        else:
+                            a = float(a_exact)
+                        c = c_least_squares_two_boundaries(a, y1L_hat, yB_hat, y1R_hat, y2_hat)
+                    else:
+                        ok = True
+                        _, a, c, lres, rres, sa2, sh2, st2, rmax2, why2 = best
+                        msg = f"robust_constrained_min_both_resid (exact infeasible: {why})"
+                        std_all, std_head, std_tail, std_ratio_maxwin = sa2, sh2, st2, rmax2
+
+        # --- One-boundary cases ---
+        else:
+            if args.affine_solver == "exact":
+                a = 1.0
+                if has_left:
+                    c = yB_hat - a * y1L_hat
+                    msg = f"exact_left_only_anchor_{left_line_desc}"
                 else:
-                    resid_other = 0.0  # only one boundary exists
-
-                # Enforce transformed ROI nonnegativity if requested (uses ROI curve, not affine-source)
-                if args.y_positive:
-                    y1_roi_x = a_try * y1_roi + c_try
-                    if np.nanmin(y1_roi_x) < float(args.y_min):
-                        rejected_nonneg += 1
-                        continue
-
-                # HARD std feasibility
-                sa, sh, st, rmax = compute_std_ratio_maxwin(a_try, c_try)
-                if std_constraint_active:
-                    if not np.isfinite(rmax):
-                        # If we cannot evaluate ratio, treat as reject (we asked for constraint)
-                        rejected_std += 1
-                        continue
-                    if rmax > float(args.std_max_ratio):
-                        rejected_std += 1
-                        continue
-
-                # Cost: keep anchor exact, minimize other-boundary residual (if present)
-                cost = float(args.robust_w_resid) * float(resid_other) ** 2
-
-                # Mild preference to stay near a_expected (optional; only if we have it)
-                if a_expected is not None and np.isfinite(a_expected) and a_expected > 0:
-                    # very gentle regularization (won't override std feasibility)
-                    cost += 1e-6 * ((a_try - a_expected) / a_expected) ** 2
-
-                if best is None or cost < best[0]:
-                    best = (cost, float(a_try), float(c_try), float(resid_other), float(rmax) if np.isfinite(rmax) else float("nan"), sa, sh, st)
-
-            if best is None:
-                ok = False
-                # Fallback strategy:
-                # - If both boundaries exist, fall back to exact solution (ignoring std feasibility)
-                # - Else anchor-only with a_expected if available, else a=1
-                if has_left and has_right:
-                    a_raw, c_raw = solve_affine_from_two_constraints(y1L_hat, yB_hat, y1R_hat, y2_hat)
-                    a = a_raw
-                    c = c_raw
-                    msg = "robust_no_feasible_fallback_exact_both"
+                    c = y2_hat - a * y1R_hat
+                    msg = "exact_right_only_anchor"
+                ok = True
+            else:
+                # robust grid over a, anchor boundary exactly; minimize nothing else (only constraints)
+                if a_bounds is not None:
+                    a_lo, a_hi = float(a_bounds[0]), float(a_bounds[1])
                 else:
                     if a_expected is not None and np.isfinite(a_expected) and a_expected > 0:
-                        a = float(a_expected)
-                        msg = "robust_no_feasible_fallback_a_expected"
+                        a_lo, a_hi = a_expected / 25.0, a_expected * 25.0
                     else:
-                        a = 1.0
-                        msg = "robust_no_feasible_fallback_a_1"
+                        a_lo, a_hi = 0.05, 50.0
+                if args.a_positive:
+                    a_lo = max(a_lo, 1e-6)
+
+                grid = np.linspace(a_lo, a_hi, int(args.robust_grid_n), dtype=np.float64)
+                best = None
+                for a_try in grid:
+                    if has_left:
+                        c_try = yB_hat - a_try * y1L_hat
+                    else:
+                        c_try = y2_hat - a_try * y1R_hat
+                    feasible2, why2, sa2, sh2, st2, rmax2 = passes_constraints(a_try, c_try)
+                    if not feasible2:
+                        continue
+                    # cost just mild pull to a_expected if present; otherwise 0
+                    cost = 0.0
+                    if a_expected is not None and np.isfinite(a_expected) and a_expected > 0:
+                        cost += 1e-6 * ((a_try - a_expected) / a_expected) ** 2
+                    if best is None or cost < best[0]:
+                        best = (cost, float(a_try), float(c_try), sa2, sh2, st2, rmax2, why2)
+
+                if best is None:
+                    ok = False
+                    msg = "robust_no_feasible_one_boundary"
+                    a = 1.0
                     if has_left:
                         c = yB_hat - a * y1L_hat
                     else:
                         c = y2_hat - a * y1R_hat
-            else:
-                ok = True
-                _, a, c, resid_other, rmax, sa, sh, st = best
-                msg = f"robust_grid_anchor={anchor_side}"
-                std_ratio_maxwin = rmax
-                std_all, std_head, std_tail = sa, sh, st
+                else:
+                    ok = True
+                    _, a, c, sa2, sh2, st2, rmax2, why2 = best
+                    msg = "robust_one_boundary_feasible"
+                    std_all, std_head, std_tail, std_ratio_maxwin = sa2, sh2, st2, rmax2
 
-        # Final sanity constraints
-        if args.a_positive and a <= 0:
-            ok = False
-            msg = f"{msg}; a_positive_violated(a={a})"
-
-        # Apply affine to ROI curve for plotting
+        # apply affine to ROI curve for plotting
         y1_roi_xform = a * y1_roi + c
-        segments_y[0 if not has_left else 1] = y1_roi_xform
-        labels[0 if not has_left else 1] = f"img1_ROI→a*y+c (a={a:.6g}, c={c:.6g})"
+        idx_img1 = 1 if has_left else 0
+        segments_y[idx_img1] = y1_roi_xform
+        labels[idx_img1] = f"img1_ROI→a*y+c (a={a:.6g}, c={c:.6g})"
 
-        # Compute C0 residuals using the line-evaluations (these are the actual constraints)
+        # residuals on actual line-C0 constraints
         if has_left:
             left_resid = (a * y1L_hat + c) - yB_hat
         if has_right:
@@ -927,23 +924,16 @@ def main():
     plt.figure()
     plt.plot(t_all / x_scale, y_all)
 
-    # boundaries as dashed vertical lines
     if datab is not None:
-        # boundary at start of img1 segment
         plt.axvline((t1_abs[0]) / x_scale, linestyle="--")
     if data2 is not None:
-        # boundary at start of img2 segment (if present)
         plt.axvline((t2_abs[0]) / x_scale, linestyle="--")
 
     plt.xlabel(x_label)
     plt.ylabel("Mean ROI intensity")
 
     # Title
-    if args.title_tag is not None and args.title_tag.strip() != "":
-        title_tag = args.title_tag.strip()
-    else:
-        title_tag = "ROI intensity"
-
+    title_tag = args.title_tag.strip() if (args.title_tag and args.title_tag.strip()) else "ROI intensity"
     if args.center is None:
         coord_line = f"({center_label};r={args.radius:g})"
     else:
@@ -957,6 +947,8 @@ def main():
         title += f"\n(mode={args.norm_method}, solver={args.affine_solver}, affine-source={args.affine_source}, reducer={args.reducer}, global-mask={global_mask_note})"
         if args.norm_method == "affine2boundline":
             title += f"\na={a:.6g}, c={c:.6g}, ok={ok}, msg={msg}"
+            if a_exact is not None and c_exact is not None:
+                title += f"\na_exact={a_exact:.6g}, c_exact={c_exact:.6g}"
             if a_expected is not None:
                 title += f"\na_expected={a_expected:.6g}"
             if a_bounds is not None:
@@ -986,25 +978,31 @@ def main():
         print("[mode] ROI plot (no transform)")
     else:
         print("[mode] ROI plot; baseline/img2 fixed; img1 transformed only")
+
     print(f"       segments: {labels}")
     print(f"[roi] center={center_label}, radius={args.radius:g}, voxels={int(roi_mask.sum())}")
     print(f"[affine-source] {args.affine_source}  (reducer={args.reducer}, nonzero-eps={args.nonzero_eps:g}, global-mask={global_mask_note})")
 
     if args.norm_method == "affine2boundline":
-        if a_expected is not None:
-            if a_bounds is not None:
-                print(f"[img1-transform] method=affine2boundline  solver={args.affine_solver}  a_expected={a_expected:.10g}  a_bounds=[{a_bounds[0]:.10g},{a_bounds[1]:.10g}]")
-            else:
-                print(f"[img1-transform] method=affine2boundline  solver={args.affine_solver}  a_expected={a_expected:.10g}")
+        if a_expected is not None and a_bounds is not None:
+            print(f"[a] a_expected={a_expected:.10g}  a_bounds=[{a_bounds[0]:.10g},{a_bounds[1]:.10g}]")
+        elif a_expected is not None:
+            print(f"[a] a_expected={a_expected:.10g}")
+
+        if a_exact is not None and c_exact is not None:
+            print(f"[exact] a_exact={a_exact:.10g}  c_exact={c_exact:.10g}")
+
+        print(f"[img1-transform] method=affine2boundline  solver={args.affine_solver}")
         print(f"                a={a:.10g}  c={c:.10g}  ok={ok}  msg={msg}")
+
         if left_resid is not None:
             print(f"[line-C0] left_resid(a*y1Lhat+c - yBhat)={left_resid:.6g}")
         if right_resid is not None:
             print(f"[line-C0] right_resid(a*y1Rhat+c - y2hat)={right_resid:.6g}")
 
-        # std reporting
         if std_target is not None and np.isfinite(std_target):
             print(f"[std] std_target_pooled={std_target:.6g}  (pooled baseline_tail + img2_head where available)")
+
         if std_all is not None and np.isfinite(std_all):
             print(f"[std] std_img1_all_post={std_all:.6g}")
         if std_head is not None and np.isfinite(std_head):
@@ -1018,7 +1016,7 @@ def main():
                 print("[std] NOTE: std-max-ratio requested but std_target could not be computed (pooled sample count <2). Constraint disabled.")
 
         if baseline_is_3d:
-            print("[baseline] NOTE: baseline is 3D (single volume) - left boundary line uses single_point_const unless you have >=2 baseline frames.")
+            print("[baseline] NOTE: baseline is 3D (single volume) - left boundary uses single_point_const if base-tail-n=1.")
 
     print(f"[out] roi-mask: {mask_out}")
     print(f"[out] plot    : {out_plot}")
