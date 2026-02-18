@@ -220,11 +220,17 @@ def generate_auto_brain_mask_from_mean(
 
 # ----------------------------- line fitting + affine solve ----------------------------- #
 
-def fit_line(t: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+def fit_line_or_constant(t: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """
+    Return (m,b) for y ≈ m t + b.
+    If only 1 point is available, treat as a constant line: m=0, b=y0.
+    """
     if t.size != y.size:
         raise ValueError("fit_line: t and y must be same length")
-    if t.size < 2:
-        raise ValueError("fit_line: need >=2 points")
+    if t.size < 1:
+        raise ValueError("fit_line: need >=1 point")
+    if t.size == 1:
+        return 0.0, float(y[0])
     m, b = np.polyfit(t.astype(np.float64), y.astype(np.float64), 1)
     return float(m), float(b)
 
@@ -234,11 +240,29 @@ def eval_line(m: float, b: float, t: float) -> float:
 
 
 def solve_affine_from_two_constraints(y1L_hat: float, yB_hat: float, y1R_hat: float, y2_hat: float) -> tuple[float, float]:
+    """
+    Solve a,c from:
+      a*y1L_hat + c = yB_hat
+      a*y1R_hat + c = y2_hat
+    """
     denom = (y1R_hat - y1L_hat)
     if abs(denom) < 1e-12:
         raise ValueError("Affine solve ill-conditioned: y1R_hat ~ y1L_hat (denominator ~ 0)")
     a = (y2_hat - yB_hat) / denom
     c = yB_hat - a * y1L_hat
+    return float(a), float(c)
+
+
+def solve_affine_match_line_right(m1R: float, b1R: float, m2: float, b2: float) -> tuple[float, float]:
+    """
+    Right-boundary-only solve (no baseline):
+      Want a*(m1R t + b1R) + c ≈ (m2 t + b2) for all t
+      => a*m1R = m2  and  a*b1R + c = b2
+    """
+    if abs(m1R) < 1e-12:
+        raise ValueError("Right-boundary-only solve ill-conditioned: m1R ~ 0 (flat img1 tail).")
+    a = m2 / m1R
+    c = b2 - a * b1R
     return float(a), float(c)
 
 
@@ -281,7 +305,7 @@ def main():
                         help="Number of final img1 points for right-line fit (default 8).")
     parser.add_argument("--base-tail-n", type=int, default=0,
                         help="Number of final baseline points for baseline-line fit. "
-                             "If 0, uses all baseline points.")
+                             "If 0, uses all baseline points (even if that is 1).")
     parser.add_argument("--img2-head-n", type=int, default=8,
                         help="Number of initial img2 points for img2-line fit (default 8).")
 
@@ -290,7 +314,8 @@ def main():
                         choices=["none", "affine2boundline"],
                         default="none",
                         help="Transform applied to img1 only. "
-                             "'affine2boundline' enforces C0 continuity at both boundaries using fitted lines.")
+                             "'affine2boundline' enforces C0 continuity from fitted lines. "
+                             "If baseline is missing, it enforces continuity at the right boundary only (C0+C1 via line match).")
 
     # Affine source signal (for computing a,c) can be ROI or global-like
     parser.add_argument("--affine-source",
@@ -316,15 +341,6 @@ def main():
     parser.add_argument("--auto-mask-hist-bins", type=int, default=256)
     parser.add_argument("--auto-mask-out", default=None,
                         help="Write auto global mask to this path (default auto name). Use 'none' to skip writing.")
-
-    # NPro-based expectation + bounds for a
-    parser.add_argument("--a-expected-from-npro", action="store_true",
-                        help="Compute a_expected = NPro(img2)/NPro(img1) (requires method sidecars).")
-    parser.add_argument("--a-expected", type=float, default=None,
-                        help="Override expected a (e.g., 3.0).")
-    parser.add_argument("--a-bound-scale", type=float, default=25.0,
-                        help="Bounds factor for a around expected: [a_expected/scale, a_expected*scale]. "
-                             "Only applied if a_expected is available. Default 25.0 (essentially turned off...more reasonable values are 2-4).")
 
     args = parser.parse_args()
 
@@ -358,7 +374,7 @@ def main():
         raise ValueError(f"img_1 must be 4D, got shape {data1.shape}")
     nx, ny, nz = data1.shape[:3]
 
-    # Load img2 (optional)
+    # Load img2 (optional but required for affine2boundline)
     img2_path = Path(args.img_2) if args.img_2 else None
     data2 = None
     img2 = None
@@ -405,7 +421,7 @@ def main():
     roi_mask = make_spherical_mask((nx, ny, nz), radius_vox=args.radius, center_xyz=(cx, cy, cz))
     nib.save(nib.Nifti1Image(roi_mask, img1.affine), str(mask_out))
 
-    # Build global mask if requested
+    # Build global mask if requested (used if affine-source=global)
     global_mask = None
     global_mask_note = "OFF"
 
@@ -480,6 +496,7 @@ def main():
     labels = []
     t_cursor = 0.0
 
+    tb_abs = None
     if datab is not None:
         tb_abs = t_cursor + tb
         segments_t.append(tb_abs)
@@ -510,22 +527,22 @@ def main():
             return reduce_timeseries_from_nonzero(data_4d, args.reducer, args.nonzero_eps)
         raise ValueError("Unknown affine source")
 
-    # ---------------- Transform: affine2boundline (Version 2) ---------------- #
+    # ---------------- Transform: affine2boundline ---------------- #
     a = 1.0
     c = 0.0
-    a_expected = None
-    a_bounds = None
     ok = True
     msg = "none"
+    left_resid = None
+    right_resid = None
 
     if args.norm_method == "affine2boundline":
-        if datab is None or data2 is None:
-            raise ValueError("affine2boundline requires BOTH --img2-baseline and img_2.")
+        if data2 is None:
+            raise ValueError("affine2boundline requires img_2 (block2) to be provided.")
 
         # affine-source signals
-        sB = get_affine_signal(datab)
         s1 = get_affine_signal(data1)
         s2 = get_affine_signal(data2)
+        sB = get_affine_signal(datab) if datab is not None else None
 
         # windows
         stable_n = int(args.stable_n)
@@ -540,92 +557,68 @@ def main():
         if head2_n < 2 or head2_n > s2.size:
             raise ValueError(f"--img2-head-n must be in [2..len(img2)] got {head2_n}")
 
-        if base_tail_n <= 0:
-            base_tail_n = int(sB.size)
-        if base_tail_n < 2 or base_tail_n > sB.size:
-            raise ValueError(f"--base-tail-n must be in [2..len(baseline)] got {base_tail_n}")
-
-        # absolute times for fitting
-        tb_abs = segments_t[0]
-        t1_abs_fit = segments_t[1]
-        t2_abs_fit = segments_t[2]
+        if sB is not None:
+            if base_tail_n <= 0:
+                base_tail_n = int(sB.size)
+            # NOTE: baseline can be 1; we'll fit constant if needed
+            if base_tail_n < 1 or base_tail_n > sB.size:
+                raise ValueError(f"--base-tail-n must be in [1..len(baseline)] got {base_tail_n}")
 
         # boundary times in the concatenated plot
-        tL = float(t1_abs_fit[0])      # baseline -> img1 boundary time
-        tR = float(t2_abs_fit[0])      # img1 -> img2 boundary time
-
-        # fit baseline tail line
-        tB_win = tb_abs[-base_tail_n:]
-        yB_win = sB[-base_tail_n:]
-        mB, bB = fit_line(tB_win, yB_win)
+        tL = float(t1_abs[0])          # baseline -> img1 boundary time (if baseline exists)
+        tR = float(t2_abs[0])          # img1 -> img2 boundary time
 
         # fit img1 stable head line
-        t1L_win = t1_abs_fit[:stable_n]
+        t1L_win = t1_abs[:stable_n]
         y1L_win = s1[:stable_n]
-        m1L, b1L = fit_line(t1L_win, y1L_win)
+        m1L, b1L = fit_line_or_constant(t1L_win, y1L_win)
 
         # fit img1 tail line
-        t1R_win = t1_abs_fit[-tail_n:]
+        t1R_win = t1_abs[-tail_n:]
         y1R_win = s1[-tail_n:]
-        m1R, b1R = fit_line(t1R_win, y1R_win)
+        m1R, b1R = fit_line_or_constant(t1R_win, y1R_win)
 
         # fit img2 head line
-        t2_win = t2_abs_fit[:head2_n]
+        t2_win = t2_abs[:head2_n]
         y2_win = s2[:head2_n]
-        m2, b2 = fit_line(t2_win, y2_win)
+        m2, b2 = fit_line_or_constant(t2_win, y2_win)
 
-        # evaluate lines at boundary times
-        yB_hat = eval_line(mB, bB, tL)
-        y1L_hat = eval_line(m1L, b1L, tL)
-        y2_hat = eval_line(m2, b2, tR)
-        y1R_hat = eval_line(m1R, b1R, tR)
+        if sB is not None:
+            # LEFT boundary line from baseline tail (or constant if 1 point)
+            tB_win = tb_abs[-base_tail_n:]
+            yB_win = sB[-base_tail_n:]
+            mB, bB = fit_line_or_constant(tB_win, yB_win)
 
-        # expected a from NPro if requested
-        if args.a_expected is not None:
-            a_expected = float(args.a_expected)
-        elif args.a_expected_from_npro:
-            a_expected = float(get_npro(img2_path) / get_npro(img1_path))
+            # evaluate lines at boundary times
+            yB_hat = eval_line(mB, bB, tL)
+            y1L_hat = eval_line(m1L, b1L, tL)
+            y2_hat = eval_line(m2, b2, tR)
+            y1R_hat = eval_line(m1R, b1R, tR)
 
-        if a_expected is not None and args.a_bound_scale and args.a_bound_scale > 0:
-            a_bounds = (a_expected / float(args.a_bound_scale), a_expected * float(args.a_bound_scale))
+            # exact C0 solution from the two boundary constraints (Version 2)
+            a, c = solve_affine_from_two_constraints(y1L_hat, yB_hat, y1R_hat, y2_hat)
+            msg = "two-boundary_C0_from_lines"
 
-        # unconstrained exact C0 solution
-        a_raw, c_raw = solve_affine_from_two_constraints(y1L_hat, yB_hat, y1R_hat, y2_hat)
+            left_resid = (a * y1L_hat + c) - yB_hat
+            right_resid = (a * y1R_hat + c) - y2_hat
 
-        # apply bounds if requested
-        a = a_raw
-        c = c_raw
-        msg = "exact_C0_from_lines"
-
-        if a_bounds is not None:
-            lo, hi = a_bounds
-            if a < lo:
-                a = lo
-                c = yB_hat - a * y1L_hat  # keep LEFT boundary exact; right may miss
+        else:
+            # NO baseline: solve from right boundary only by matching the two lines (C0+C1 across that boundary)
+            try:
+                a, c = solve_affine_match_line_right(m1R, b1R, m2, b2)
+                msg = "right-only_line_match(C0+C1)"
+            except Exception as e:
                 ok = False
-                msg = "a_hit_lower_bound_left_exact"
-            elif a > hi:
-                a = hi
-                c = yB_hat - a * y1L_hat  # keep LEFT boundary exact; right may miss
-                ok = False
-                msg = "a_hit_upper_bound_left_exact"
+                msg = f"right-only_line_match_failed: {e}"
+                # fall back to no transform
+                a, c = 1.0, 0.0
 
         # apply affine transform to img1 ROI curve ONLY for plotting
         y1_roi_xform = a * y1_roi + c
 
         # replace plotted img1 segment
-        segments_y[1] = y1_roi_xform
-        labels[1] = f"img1_ROI→a*y+c (a={a:.6g}, c={c:.6g})"
-
-        # boundary QA using ROI (not affine-source) for intuitive plot continuity
-        base_left = float(np.mean(yb_roi)) if yb_roi.size > 1 else float(yb_roi[0])
-        img1_left_post = float(np.mean(y1_roi_xform[:stable_n]))
-        img2_head = float(np.mean(y2_roi[:head2_n]))
-        img1_tail_post = float(np.mean(y1_roi_xform[-tail_n:]))
-
-        # Also QA using fitted-line evaluations (the actual constraints)
-        left_resid = (a * y1L_hat + c) - yB_hat
-        right_resid = (a * y1R_hat + c) - y2_hat
+        segments_y[0 if datab is None else 1] = y1_roi_xform
+        labels[0 if datab is None else 1] = f"img1_ROI→a*y+c (a={a:.6g}, c={c:.6g})"
 
     # Concatenate + plot
     t_all = np.concatenate(segments_t, axis=0)
@@ -661,12 +654,9 @@ def main():
         title = f"{title_tag} {coord_line}\nROI mean intensity"
         title += f"\n(mode={args.norm_method}, affine-source={args.affine_source}, reducer={args.reducer}, global-mask={global_mask_note})"
         if args.norm_method == "affine2boundline":
-            title += f"\na={a:.6g}, c={c:.6g}"
-            if a_expected is not None:
-                title += f"  a_expected={a_expected:.6g}"
-            if a_bounds is not None:
-                title += f"  a_bounds=[{a_bounds[0]:.6g},{a_bounds[1]:.6g}]"
-            title += f"\nstatus ok={ok} msg={msg}"
+            title += f"\na={a:.6g}, c={c:.6g}  ok={ok}  msg={msg}"
+            if left_resid is not None:
+                title += f"\nline-C0 left_resid={left_resid:.3g}  right_resid={right_resid:.3g}"
         ax.set_title(title, fontsize=11)
 
     plt.tight_layout()
@@ -680,20 +670,20 @@ def main():
                 f.write(f"{ti:.9g},{yi:.9g}\n")
 
     # ---------------- prints ----------------
-    print("[mode] ROI plot; baseline+img2 fixed; img1 transformed only" if args.norm_method != "none" else "[mode] ROI plot (no transform)")
+    if args.norm_method == "affine2boundline":
+        print("[mode] ROI plot; baseline+img2 fixed; img1 transformed only" if datab is not None else "[mode] ROI plot; img2 fixed; img1 transformed only (no baseline)")
+    else:
+        print("[mode] ROI plot (no transform)")
+
     print(f"       segments: {labels}")
     print(f"[roi] center={center_label}, radius={args.radius:g}, voxels={int(roi_mask.sum())}")
     print(f"[affine-source] {args.affine_source}  (reducer={args.reducer}, nonzero-eps={args.nonzero_eps:g}, global-mask={global_mask_note})")
 
     if args.norm_method == "affine2boundline":
-        if a_expected is not None:
-            if a_bounds is not None:
-                print(f"[img1-transform] method=affine2boundline  a_expected={a_expected:.10g}  a_bounds=[{a_bounds[0]:.10g},{a_bounds[1]:.10g}]")
-            else:
-                print(f"[img1-transform] method=affine2boundline  a_expected={a_expected:.10g}")
-        print(f"                a={a:.10g}  c={c:.10g}  ok={ok}  msg={msg}")
-        print(f"[line-C0] left_resid(a*y1Lhat+c - yBhat)={left_resid:.6g}")
-        print(f"[line-C0] right_resid(a*y1Rhat+c - y2hat)={right_resid:.6g}")
+        print(f"[img1-transform] method=affine2boundline  a={a:.10g}  c={c:.10g}  ok={ok}  msg={msg}")
+        if left_resid is not None:
+            print(f"[line-C0] left_resid(a*y1Lhat+c - yBhat)={left_resid:.6g}")
+            print(f"[line-C0] right_resid(a*y1Rhat+c - y2hat)={right_resid:.6g}")
 
     print(f"[out] roi-mask: {mask_out}")
     print(f"[out] plot    : {out_plot}")
