@@ -285,14 +285,15 @@ def fmt_cell(cell: dict) -> str:
 
 
 def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
-    # Font sizing (still prominent but not comically large)
+    # Font sizes
     count_fs = 22 if big else 15
     label_fs = count_fs + 2
     title_fs = 26 if big else 18
 
-    # Tighter title spacing
-    title_h = 0.45 if big else 0.35
+    title_h = 0.42 if big else 0.33
+    title_gap = 0.10 if big else 0.08  # small gap between title and grid
 
+    # --- Title ---
     add_textbox(
         slide, title,
         left, top, width, title_h,
@@ -300,20 +301,21 @@ def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
         bold=True, align="left", valign="middle",
     )
 
-    # Tighter grid geometry
-    grid_top = top + (0.55 if big else 0.45)
-    grid_h   = height - (0.65 if big else 0.55)
+    # --- HARD-CAPPED grid geometry (this is the key fix) ---
+    # Choose a sensible grid height regardless of the passed-in block height.
+    # (Big block is visually dominant, but not comically tall.)
+    grid_h = 4.30 if big else 2.05  # <- adjust these if you want tighter/looser
+    grid_top = top + title_h + title_gap
 
     label_col_w = 0.9 if big else 0.75
     data_col_w  = (width - label_col_w) / 2.0
 
-    # Smaller header + row heights
-    header_h = 0.45 if big else 0.35
+    header_h = 0.55 if big else 0.40
     row_h    = (grid_h - header_h) / 2.0
 
     bw = 2.0 if big else 1.25
 
-    # --- Draw borders ---
+    # --- Draw borders (3x3) ---
     # Header
     add_cell(slide, left, grid_top, label_col_w, header_h, bw)
     add_cell(slide, left + label_col_w, grid_top, data_col_w, header_h, bw)
@@ -352,21 +354,19 @@ def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
                 left + label_col_w, grid_top + header_h, data_col_w, row_h,
                 "Aptos (Body)", count_fs, RGBColor(0,0,0),
                 False, align="center", valign="middle")
-
     add_textbox(slide, fmt_cell(counts_block["CVN"]["IV"]),
                 left + label_col_w + data_col_w, grid_top + header_h, data_col_w, row_h,
                 "Aptos (Body)", count_fs, RGBColor(0,0,0),
                 False, align="center", valign="middle")
-
     add_textbox(slide, fmt_cell(counts_block["APOE"]["CM"]),
                 left + label_col_w, grid_top + header_h + row_h, data_col_w, row_h,
                 "Aptos (Body)", count_fs, RGBColor(0,0,0),
                 False, align="center", valign="middle")
-
     add_textbox(slide, fmt_cell(counts_block["CVN"]["CM"]),
                 left + label_col_w + data_col_w, grid_top + header_h + row_h, data_col_w, row_h,
                 "Aptos (Body)", count_fs, RGBColor(0,0,0),
-                False, align="center", valign="middle")
+                False, align="center", valign="middle")               
+                
 def add_summary_slide(prs, blank_layout, summary_counts):
     slide = prs.slides.add_slide(blank_layout)
     force_white_background(slide)
@@ -389,7 +389,7 @@ def add_summary_slide(prs, blank_layout, summary_counts):
     add_textbox(
         slide,
         "*Data may be improved/made usable after motion corrections (coregistration and volume pruning).",
-        0.9, 7.05, 12.4, 0.35,
+        0.9, 7.18, 12.4, 0.35,
         "Aptos (Body)", 12, RGBColor(0,0,0), False
     )
 
