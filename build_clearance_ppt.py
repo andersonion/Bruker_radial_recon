@@ -283,100 +283,103 @@ def fmt_cell(cell: dict) -> str:
         bits.append(f"{q} ?")
     return f"{total} ({', '.join(bits)})"
 
-
 def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
+    # ---- Layout knobs ----
+    width_scale = 0.75  # 75% width
+    v_shift_frac = 1.0 / 3.0  # shift block down by 1/3 of remaining height
 
     # Font sizes
     count_fs = 20 if big else 14
     label_fs = count_fs + 2
     title_fs = 26 if big else 18
 
-    # Title
+    # Compact geometry
     title_h = 0.38
     gap = 0.08
+    header_h = 0.40 if big else 0.32
+    row_h = 0.85 if big else 0.55
 
+    grid_h = header_h + 2 * row_h
+    block_h = title_h + gap + grid_h  # title + grid treated as one "block"
+
+    # ---- Apply 1/3-down vertical placement (NOT centered) ----
+    extra_h = max(0.0, height - block_h)
+    block_top = top + v_shift_frac * extra_h
+
+    # ---- Apply 75% width, centered within allotted width ----
+    rub_w = width * width_scale
+    rub_left = left + (width - rub_w) / 2.0
+
+    # --- Title (moves with rubric) ---
     add_textbox(
         slide, title,
-        left, top, width, title_h,
+        rub_left, block_top, rub_w, title_h,
         "Aptos Display", title_fs, RGBColor(0, 0, 0),
         bold=True, align="left", valign="middle",
     )
 
-    # ---- FIXED COMPACT GEOMETRY ----
-    header_h = 0.40 if big else 0.32
-    row_h    = 0.85 if big else 0.55
-
-    grid_total_h = header_h + 2 * row_h
-
-    # Vertical centering within allotted block height
-    available_h = max(0.0, height - (title_h + gap))
-    offset = max(0.0, (available_h - grid_total_h) / 2.0)
-
-    grid_top = top + title_h + gap + offset
+    grid_top = block_top + title_h + gap
 
     label_col_w = 0.85 if big else 0.70
-    data_col_w  = (width - label_col_w) / 2.0
-
+    data_col_w = (rub_w - label_col_w) / 2.0
     bw = 2.0 if big else 1.25
 
-    # --- Draw borders ---
+    # --- Borders (3 cols x 3 rows) ---
     # Header
-    add_cell(slide, left, grid_top, label_col_w, header_h, bw)
-    add_cell(slide, left + label_col_w, grid_top, data_col_w, header_h, bw)
-    add_cell(slide, left + label_col_w + data_col_w, grid_top, data_col_w, header_h, bw)
+    add_cell(slide, rub_left, grid_top, label_col_w, header_h, bw)
+    add_cell(slide, rub_left + label_col_w, grid_top, data_col_w, header_h, bw)
+    add_cell(slide, rub_left + label_col_w + data_col_w, grid_top, data_col_w, header_h, bw)
 
     # IV row
-    add_cell(slide, left, grid_top + header_h, label_col_w, row_h, bw)
-    add_cell(slide, left + label_col_w, grid_top + header_h, data_col_w, row_h, bw)
-    add_cell(slide, left + label_col_w + data_col_w, grid_top + header_h, data_col_w, row_h, bw)
+    add_cell(slide, rub_left, grid_top + header_h, label_col_w, row_h, bw)
+    add_cell(slide, rub_left + label_col_w, grid_top + header_h, data_col_w, row_h, bw)
+    add_cell(slide, rub_left + label_col_w + data_col_w, grid_top + header_h, data_col_w, row_h, bw)
 
     # CM row
-    add_cell(slide, left, grid_top + header_h + row_h, label_col_w, row_h, bw)
-    add_cell(slide, left + label_col_w, grid_top + header_h + row_h, data_col_w, row_h, bw)
-    add_cell(slide, left + label_col_w + data_col_w, grid_top + header_h + row_h, data_col_w, row_h, bw)
+    add_cell(slide, rub_left, grid_top + header_h + row_h, label_col_w, row_h, bw)
+    add_cell(slide, rub_left + label_col_w, grid_top + header_h + row_h, data_col_w, row_h, bw)
+    add_cell(slide, rub_left + label_col_w + data_col_w, grid_top + header_h + row_h, data_col_w, row_h, bw)
 
     # --- Labels ---
-    add_textbox(slide, "", left, grid_top, label_col_w, header_h,
-                "Aptos Display", label_fs, RGBColor(0,0,0),
+    add_textbox(slide, "", rub_left, grid_top, label_col_w, header_h,
+                "Aptos Display", label_fs, RGBColor(0, 0, 0),
+                True, align="center", valign="middle")
+    add_textbox(slide, "APOE", rub_left + label_col_w, grid_top, data_col_w, header_h,
+                "Aptos Display", label_fs, RGBColor(0, 0, 0),
+                True, align="center", valign="middle")
+    add_textbox(slide, "CVN", rub_left + label_col_w + data_col_w, grid_top, data_col_w, header_h,
+                "Aptos Display", label_fs, RGBColor(0, 0, 0),
                 True, align="center", valign="middle")
 
-    add_textbox(slide, "APOE", left + label_col_w, grid_top, data_col_w, header_h,
-                "Aptos Display", label_fs, RGBColor(0,0,0),
+    add_textbox(slide, "IV", rub_left, grid_top + header_h, label_col_w, row_h,
+                "Aptos Display", label_fs, RGBColor(0, 0, 0),
                 True, align="center", valign="middle")
-
-    add_textbox(slide, "CVN", left + label_col_w + data_col_w, grid_top, data_col_w, header_h,
-                "Aptos Display", label_fs, RGBColor(0,0,0),
-                True, align="center", valign="middle")
-
-    add_textbox(slide, "IV", left, grid_top + header_h, label_col_w, row_h,
-                "Aptos Display", label_fs, RGBColor(0,0,0),
-                True, align="center", valign="middle")
-
-    add_textbox(slide, "CM", left, grid_top + header_h + row_h, label_col_w, row_h,
-                "Aptos Display", label_fs, RGBColor(0,0,0),
+    add_textbox(slide, "CM", rub_left, grid_top + header_h + row_h, label_col_w, row_h,
+                "Aptos Display", label_fs, RGBColor(0, 0, 0),
                 True, align="center", valign="middle")
 
     # --- Data ---
     add_textbox(slide, fmt_cell(counts_block["APOE"]["IV"]),
-                left + label_col_w, grid_top + header_h, data_col_w, row_h,
-                "Aptos (Body)", count_fs, RGBColor(0,0,0),
+                rub_left + label_col_w, grid_top + header_h, data_col_w, row_h,
+                "Aptos (Body)", count_fs, RGBColor(0, 0, 0),
                 False, align="center", valign="middle")
 
     add_textbox(slide, fmt_cell(counts_block["CVN"]["IV"]),
-                left + label_col_w + data_col_w, grid_top + header_h, data_col_w, row_h,
-                "Aptos (Body)", count_fs, RGBColor(0,0,0),
+                rub_left + label_col_w + data_col_w, grid_top + header_h, data_col_w, row_h,
+                "Aptos (Body)", count_fs, RGBColor(0, 0, 0),
                 False, align="center", valign="middle")
 
     add_textbox(slide, fmt_cell(counts_block["APOE"]["CM"]),
-                left + label_col_w, grid_top + header_h + row_h, data_col_w, row_h,
-                "Aptos (Body)", count_fs, RGBColor(0,0,0),
+                rub_left + label_col_w, grid_top + header_h + row_h, data_col_w, row_h,
+                "Aptos (Body)", count_fs, RGBColor(0, 0, 0),
                 False, align="center", valign="middle")
 
     add_textbox(slide, fmt_cell(counts_block["CVN"]["CM"]),
-                left + label_col_w + data_col_w, grid_top + header_h + row_h, data_col_w, row_h,
-                "Aptos (Body)", count_fs, RGBColor(0,0,0),
+                rub_left + label_col_w + data_col_w, grid_top + header_h + row_h, data_col_w, row_h,
+                "Aptos (Body)", count_fs, RGBColor(0, 0, 0),
                 False, align="center", valign="middle")
-             
+
+
 def add_summary_slide(prs, blank_layout, summary_counts):
     slide = prs.slides.add_slide(blank_layout)
     force_white_background(slide)
