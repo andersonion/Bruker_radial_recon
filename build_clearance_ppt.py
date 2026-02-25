@@ -36,11 +36,6 @@ def load_lookup_table(excel_path: str) -> pd.DataFrame:
     if missing:
         raise RuntimeError(f"Missing required columns in Excel: {missing}")
 
-    # Optional (for summary)
-    # We will look for Sex column if present.
-    # Common variants: Sex, sex
-    # We'll normalize access later.
-
     df["Arunno_or_Crunno"] = df["Arunno_or_Crunno"].astype(str)
     df["Image_QA"] = df["Image_QA"].astype(str)
     return df
@@ -70,7 +65,7 @@ def lookup_sex(df: pd.DataFrame, runno: str) -> str:
     """
     Returns 'm', 'f', or '?'.
     Looks for column 'Sex' (case-insensitive).
-    Accepts values like M/F, Male/Female, m/f.
+    Accepts M/F, Male/Female, etc.
     """
     row = lookup_row(df, runno)
     if row is None:
@@ -81,7 +76,6 @@ def lookup_sex(df: pd.DataFrame, runno: str) -> str:
         if str(c).strip().lower() == "sex":
             sex_col = c
             break
-
     if sex_col is None:
         return "?"
 
@@ -151,13 +145,12 @@ def add_textbox(slide, text, left, top, width, height, font_name, font_size, col
 
 
 # -----------------------------
-# Slides: Title + Summary
+# Title slide
 # -----------------------------
 def add_title_slide(prs, blank_layout):
     slide = prs.slides.add_slide(blank_layout)
     force_white_background(slide)
 
-    # Title
     add_textbox(
         slide,
         "Brain Clearance in Mice",
@@ -171,7 +164,6 @@ def add_title_slide(prs, blank_layout):
         bold=True,
     )
 
-    # Subtitle
     add_textbox(
         slide,
         "Initial Quality Assurance Report",
@@ -185,7 +177,6 @@ def add_title_slide(prs, blank_layout):
         bold=False,
     )
 
-    # Date (month spelled out)
     date_str = datetime.now().strftime("%B %d, %Y")
     add_textbox(
         slide,
@@ -200,7 +191,6 @@ def add_title_slide(prs, blank_layout):
         bold=False,
     )
 
-    # Author
     add_textbox(
         slide,
         "Dr. B.J. Anderson, Ph.D., QIAL, Duke University Medical Center",
@@ -215,53 +205,151 @@ def add_title_slide(prs, blank_layout):
     )
 
 
-def key_label_from_prefix(prefix: str):
-    prefix = prefix.upper()
-    if prefix == "A":
-        return "APOE with IV", "A"
-    if prefix == "P":
-        return "APOE with CM", "P"
-    if prefix == "C":
-        return "CVN with IV", "C"
-    if prefix == "V":
-        return "CVN with CM", "V"
-    return f"Unknown ({prefix})", prefix
+# -----------------------------
+# Summary counts + rubric helpers
+# -----------------------------
+def init_summary_counts():
+    # counts[status][genotype][method] -> dict(sex->count, total->count)
+    counts = {}
+    for status in ("Yes", "Maybe", "No"):
+        counts[status] = {}
+        for genotype in ("APOE", "CVN"):
+            counts[status][genotype] = {}
+            for method in ("IV", "CM"):
+                counts[status][genotype][method] = {"m": 0, "f": 0, "?": 0, "total": 0}
+    return counts
 
 
-def format_bucket_lines(bucket_counts):
+def bump_counts(counts, status, genotype, method, sex):
+    if status not in counts:
+        return
+    if genotype not in counts[status]:
+        return
+    if method not in counts[status][genotype]:
+        return
+    if sex not in ("m", "f", "?"):
+        sex = "?"
+    cell = counts[status][genotype][method]
+    cell["total"] += 1
+    cell[sex] += 1
+
+
+def fmt_cell(cell: dict) -> str:
+    total = cell.get("total", 0)
+    m = cell.get("m", 0)
+    f = cell.get("f", 0)
+    q = cell.get("?", 0)
+    bits = [f"{m} m", f"{f} f"]
+    if q:
+        bits.append(f"{q} ?")
+    return f"{total} ({', '.join(bits)})"
+
+
+def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
     """
-    bucket_counts: dict(prefix -> dict(sex->count, total->count))
-    returns list[str] lines in A,P,C,V order.
+    Renders a 2x2 rubric:
+      columns: APOE, CVN
+      rows: IV, CM
+    counts_block: counts[status] -> counts_block[genotype][method]
     """
-    order = ["A", "P", "C", "V"]
-    lines = []
-    for pref in order:
-        label, _ = key_label_from_prefix(pref)
-        info = bucket_counts.get(pref, {"m": 0, "f": 0, "?": 0, "total": 0})
-        total = info.get("total", 0)
-        m = info.get("m", 0)
-        f = info.get("f", 0)
-        q = info.get("?", 0)
 
-        sex_bits = [f"{m} m", f"{f} f"]
-        if q:
-            sex_bits.append(f"{q} ?")
-        sex_str = ", ".join(sex_bits)
+    # Title for the block
+    add_textbox(
+        slide,
+        title,
+        left=left,
+        top=top,
+        width=width,
+        height=0.45 if big else 0.38,
+        font_name="Aptos Display",
+        font_size=26 if big else 18,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=True,
+    )
 
-        lines.append(f"{label}: {total} ({sex_str})")
-    return lines
+    grid_top = top + (0.6 if big else 0.5)
+    grid_h = height - (0.8 if big else 0.65)
+
+    # Grid geometry: left label col + 2 data cols; header row + 2 data rows
+    label_col_w = 0.9 if big else 0.75
+    data_col_w = (width - label_col_w) / 2.0
+
+    header_h = 0.55 if big else 0.45
+    row_h = (grid_h - header_h) / 2.0
+
+    # Column headers
+    add_textbox(slide, "", left, grid_top, label_col_w, header_h, "Aptos (Body)", 14 if big else 12, RGBColor(0, 0, 0), False)
+    add_textbox(slide, "APOE", left + label_col_w, grid_top, data_col_w, header_h, "Aptos Display", 16 if big else 14, RGBColor(0, 0, 0), True)
+    add_textbox(slide, "CVN", left + label_col_w + data_col_w, grid_top, data_col_w, header_h, "Aptos Display", 16 if big else 14, RGBColor(0, 0, 0), True)
+
+    # Row labels
+    add_textbox(slide, "IV", left, grid_top + header_h, label_col_w, row_h, "Aptos Display", 16 if big else 14, RGBColor(0, 0, 0), True)
+    add_textbox(slide, "CM", left, grid_top + header_h + row_h, label_col_w, row_h, "Aptos Display", 16 if big else 14, RGBColor(0, 0, 0), True)
+
+    # Data cells
+    # IV row
+    add_textbox(
+        slide,
+        fmt_cell(counts_block["APOE"]["IV"]),
+        left + label_col_w,
+        grid_top + header_h,
+        data_col_w,
+        row_h,
+        "Aptos (Body)",
+        22 if big else 14,
+        RGBColor(0, 0, 0),
+        False,
+    )
+    add_textbox(
+        slide,
+        fmt_cell(counts_block["CVN"]["IV"]),
+        left + label_col_w + data_col_w,
+        grid_top + header_h,
+        data_col_w,
+        row_h,
+        "Aptos (Body)",
+        22 if big else 14,
+        RGBColor(0, 0, 0),
+        False,
+    )
+
+    # CM row
+    add_textbox(
+        slide,
+        fmt_cell(counts_block["APOE"]["CM"]),
+        left + label_col_w,
+        grid_top + header_h + row_h,
+        data_col_w,
+        row_h,
+        "Aptos (Body)",
+        22 if big else 14,
+        RGBColor(0, 0, 0),
+        False,
+    )
+    add_textbox(
+        slide,
+        fmt_cell(counts_block["CVN"]["CM"]),
+        left + label_col_w + data_col_w,
+        grid_top + header_h + row_h,
+        data_col_w,
+        row_h,
+        "Aptos (Body)",
+        22 if big else 14,
+        RGBColor(0, 0, 0),
+        False,
+    )
 
 
 def add_summary_slide(prs, blank_layout, summary_counts):
     slide = prs.slides.add_slide(blank_layout)
     force_white_background(slide)
 
-    # Title
+    # Slide title
     add_textbox(
         slide,
-        "Summary",
+        "QA Summary",
         left=0.9,
-        top=0.55,
+        top=0.5,
         width=11.6,
         height=0.7,
         font_name="Aptos Display",
@@ -270,97 +358,48 @@ def add_summary_slide(prs, blank_layout, summary_counts):
         bold=True,
     )
 
-    # Layout regions:
-    # Left half: big "Usable Data" + lines
-    # Right half top: "Possibly Usable Data" + lines
-    # Right half mid/bot: "Unusable Data" + lines
+    # Layout:
+    # Left half (big): Yes
+    # Right half (stacked): Maybe (top), No (bottom)
     left_x = 0.9
-    left_w = 6.2
+    left_w = 6.3
     right_x = 7.4
-    right_w = 5.6
+    right_w = 5.5
 
-    # Usable (Yes) - center of attention
-    add_textbox(
+    # Big left rubric (Usable)
+    add_rubric(
         slide,
-        "Usable Data:",
+        "Usable Data",
+        summary_counts["Yes"],
         left=left_x,
-        top=1.55,
+        top=1.45,
         width=left_w,
-        height=0.5,
-        font_name="Aptos Display",
-        font_size=26,
-        color_rgb=RGBColor(0, 0, 0),
-        bold=True,
+        height=5.8,
+        big=True,
     )
 
-    yes_lines = format_bucket_lines(summary_counts["Yes"])
-    add_textbox(
+    # Right top rubric (Maybe)
+    add_rubric(
         slide,
-        "\n".join(yes_lines),
-        left=left_x,
-        top=2.15,
-        width=left_w,
-        height=4.6,
-        font_name="Aptos (Body)",
-        font_size=22,
-        color_rgb=RGBColor(0, 0, 0),
-        bold=False,
-    )
-
-    # Maybe (Possibly usable) - right top
-    add_textbox(
-        slide,
-        "Possibly Usable Data:",
+        "Possibly Usable Data",
+        summary_counts["Maybe"],
         left=right_x,
-        top=1.55,
+        top=1.45,
         width=right_w,
-        height=0.45,
-        font_name="Aptos Display",
-        font_size=20,
-        color_rgb=RGBColor(0, 0, 0),
-        bold=True,
+        height=2.8,
+        big=False,
     )
 
-    maybe_lines = format_bucket_lines(summary_counts["Maybe"])
-    add_textbox(
+    # Right bottom rubric (No)
+    add_rubric(
         slide,
-        "\n".join(maybe_lines),
-        left=right_x,
-        top=2.05,
-        width=right_w,
-        height=2.1,
-        font_name="Aptos (Body)",
-        font_size=16,
-        color_rgb=RGBColor(0, 0, 0),
-        bold=False,
-    )
-
-    # No (Unusable) - right lower
-    add_textbox(
-        slide,
-        "Unusable Data:",
+        "Unusable Data",
+        summary_counts["No"],
         left=right_x,
         top=4.35,
         width=right_w,
-        height=0.45,
-        font_name="Aptos Display",
-        font_size=20,
-        color_rgb=RGBColor(0, 0, 0),
-        bold=True,
-    )
-
-    no_lines = format_bucket_lines(summary_counts["No"])
-    add_textbox(
-        slide,
-        "\n".join(no_lines),
-        left=right_x,
-        top=4.85,
-        width=right_w,
-        height=1.7,
-        font_name="Aptos (Body)",
-        font_size=16,
-        color_rgb=RGBColor(0, 0, 0),
-        bold=False,
+        height=2.9,
+        big=False,
     )
 
     # Footnote
@@ -378,76 +417,55 @@ def add_summary_slide(prs, blank_layout, summary_counts):
     )
 
 
-def init_summary_counts():
-    # structure: counts[status][prefix]["m"/"f"/"?"/"total"]
-    counts = {}
-    for status in ("Yes", "Maybe", "No"):
-        counts[status] = {}
-        for pref in ("A", "P", "C", "V"):
-            counts[status][pref] = {"m": 0, "f": 0, "?": 0, "total": 0}
-    return counts
-
-
-def bump_counts(counts, status, prefix, sex):
-    if status not in counts:
-        return
-    if prefix not in counts[status]:
-        return
-    if sex not in ("m", "f", "?"):
-        sex = "?"
-    counts[status][prefix]["total"] += 1
-    counts[status][prefix][sex] += 1
-
-
 # -----------------------------
 # Main
 # -----------------------------
 def main():
     args = parse_args()
-
     df = load_lookup_table(args.excel)
 
-    if args.template:
-        prs = Presentation(args.template)
-        # If you use a template, we assume its slide size is already correct and DO NOT override.
-    else:
-        prs = Presentation()
-        # Force slide size so your absolute inch coordinates match what you expect
-        prs.slide_width = Inches(args.slide_width)
-        prs.slide_height = Inches(args.slide_height)
-
-    blank_layout = prs.slide_layouts[6]  # blank
-
-    # Title slide first
-    add_title_slide(prs, blank_layout)
-
-    # Summary accumulator
+    # Pass 1: scan folders, collect run list + summary counts
+    run_folders = []
     summary_counts = init_summary_counts()
 
-    # Iterate z<runno> folders
-    root = args.root
-    for folder in sorted(os.listdir(root)):
+    for folder in sorted(os.listdir(args.root)):
         if not folder.startswith("z"):
             continue
-
         runno = folder[1:]
-        fullpath = os.path.join(root, folder)
+        fullpath = os.path.join(args.root, folder)
         if not os.path.isdir(fullpath):
             continue
-
-        # include any folder with any png
         if not glob.glob(os.path.join(fullpath, "*.png")):
             continue
 
-        genotype, method = parse_genotype_method(runno)
         status = lookup_status(df, runno)
         sex = lookup_sex(df, runno)
-        prefix = runno[0].upper()
+        genotype, method = parse_genotype_method(runno)
 
-        # Update summary counts
-        bump_counts(summary_counts, status, prefix, sex)
+        bump_counts(summary_counts, status, genotype, method, sex)
+        run_folders.append((runno, fullpath))
 
-        print(f"Adding slide for {runno} (status={status}, sex={sex})")
+    # Pass 2: build PPT in the required order
+    if args.template:
+        prs = Presentation(args.template)
+        # template controls size/theme
+    else:
+        prs = Presentation()
+        prs.slide_width = Inches(args.slide_width)
+        prs.slide_height = Inches(args.slide_height)
+
+    blank_layout = prs.slide_layouts[6]
+
+    # Title then Summary immediately after
+    add_title_slide(prs, blank_layout)
+    add_summary_slide(prs, blank_layout, summary_counts)
+
+    # Then the per-run slides
+    for runno, fullpath in run_folders:
+        genotype, method = parse_genotype_method(runno)
+        status = lookup_status(df, runno)
+
+        print(f"Adding slide for {runno}")
 
         slide = prs.slides.add_slide(blank_layout)
         force_white_background(slide)
@@ -466,16 +484,13 @@ def main():
         add_textbox(slide, "Cerebral Spinal Fluid", 6.95, 7.0, 1.97, 0.3, "Aptos (Body)", 12, RGBColor(255, 255, 255))
         add_textbox(slide, "Cisterna Magna", 11.7, 7.0, 1.41, 0.3, "Aptos (Body)", 12, RGBColor(255, 255, 255))
 
-        # -------- Genotype/Method/Usable (Set 2) --------
+        # -------- Genotype/Method/Usable (Set 2) [YOUR UPDATED POSITIONS] --------
         add_textbox(slide, f"Genotype: {genotype}", 3.5, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
         add_textbox(slide, f"Method: {method}", 8.1, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
         add_textbox(slide, f"Usable: {status}", 11.7, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
 
         # -------- Title box ($runno) --------
         add_textbox(slide, runno, 2.55, 0.17, 1.5, 0.4, "Aptos Display", 16, RGBColor(0, 0, 0), bold=True)
-
-    # Summary slide last
-    add_summary_slide(prs, blank_layout, summary_counts)
 
     prs.save(args.out)
     print(f"\nSaved presentation to {args.out}")
