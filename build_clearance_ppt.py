@@ -159,12 +159,12 @@ def main():
         add_textbox(slide, "Cisterna Magna", 11.7, 7.0, 1.41, 0.3, "Aptos (Body)", 12, RGBColor(255, 255, 255))
 
         # -------- Genotype/Method/Usable (Set 2) --------
-        add_textbox(slide, f"Genotype: {genotype}", 2.55, 2.4, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
-        add_textbox(slide, f"Method: {method}", 7.5, 2.4, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
-        add_textbox(slide, f"Usable: {status}", 11.65, 2.4, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
+        add_textbox(slide, f"Genotype: {genotype}", 3.5, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
+        add_textbox(slide, f"Method: {method}", 8.1, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
+        add_textbox(slide, f"Usable: {status}", 11.7, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
 
         # -------- Title box ($runno) --------
-        add_textbox(slide, runno, 2.55, 0.17, 1.5, 0.4, "Aptos Display", 16, RGBColor(0, 0, 0), bold=True)
+        add_textbox(slide, runno, 0.1, 2.85, 1.3, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0), bold=True)
 
     prs.save(args.out)
     print(f"\nSaved presentation to {args.out}")
