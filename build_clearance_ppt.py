@@ -471,7 +471,7 @@ def main():
         # -------- Bottom Labels (Set 1) --------
         add_textbox(slide, "Cisterna Magna", 2.6, 7.0, 1.41, 0.3, "Aptos (Body)", 12, RGBColor(255, 255, 255))
         add_textbox(slide, "Cerebral Spinal Fluid", 6.95, 7.0, 1.97, 0.3, "Aptos (Body)", 12, RGBColor(255, 255, 255))
-        add_textbox(slide, "Cisterna Magna", 11.7, 7.0, 1.41, 0.3, "Aptos (Body)", 12, RGBColor(255, 255, 255))
+        add_textbox(slide, "Hippocampus", 11.7, 7.0, 1.41, 0.3, "Aptos (Body)", 12, RGBColor(255, 255, 255))
 
         # -------- Genotype/Method/Usable (Set 2) [YOUR UPDATED POSITIONS] --------
         add_textbox(slide, f"Genotype: {genotype}", 3.5, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
