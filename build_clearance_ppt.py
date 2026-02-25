@@ -4,12 +4,16 @@ import os
 import glob
 import argparse
 import pandas as pd
+from datetime import datetime
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 
 
+# -----------------------------
+# CLI
+# -----------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root folder containing z<runno> subfolders")
@@ -21,6 +25,9 @@ def parse_args():
     return ap.parse_args()
 
 
+# -----------------------------
+# Excel lookups
+# -----------------------------
 def load_lookup_table(excel_path: str) -> pd.DataFrame:
     df = pd.read_excel(excel_path)
 
@@ -29,24 +36,61 @@ def load_lookup_table(excel_path: str) -> pd.DataFrame:
     if missing:
         raise RuntimeError(f"Missing required columns in Excel: {missing}")
 
-    # normalize to string for exact matching
+    # Optional (for summary)
+    # We will look for Sex column if present.
+    # Common variants: Sex, sex
+    # We'll normalize access later.
+
     df["Arunno_or_Crunno"] = df["Arunno_or_Crunno"].astype(str)
     df["Image_QA"] = df["Image_QA"].astype(str)
-
     return df
 
 
-def lookup_status(df: pd.DataFrame, runno: str) -> str:
+def lookup_row(df: pd.DataFrame, runno: str):
     matches = df[df["Arunno_or_Crunno"] == runno]
     if len(matches) == 0:
+        return None
+    return matches.iloc[0]
+
+
+def lookup_status(df: pd.DataFrame, runno: str) -> str:
+    row = lookup_row(df, runno)
+    if row is None:
         return "Maybe"
 
-    qa = str(matches.iloc[0]["Image_QA"]).strip().upper()
+    qa = str(row["Image_QA"]).strip().upper()
     if qa.startswith("U"):
         return "Yes"
     if qa.startswith("N"):
         return "No"
     return "Maybe"
+
+
+def lookup_sex(df: pd.DataFrame, runno: str) -> str:
+    """
+    Returns 'm', 'f', or '?'.
+    Looks for column 'Sex' (case-insensitive).
+    Accepts values like M/F, Male/Female, m/f.
+    """
+    row = lookup_row(df, runno)
+    if row is None:
+        return "?"
+
+    sex_col = None
+    for c in df.columns:
+        if str(c).strip().lower() == "sex":
+            sex_col = c
+            break
+
+    if sex_col is None:
+        return "?"
+
+    raw = str(row[sex_col]).strip().lower()
+    if raw in ("m", "male"):
+        return "m"
+    if raw in ("f", "female"):
+        return "f"
+    return "?"
 
 
 def parse_genotype_method(runno: str):
@@ -62,8 +106,10 @@ def parse_genotype_method(runno: str):
     return "Unknown", "Unknown"
 
 
+# -----------------------------
+# PPT helpers
+# -----------------------------
 def force_white_background(slide):
-    # Force solid white background regardless of template theme
     fill = slide.background.fill
     fill.solid()
     fill.fore_color.rgb = RGBColor(255, 255, 255)
@@ -104,6 +150,258 @@ def add_textbox(slide, text, left, top, width, height, font_name, font_size, col
     return box
 
 
+# -----------------------------
+# Slides: Title + Summary
+# -----------------------------
+def add_title_slide(prs, blank_layout):
+    slide = prs.slides.add_slide(blank_layout)
+    force_white_background(slide)
+
+    # Title
+    add_textbox(
+        slide,
+        "Brain Clearance in Mice",
+        left=0.9,
+        top=1.6,
+        width=11.6,
+        height=1.0,
+        font_name="Aptos Display",
+        font_size=44,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=True,
+    )
+
+    # Subtitle
+    add_textbox(
+        slide,
+        "Initial Quality Assurance Report",
+        left=0.95,
+        top=2.6,
+        width=11.6,
+        height=0.6,
+        font_name="Aptos Display",
+        font_size=24,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=False,
+    )
+
+    # Date (month spelled out)
+    date_str = datetime.now().strftime("%B %d, %Y")
+    add_textbox(
+        slide,
+        date_str,
+        left=0.95,
+        top=3.35,
+        width=6.5,
+        height=0.45,
+        font_name="Aptos (Body)",
+        font_size=16,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=False,
+    )
+
+    # Author
+    add_textbox(
+        slide,
+        "Dr. B.J. Anderson, Ph.D., QIAL, Duke University Medical Center",
+        left=0.95,
+        top=4.0,
+        width=12.0,
+        height=0.6,
+        font_name="Aptos (Body)",
+        font_size=16,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=False,
+    )
+
+
+def key_label_from_prefix(prefix: str):
+    prefix = prefix.upper()
+    if prefix == "A":
+        return "APOE with IV", "A"
+    if prefix == "P":
+        return "APOE with CM", "P"
+    if prefix == "C":
+        return "CVN with IV", "C"
+    if prefix == "V":
+        return "CVN with CM", "V"
+    return f"Unknown ({prefix})", prefix
+
+
+def format_bucket_lines(bucket_counts):
+    """
+    bucket_counts: dict(prefix -> dict(sex->count, total->count))
+    returns list[str] lines in A,P,C,V order.
+    """
+    order = ["A", "P", "C", "V"]
+    lines = []
+    for pref in order:
+        label, _ = key_label_from_prefix(pref)
+        info = bucket_counts.get(pref, {"m": 0, "f": 0, "?": 0, "total": 0})
+        total = info.get("total", 0)
+        m = info.get("m", 0)
+        f = info.get("f", 0)
+        q = info.get("?", 0)
+
+        sex_bits = [f"{m} m", f"{f} f"]
+        if q:
+            sex_bits.append(f"{q} ?")
+        sex_str = ", ".join(sex_bits)
+
+        lines.append(f"{label}: {total} ({sex_str})")
+    return lines
+
+
+def add_summary_slide(prs, blank_layout, summary_counts):
+    slide = prs.slides.add_slide(blank_layout)
+    force_white_background(slide)
+
+    # Title
+    add_textbox(
+        slide,
+        "Summary",
+        left=0.9,
+        top=0.55,
+        width=11.6,
+        height=0.7,
+        font_name="Aptos Display",
+        font_size=40,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=True,
+    )
+
+    # Layout regions:
+    # Left half: big "Usable Data" + lines
+    # Right half top: "Possibly Usable Data" + lines
+    # Right half mid/bot: "Unusable Data" + lines
+    left_x = 0.9
+    left_w = 6.2
+    right_x = 7.4
+    right_w = 5.6
+
+    # Usable (Yes) - center of attention
+    add_textbox(
+        slide,
+        "Usable Data:",
+        left=left_x,
+        top=1.55,
+        width=left_w,
+        height=0.5,
+        font_name="Aptos Display",
+        font_size=26,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=True,
+    )
+
+    yes_lines = format_bucket_lines(summary_counts["Yes"])
+    add_textbox(
+        slide,
+        "\n".join(yes_lines),
+        left=left_x,
+        top=2.15,
+        width=left_w,
+        height=4.6,
+        font_name="Aptos (Body)",
+        font_size=22,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=False,
+    )
+
+    # Maybe (Possibly usable) - right top
+    add_textbox(
+        slide,
+        "Possibly Usable Data:",
+        left=right_x,
+        top=1.55,
+        width=right_w,
+        height=0.45,
+        font_name="Aptos Display",
+        font_size=20,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=True,
+    )
+
+    maybe_lines = format_bucket_lines(summary_counts["Maybe"])
+    add_textbox(
+        slide,
+        "\n".join(maybe_lines),
+        left=right_x,
+        top=2.05,
+        width=right_w,
+        height=2.1,
+        font_name="Aptos (Body)",
+        font_size=16,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=False,
+    )
+
+    # No (Unusable) - right lower
+    add_textbox(
+        slide,
+        "Unusable Data:",
+        left=right_x,
+        top=4.35,
+        width=right_w,
+        height=0.45,
+        font_name="Aptos Display",
+        font_size=20,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=True,
+    )
+
+    no_lines = format_bucket_lines(summary_counts["No"])
+    add_textbox(
+        slide,
+        "\n".join(no_lines),
+        left=right_x,
+        top=4.85,
+        width=right_w,
+        height=1.7,
+        font_name="Aptos (Body)",
+        font_size=16,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=False,
+    )
+
+    # Footnote
+    add_textbox(
+        slide,
+        "*Data may be improved/made usable after motion corrections (coregistration and volume pruning).",
+        left=0.9,
+        top=7.05,
+        width=12.4,
+        height=0.35,
+        font_name="Aptos (Body)",
+        font_size=12,
+        color_rgb=RGBColor(0, 0, 0),
+        bold=False,
+    )
+
+
+def init_summary_counts():
+    # structure: counts[status][prefix]["m"/"f"/"?"/"total"]
+    counts = {}
+    for status in ("Yes", "Maybe", "No"):
+        counts[status] = {}
+        for pref in ("A", "P", "C", "V"):
+            counts[status][pref] = {"m": 0, "f": 0, "?": 0, "total": 0}
+    return counts
+
+
+def bump_counts(counts, status, prefix, sex):
+    if status not in counts:
+        return
+    if prefix not in counts[status]:
+        return
+    if sex not in ("m", "f", "?"):
+        sex = "?"
+    counts[status][prefix]["total"] += 1
+    counts[status][prefix][sex] += 1
+
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     args = parse_args()
 
@@ -111,15 +409,20 @@ def main():
 
     if args.template:
         prs = Presentation(args.template)
-        # If user provides template, we assume its size is correct and DO NOT override.
-        # (But if they still want override, they can omit --template or explicitly set below.)
+        # If you use a template, we assume its slide size is already correct and DO NOT override.
     else:
         prs = Presentation()
-        # Force slide size (python-pptx default is often 4:3, which breaks your coordinates)
+        # Force slide size so your absolute inch coordinates match what you expect
         prs.slide_width = Inches(args.slide_width)
         prs.slide_height = Inches(args.slide_height)
 
     blank_layout = prs.slide_layouts[6]  # blank
+
+    # Title slide first
+    add_title_slide(prs, blank_layout)
+
+    # Summary accumulator
+    summary_counts = init_summary_counts()
 
     # Iterate z<runno> folders
     root = args.root
@@ -138,8 +441,13 @@ def main():
 
         genotype, method = parse_genotype_method(runno)
         status = lookup_status(df, runno)
+        sex = lookup_sex(df, runno)
+        prefix = runno[0].upper()
 
-        print(f"Adding slide for {runno}")
+        # Update summary counts
+        bump_counts(summary_counts, status, prefix, sex)
+
+        print(f"Adding slide for {runno} (status={status}, sex={sex})")
 
         slide = prs.slides.add_slide(blank_layout)
         force_white_background(slide)
@@ -164,7 +472,10 @@ def main():
         add_textbox(slide, f"Usable: {status}", 11.7, 2.85, 1.83, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0))
 
         # -------- Title box ($runno) --------
-        add_textbox(slide, runno, 0.1, 2.85, 1.3, 0.37, "Aptos Display", 16, RGBColor(0, 0, 0), bold=True)
+        add_textbox(slide, runno, 2.55, 0.17, 1.5, 0.4, "Aptos Display", 16, RGBColor(0, 0, 0), bold=True)
+
+    # Summary slide last
+    add_summary_slide(prs, blank_layout, summary_counts)
 
     prs.save(args.out)
     print(f"\nSaved presentation to {args.out}")
