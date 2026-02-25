@@ -293,6 +293,8 @@ def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
 
     # Title
     title_h = 0.38
+    gap = 0.08
+
     add_textbox(
         slide, title,
         left, top, width, title_h,
@@ -301,13 +303,16 @@ def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
     )
 
     # ---- FIXED COMPACT GEOMETRY ----
-    grid_top = top + title_h + 0.08
-
     header_h = 0.40 if big else 0.32
-    row_h    = 0.85 if big else 0.55   # ← THIS is the real compression
+    row_h    = 0.85 if big else 0.55
 
-    # Total grid height is now compact and controlled
-    grid_h = header_h + 2 * row_h
+    grid_total_h = header_h + 2 * row_h
+
+    # Vertical centering within allotted block height
+    available_h = max(0.0, height - (title_h + gap))
+    offset = max(0.0, (available_h - grid_total_h) / 2.0)
+
+    grid_top = top + title_h + gap + offset
 
     label_col_w = 0.85 if big else 0.70
     data_col_w  = (width - label_col_w) / 2.0
@@ -371,7 +376,6 @@ def add_rubric(slide, title, counts_block, left, top, width, height, big=False):
                 left + label_col_w + data_col_w, grid_top + header_h + row_h, data_col_w, row_h,
                 "Aptos (Body)", count_fs, RGBColor(0,0,0),
                 False, align="center", valign="middle")
-
              
 def add_summary_slide(prs, blank_layout, summary_counts):
     slide = prs.slides.add_slide(blank_layout)
