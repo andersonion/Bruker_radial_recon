@@ -11,38 +11,13 @@ Outputs in the same folder:
     ${runno}_bfc_T2.method
     ${runno}_bfc_mask.nii.gz
     ${runno}_bfc_biasfield.nii.gz
+    ${runno}_bfc_diff_T2.nii.gz   (optional)
 
 This version:
-- auto-creates a rough foreground mask per runno
+- builds a more robust foreground mask
+- uses mouse-scale N4 defaults
 - saves the N4 bias field
-- uses more assertive N4 settings by default
 - submits one Slurm job per runno
-
-Examples
---------
-# Discover all runnos under all_niis/z*
-python submit_n4_t2_slurm.py \
-    --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
-    --discover \
-    --n4_path N4BiasFieldCorrection
-
-# Specific runnos
-python submit_n4_t2_slurm.py \
-    --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
-    --runnos 12345 12346 12347 \
-    --n4_path N4BiasFieldCorrection
-
-# Dry run
-python submit_n4_t2_slurm.py \
-    --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
-    --discover \
-    --dry_run
-
-# Overwrite prior outputs
-python submit_n4_t2_slurm.py \
-    --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
-    --discover \
-    --overwrite
 """
 
 import argparse
@@ -71,7 +46,7 @@ def discover_runnos(base_dir: Path):
     runnos = []
     for d in sorted(base_dir.glob("z*")):
         if d.is_dir():
-            runno = d.name[1:]  # strip leading z
+            runno = d.name[1:]
             if runno:
                 runnos.append(runno)
     return runnos
@@ -113,15 +88,22 @@ def build_job_script(
     mask_nii: Path,
     bias_nii: Path,
     diff_nii: Path | None,
+    tmp_otsu_nii: Path,
     n4_path: str,
     thresholdimage_path: str,
     imagemath_path: str,
+    printheader_path: str | None,
     dimension: int,
     shrink_factor: int,
     convergence: str,
     bspline: str,
     histogram_sharpening: str,
-    mask_dilate_radius: int,
+    otsu_keep_low: int,
+    otsu_keep_high: int,
+    close_radius: int,
+    dilate_radius_pre_glc: int,
+    dilate_radius_final: int,
+    fill_holes_radius: int,
     threads: int,
     job_name: str,
     log_out: Path,
@@ -162,6 +144,7 @@ in_method=""" + shell_quote(str(in_method)) + r"""
 out_method=""" + shell_quote(str(out_method)) + r"""
 mask_nii=""" + shell_quote(str(mask_nii)) + r"""
 bias_nii=""" + shell_quote(str(bias_nii)) + r"""
+tmp_otsu_nii=""" + shell_quote(str(tmp_otsu_nii)) + r"""
 """
 
     if diff_nii is not None:
@@ -175,7 +158,16 @@ bias_nii=""" + shell_quote(str(bias_nii)) + r"""
 n4_exe=""" + shell_quote(str(n4_path)) + r"""
 threshold_exe=""" + shell_quote(str(thresholdimage_path)) + r"""
 imagemath_exe=""" + shell_quote(str(imagemath_path)) + r"""
+"""
 
+    if printheader_path:
+        script += r"""printheader_exe=""" + shell_quote(str(printheader_path)) + r"""
+"""
+    else:
+        script += r"""printheader_exe=""
+"""
+
+    script += r"""
 mkdir -p "$(dirname "$out_nii")"
 
 echo "Input      : $in_nii"
@@ -192,16 +184,40 @@ if [[ ! -f "$in_nii" ]]; then
 fi
 
 echo
-echo "Creating rough foreground mask..."
-"$threshold_exe" """ + str(dimension) + r""" "$in_nii" "$mask_nii" Otsu 4
+echo "Header / spacing check:"
+if [[ -n "$printheader_exe" ]]; then
+    "$printheader_exe" "$in_nii" 1 || true
+else
+    echo "PrintHeader not provided; skipping explicit header dump."
+fi
+
+echo
+echo "Creating robust foreground mask..."
+rm -f "$tmp_otsu_nii" "$mask_nii"
+
+# 1) Otsu label map
+"$threshold_exe" """ + str(dimension) + r""" "$in_nii" "$tmp_otsu_nii" Otsu 4
+
+# 2) Keep upper Otsu classes (foreground-ish)
+"$threshold_exe" """ + str(dimension) + r""" "$tmp_otsu_nii" "$mask_nii" """ + str(otsu_keep_low) + r""" """ + str(otsu_keep_high) + r""" 1 0
+
+# 3) Morphology to preserve low-signal anterior structures and smooth the mask
+"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" MC "$mask_nii" """ + str(close_radius) + r"""
+"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" MD "$mask_nii" """ + str(dilate_radius_pre_glc) + r"""
+
+# 4) Fill holes
+"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" FillHoles "$mask_nii" """ + str(fill_holes_radius) + r"""
+
+# 5) Keep largest connected component
+"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" GetLargestComponent "$mask_nii"
+
+# 6) Final dilation to avoid clipping bulb / edge tissue
+"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" MD "$mask_nii" """ + str(dilate_radius_final) + r"""
 
 if [[ ! -f "$mask_nii" ]]; then
     echo "ERROR: Mask creation failed: $mask_nii" >&2
     exit 1
 fi
-
-"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" MD "$mask_nii" """ + str(mask_dilate_radius) + r"""
-"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" GetLargestComponent "$mask_nii"
 
 echo
 echo "Running N4BiasFieldCorrection..."
@@ -214,6 +230,7 @@ cmd=(
     -c """ + shell_quote(convergence) + r"""
     -b """ + shell_quote(bspline) + r"""
     -t """ + shell_quote(histogram_sharpening) + r"""
+    -r 1
     -o "[""$out_nii"",""$bias_nii""]"
 )
 
@@ -244,6 +261,8 @@ if [[ -n "$diff_nii" ]]; then
     "$imagemath_exe" """ + str(dimension) + r""" "$diff_nii" - "$out_nii" "$in_nii"
 fi
 
+rm -f "$tmp_otsu_nii"
+
 echo "===== JOB END ====="
 date
 """
@@ -261,20 +280,9 @@ def main():
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--runnos",
-        nargs="+",
-        help="One or more runnos."
-    )
-    group.add_argument(
-        "--runno_file",
-        help="Text file containing one runno per line."
-    )
-    group.add_argument(
-        "--discover",
-        action="store_true",
-        help="Discover runnos from z* directories under base_dir."
-    )
+    group.add_argument("--runnos", nargs="+", help="One or more runnos.")
+    group.add_argument("--runno_file", help="Text file containing one runno per line.")
+    group.add_argument("--discover", action="store_true", help="Discover runnos from z* directories under base_dir.")
 
     parser.add_argument(
         "--sbatch_dir",
@@ -282,103 +290,36 @@ def main():
         help="Directory to store sbatch scripts and logs. Default: <base_dir>/n4_t2_sbatch"
     )
 
-    parser.add_argument(
-        "--n4_path",
-        default="N4BiasFieldCorrection",
-        help="Path to N4BiasFieldCorrection executable."
-    )
-    parser.add_argument(
-        "--thresholdimage_path",
-        default="ThresholdImage",
-        help="Path to ThresholdImage executable."
-    )
-    parser.add_argument(
-        "--imagemath_path",
-        default="ImageMath",
-        help="Path to ImageMath executable."
-    )
+    parser.add_argument("--n4_path", default="N4BiasFieldCorrection", help="Path to N4BiasFieldCorrection executable.")
+    parser.add_argument("--thresholdimage_path", default="ThresholdImage", help="Path to ThresholdImage executable.")
+    parser.add_argument("--imagemath_path", default="ImageMath", help="Path to ImageMath executable.")
+    parser.add_argument("--printheader_path", default="PrintHeader", help="Path to PrintHeader executable.")
 
-    parser.add_argument(
-        "--dimension",
-        type=int,
-        default=3,
-        choices=[2, 3, 4],
-        help="Image dimension. Default: 3"
-    )
+    parser.add_argument("--dimension", type=int, default=3, choices=[2, 3, 4], help="Image dimension. Default: 3")
 
-    # More assertive defaults than before
-    parser.add_argument(
-        "--shrink_factor",
-        type=int,
-        default=2,
-        help="N4 shrink factor. Default: 2"
-    )
-    parser.add_argument(
-        "--convergence",
-        default="[100x100x70x50,1e-7]",
-        help='N4 convergence string. Default: "[100x100x70x50,1e-7]"'
-    )
-    parser.add_argument(
-        "--bspline",
-        default="[150]",
-        help='N4 bspline string. Default: "[150]"'
-    )
-    parser.add_argument(
-        "--histogram_sharpening",
-        default="[0.15,0.01,200]",
-        help='N4 histogram sharpening string. Default: "[0.15,0.01,200]"'
-    )
-    parser.add_argument(
-        "--mask_dilate_radius",
-        type=int,
-        default=1,
-        help="Mask dilation radius after Otsu thresholding. Default: 1"
-    )
+    # Mouse-scale defaults
+    parser.add_argument("--shrink_factor", type=int, default=1, help="N4 shrink factor. Default: 1")
+    parser.add_argument("--convergence", default="[200x200x100x50,1e-8]", help='N4 convergence string.')
+    parser.add_argument("--bspline", default="[8]", help='N4 bspline distance in physical units. Mouse-scale default: "[8]"')
+    parser.add_argument("--histogram_sharpening", default="[0.15,0.01,200]", help='N4 histogram sharpening string.')
 
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=4,
-        help="ITK thread count inside each job. Default: 4"
-    )
-    parser.add_argument(
-        "--cpus",
-        type=int,
-        default=4,
-        help="Slurm cpus-per-task. Default: 4"
-    )
-    parser.add_argument(
-        "--mem_gb",
-        type=int,
-        default=16,
-        help="Slurm memory in GB. Default: 16"
-    )
-    parser.add_argument(
-        "--time",
-        default="04:00:00",
-        help='Slurm time limit. Default: "04:00:00"'
-    )
-    parser.add_argument(
-        "--partition",
-        default=None,
-        help="Optional Slurm partition."
-    )
+    # Mask settings
+    parser.add_argument("--otsu_keep_low", type=int, default=2, help="Lowest Otsu class to keep. Default: 2")
+    parser.add_argument("--otsu_keep_high", type=int, default=4, help="Highest Otsu class to keep. Default: 4")
+    parser.add_argument("--close_radius", type=int, default=2, help="Morphological closing radius. Default: 2")
+    parser.add_argument("--dilate_radius_pre_glc", type=int, default=1, help="Pre-GLC dilation radius. Default: 1")
+    parser.add_argument("--fill_holes_radius", type=int, default=2, help="Fill-holes radius. Default: 2")
+    parser.add_argument("--dilate_radius_final", type=int, default=2, help="Final dilation radius. Default: 2")
 
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing outputs."
-    )
-    parser.add_argument(
-        "--save_diff",
-        action="store_true",
-        help="Also save corrected-minus-original difference image as ${runno}_bfc_diff_T2.nii.gz"
-    )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Write sbatch scripts but do not submit."
-    )
+    parser.add_argument("--threads", type=int, default=4, help="ITK thread count inside each job.")
+    parser.add_argument("--cpus", type=int, default=4, help="Slurm cpus-per-task.")
+    parser.add_argument("--mem_gb", type=int, default=16, help="Slurm memory in GB.")
+    parser.add_argument("--time", default="04:00:00", help='Slurm time limit.')
+    parser.add_argument("--partition", default=None, help="Optional Slurm partition.")
+
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
+    parser.add_argument("--save_diff", action="store_true", help="Also save corrected-minus-original difference image.")
+    parser.add_argument("--dry_run", action="store_true", help="Write sbatch scripts but do not submit.")
 
     args = parser.parse_args()
 
@@ -409,7 +350,10 @@ def main():
     print(f"[INFO] base_dir    : {base_dir}")
     print(f"[INFO] sbatch_dir  : {sbatch_dir}")
     print(f"[INFO] runno count : {len(runnos)}")
-    print(f"[INFO] N4 defaults : shrink={args.shrink_factor}, convergence={args.convergence}, bspline={args.bspline}")
+    print(f"[INFO] Mouse-scale N4 defaults:")
+    print(f"       shrink      = {args.shrink_factor}")
+    print(f"       convergence = {args.convergence}")
+    print(f"       bspline     = {args.bspline}")
 
     n_prepared = 0
     n_submitted = 0
@@ -425,6 +369,7 @@ def main():
         out_method = run_dir / f"{runno}_bfc_T2.method"
         mask_nii = run_dir / f"{runno}_bfc_mask.nii.gz"
         bias_nii = run_dir / f"{runno}_bfc_biasfield.nii.gz"
+        tmp_otsu_nii = run_dir / f"{runno}_bfc_otsu_tmp.nii.gz"
         diff_nii = run_dir / f"{runno}_bfc_diff_T2.nii.gz" if args.save_diff else None
 
         if not in_nii.exists():
@@ -455,15 +400,22 @@ def main():
             mask_nii=mask_nii,
             bias_nii=bias_nii,
             diff_nii=diff_nii,
+            tmp_otsu_nii=tmp_otsu_nii,
             n4_path=args.n4_path,
             thresholdimage_path=args.thresholdimage_path,
             imagemath_path=args.imagemath_path,
+            printheader_path=args.printheader_path,
             dimension=args.dimension,
             shrink_factor=args.shrink_factor,
             convergence=args.convergence,
             bspline=args.bspline,
             histogram_sharpening=args.histogram_sharpening,
-            mask_dilate_radius=args.mask_dilate_radius,
+            otsu_keep_low=args.otsu_keep_low,
+            otsu_keep_high=args.otsu_keep_high,
+            close_radius=args.close_radius,
+            dilate_radius_pre_glc=args.dilate_radius_pre_glc,
+            dilate_radius_final=args.dilate_radius_final,
+            fill_holes_radius=args.fill_holes_radius,
             threads=args.threads,
             job_name=job_name,
             log_out=log_out,
