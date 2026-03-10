@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""
-submit_n4_t2_slurm.py
-
-Submit one Slurm job per runno to run ANTs N4 bias field correction on:
-
-    all_niis/z${runno}/${runno}_T2.nii.gz
-
-Outputs in the same folder:
-    ${runno}_bfc_T2.nii.gz
-    ${runno}_bfc_T2.method
-    ${runno}_bfc_mask.nii.gz                 # pre-N4 support mask
-    ${runno}_bfc_biasfield.nii.gz
-    ${runno}_bfc_T2_mask.nii.gz              # production mask from BFC, constrained by premask
-    ${runno}_bfc_T2_masked.nii.gz            # BFC image zeroed outside premask
-    ${runno}_bfc_diff_T2.nii.gz              # optional
-
-This version:
-- builds a generous pre-N4 support mask from raw T2
-- uses mouse-scale N4 defaults
-- saves the N4 bias field
-- builds a production mask from BFC inside the premask only
-- supports an optional tight-mask erosion
-- avoids rerunning N4 if corrected output already exists and overwrite is off
-- submits one Slurm job per runno
-"""
 
 import argparse
 import re
@@ -41,20 +16,19 @@ def read_runnos_from_file(path: Path):
     with open(path, "r") as f:
         for line in f:
             s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            runnos.append(s)
+            if s and not s.startswith("#"):
+                runnos.append(s)
     return runnos
 
 
 def discover_runnos(base_dir: Path):
-    runnos = []
+    out = []
     for d in sorted(base_dir.glob("z*")):
         if d.is_dir():
             runno = d.name[1:]
             if runno:
-                runnos.append(runno)
-    return runnos
+                out.append(runno)
+    return out
 
 
 def unique_preserve_order(items):
@@ -84,6 +58,127 @@ def submit_job(script_path: Path):
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
+def write_prodmask_helper(helper_path: Path):
+    helper_code = r'''#!/usr/bin/env python3
+import argparse
+import sys
+import numpy as np
+import nibabel as nib
+from scipy.ndimage import (
+    binary_closing,
+    binary_fill_holes,
+    binary_dilation,
+    binary_erosion,
+    center_of_mass,
+    gaussian_filter,
+    label,
+    generate_binary_structure,
+)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--bfc", required=True)
+    p.add_argument("--support_mask", required=True)
+    p.add_argument("--out_mask", required=True)
+    p.add_argument("--out_masked_bfc", required=True)
+    p.add_argument("--norm_low_pct", type=float, default=2.0)
+    p.add_argument("--norm_high_pct", type=float, default=98.0)
+    p.add_argument("--threshold_frac", type=float, default=0.12)
+    p.add_argument("--smooth_sigma", type=float, default=0.5)
+    p.add_argument("--close_iters", type=int, default=2)
+    p.add_argument("--dilate_iters", type=int, default=1)
+    p.add_argument("--tight_mask", action="store_true")
+    p.add_argument("--tight_erode_iters", type=int, default=1)
+    args = p.parse_args()
+
+    bfc_img = nib.load(args.bfc)
+    sup_img = nib.load(args.support_mask)
+
+    bfc = bfc_img.get_fdata(dtype=np.float32)
+    support = sup_img.get_fdata() > 0
+
+    if not np.any(support):
+        raise RuntimeError("Support mask is empty.")
+
+    masked_bfc = np.where(support, bfc, 0.0).astype(np.float32)
+
+    smoothed = gaussian_filter(masked_bfc, sigma=args.smooth_sigma)
+
+    vals = smoothed[support]
+    vals = vals[np.isfinite(vals)]
+
+    if vals.size == 0:
+        raise RuntimeError("No finite values inside support mask.")
+
+    p_lo = np.percentile(vals, args.norm_low_pct)
+    p_hi = np.percentile(vals, args.norm_high_pct)
+
+    if p_hi <= p_lo:
+        raise RuntimeError(f"Bad percentile range: low={p_lo}, high={p_hi}")
+
+    norm = (smoothed - p_lo) / (p_hi - p_lo)
+    norm = np.clip(norm, 0.0, 1.0)
+
+    # Threshold only inside support mask
+    cand = (norm >= args.threshold_frac) & support
+
+    if not np.any(cand):
+        # Fallback: just use support mask if thresholding somehow collapses
+        cand = support.copy()
+
+    struct = generate_binary_structure(3, 2)
+    lab, nlab = label(cand, structure=struct)
+
+    if nlab == 0:
+        final_mask = support.copy()
+    else:
+        com = center_of_mass(support.astype(np.uint8))
+        com_idx = tuple(int(round(x)) for x in com)
+        com_idx = tuple(
+            min(max(0, com_idx[i]), lab.shape[i] - 1) for i in range(3)
+        )
+
+        chosen_label = lab[com_idx]
+
+        if chosen_label == 0:
+            # If COM falls in a gap, choose the labeled component with greatest overlap
+            # with the support mask center neighborhood.
+            overlaps = []
+            for k in range(1, nlab + 1):
+                comp = (lab == k)
+                overlaps.append((np.count_nonzero(comp & support), k))
+            overlaps.sort(reverse=True)
+            chosen_label = overlaps[0][1]
+
+        final_mask = (lab == chosen_label)
+
+    final_mask = binary_closing(final_mask, structure=struct, iterations=args.close_iters)
+    final_mask = binary_fill_holes(final_mask)
+    final_mask = binary_dilation(final_mask, structure=struct, iterations=args.dilate_iters)
+
+    # Always constrain back to support mask
+    final_mask = final_mask & support
+
+    if args.tight_mask:
+        final_mask = binary_erosion(
+            final_mask, structure=struct, iterations=args.tight_erode_iters
+        )
+
+    out_mask = final_mask.astype(np.uint8)
+    out_masked_bfc = np.where(out_mask > 0, bfc, 0.0).astype(np.float32)
+
+    nib.save(nib.Nifti1Image(out_mask, bfc_img.affine, bfc_img.header), args.out_mask)
+    nib.save(nib.Nifti1Image(out_masked_bfc, bfc_img.affine, bfc_img.header), args.out_masked_bfc)
+
+
+if __name__ == "__main__":
+    main()
+'''
+    helper_path.write_text(helper_code)
+    helper_path.chmod(0o755)
+
+
 def build_job_script(
     runno: str,
     in_nii: Path,
@@ -94,15 +189,12 @@ def build_job_script(
     bias_nii: Path,
     prodmask_nii: Path,
     masked_bfc_nii: Path,
-    smoothed_masked_bfc_nii: Path,
     diff_nii: Path | None,
     tmp_otsu_pre_nii: Path,
-    tmp_otsu_post_nii: Path,
+    helper_py: Path,
     n4_path: str,
     thresholdimage_path: str,
     imagemath_path: str,
-    multiplyimages_path: str,
-    smoothimage_path: str,
     printheader_path: str | None,
     dimension: int,
     shrink_factor: int,
@@ -115,14 +207,14 @@ def build_job_script(
     pre_dilate_radius_pre_glc: int,
     pre_fill_holes_radius: int,
     pre_dilate_radius_final: int,
-    post_otsu_keep_low: int,
-    post_otsu_keep_high: int,
-    post_close_radius: int,
-    post_fill_holes_radius: int,
-    post_dilate_radius_final: int,
-    post_smoothing_sigma: float,
+    prod_norm_low_pct: float,
+    prod_norm_high_pct: float,
+    prod_threshold_frac: float,
+    prod_smooth_sigma: float,
+    prod_close_iters: int,
+    prod_dilate_iters: int,
     tight_mask: bool,
-    tight_mask_erode_radius: int,
+    tight_mask_erode_iters: int,
     threads: int,
     job_name: str,
     log_out: Path,
@@ -142,7 +234,6 @@ def build_job_script(
         f"#SBATCH --mem={mem_gb}G",
         f"#SBATCH --cpus-per-task={cpus}",
     ]
-
     if partition:
         sbatch_lines.append(f"#SBATCH --partition={partition}")
 
@@ -166,9 +257,8 @@ premask_nii=""" + shell_quote(str(premask_nii)) + r"""
 bias_nii=""" + shell_quote(str(bias_nii)) + r"""
 prodmask_nii=""" + shell_quote(str(prodmask_nii)) + r"""
 masked_bfc_nii=""" + shell_quote(str(masked_bfc_nii)) + r"""
-smoothed_masked_bfc_nii=""" + shell_quote(str(smoothed_masked_bfc_nii)) + r"""
 tmp_otsu_pre_nii=""" + shell_quote(str(tmp_otsu_pre_nii)) + r"""
-tmp_otsu_post_nii=""" + shell_quote(str(tmp_otsu_post_nii)) + r"""
+helper_py=""" + shell_quote(str(helper_py)) + r"""
 overwrite_flag=""" + ("1" if overwrite else "0") + r"""
 tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
 """
@@ -184,10 +274,7 @@ tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
 n4_exe=""" + shell_quote(str(n4_path)) + r"""
 threshold_exe=""" + shell_quote(str(thresholdimage_path)) + r"""
 imagemath_exe=""" + shell_quote(str(imagemath_path)) + r"""
-multiply_exe=""" + shell_quote(str(multiplyimages_path)) + r"""
-smooth_exe=""" + shell_quote(str(smoothimage_path)) + r"""
 """
-
     if printheader_path:
         script += r"""printheader_exe=""" + shell_quote(str(printheader_path)) + r"""
 """
@@ -197,16 +284,6 @@ smooth_exe=""" + shell_quote(str(smoothimage_path)) + r"""
 
     script += r"""
 mkdir -p "$(dirname "$out_nii")"
-
-echo "Input             : $in_nii"
-echo "BFC output        : $out_nii"
-echo "Pre-N4 mask       : $premask_nii"
-echo "Bias field        : $bias_nii"
-echo "Masked BFC        : $masked_bfc_nii"
-echo "Production mask   : $prodmask_nii"
-if [[ -n "$diff_nii" ]]; then
-    echo "Diff image        : $diff_nii"
-fi
 
 if [[ ! -f "$in_nii" ]]; then
     echo "ERROR: Input not found: $in_nii" >&2
@@ -258,51 +335,6 @@ make_support_mask() {
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" FillHoles "$dst_mask" """ + str(pre_fill_holes_radius) + r"""
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" GetLargestComponent "$dst_mask"
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(pre_dilate_radius_final) + r"""
-
-    if [[ ! -f "$dst_mask" ]]; then
-        echo "ERROR: Support mask creation failed: $dst_mask" >&2
-        exit 1
-    fi
-}
-
-make_production_mask() {
-    local src_bfc="$1"
-    local support_mask="$2"
-    local masked_bfc="$3"
-    local smoothed_masked_bfc="$4"
-    local tmp_otsu="$5"
-    local dst_mask="$6"
-
-    rm -f "$masked_bfc" "$smoothed_masked_bfc" "$tmp_otsu" "$dst_mask"
-
-    # Constrain production mask estimation to the existing support mask
-    "$multiply_exe" """ + str(dimension) + r""" "$src_bfc" "$support_mask" "$masked_bfc"
-
-    # Small smoothing to stabilize Otsu on the corrected image
-    "$smooth_exe" """ + str(dimension) + r""" "$masked_bfc" """ + str(post_smoothing_sigma) + r""" "$smoothed_masked_bfc"
-
-    # Otsu on masked/smoothed BFC only
-    "$threshold_exe" """ + str(dimension) + r""" "$smoothed_masked_bfc" "$tmp_otsu" Otsu 4
-
-    # Keep all non-background classes inside the support mask
-    "$threshold_exe" """ + str(dimension) + r""" "$tmp_otsu" "$dst_mask" """ + str(post_otsu_keep_low) + r""" """ + str(post_otsu_keep_high) + r""" 1 0
-
-    # Re-intersect with support mask so slab/background junk can never come back
-    "$multiply_exe" """ + str(dimension) + r""" "$dst_mask" "$support_mask" "$dst_mask"
-
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MC "$dst_mask" """ + str(post_close_radius) + r"""
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" FillHoles "$dst_mask" """ + str(post_fill_holes_radius) + r"""
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" GetLargestComponent "$dst_mask"
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(post_dilate_radius_final) + r"""
-
-    if [[ "$tight_mask_flag" == "1" ]]; then
-        "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" ME "$dst_mask" """ + str(tight_mask_erode_radius) + r"""
-    fi
-
-    if [[ ! -f "$dst_mask" ]]; then
-        echo "ERROR: Production mask creation failed: $dst_mask" >&2
-        exit 1
-    fi
 }
 
 if [[ "$need_n4" == "1" ]]; then
@@ -324,26 +356,17 @@ if [[ "$need_n4" == "1" ]]; then
         -r 1
         -o "[""$out_nii"",""$bias_nii""]"
     )
-
     printf '  %q' "${cmd[@]}"
     echo
     "${cmd[@]}"
 
-    if [[ ! -f "$out_nii" ]]; then
-        echo "ERROR: Expected corrected output not found: $out_nii" >&2
-        exit 1
-    fi
-
-    if [[ ! -f "$bias_nii" ]]; then
-        echo "ERROR: Expected bias field not found: $bias_nii" >&2
+    if [[ ! -f "$out_nii" || ! -f "$bias_nii" ]]; then
+        echo "ERROR: N4 outputs missing." >&2
         exit 1
     fi
 
     if [[ -f "$in_method" ]]; then
         cp -f "$in_method" "$out_method"
-        echo "Copied method file: $out_method"
-    else
-        echo "WARNING: Method file not found, skipping copy: $in_method" >&2
     fi
 else
     echo
@@ -352,39 +375,53 @@ fi
 
 if [[ "$need_prodmask" == "1" ]]; then
     if [[ ! -f "$out_nii" ]]; then
-        echo "ERROR: Cannot create production mask because corrected image is missing: $out_nii" >&2
+        echo "ERROR: Missing corrected image for production mask: $out_nii" >&2
         exit 1
     fi
     if [[ ! -f "$premask_nii" ]]; then
-        echo "ERROR: Cannot create production mask because support mask is missing: $premask_nii" >&2
+        echo "ERROR: Missing support mask for production mask: $premask_nii" >&2
         exit 1
     fi
 
     echo
-    echo "Creating production mask from BFC inside support mask..."
-    make_production_mask \
-        "$out_nii" \
-        "$premask_nii" \
-        "$masked_bfc_nii" \
-        "$smoothed_masked_bfc_nii" \
-        "$tmp_otsu_post_nii" \
-        "$prodmask_nii"
+    echo "Creating seeded/support-constrained production mask..."
+    prod_cmd=(
+        python3 "$helper_py"
+        --bfc "$out_nii"
+        --support_mask "$premask_nii"
+        --out_mask "$prodmask_nii"
+        --out_masked_bfc "$masked_bfc_nii"
+        --norm_low_pct """ + str(prod_norm_low_pct) + r"""
+        --norm_high_pct """ + str(prod_norm_high_pct) + r"""
+        --threshold_frac """ + str(prod_threshold_frac) + r"""
+        --smooth_sigma """ + str(prod_smooth_sigma) + r"""
+        --close_iters """ + str(prod_close_iters) + r"""
+        --dilate_iters """ + str(prod_dilate_iters) + r"""
+        --tight_erode_iters """ + str(tight_mask_erode_iters) + r"""
+    )
+
+    if [[ "$tight_mask_flag" == "1" ]]; then
+        prod_cmd+=( --tight_mask )
+    fi
+
+    printf '  %q' "${prod_cmd[@]}"
+    echo
+    "${prod_cmd[@]}"
+
+    if [[ ! -f "$prodmask_nii" ]]; then
+        echo "ERROR: Production mask was not created." >&2
+        exit 1
+    fi
 else
     echo
     echo "Skipping production mask stage; outputs exist and overwrite is off."
 fi
 
 if [[ "$need_diff" == "1" ]]; then
-    if [[ ! -f "$out_nii" ]]; then
-        echo "ERROR: Cannot create diff image because corrected image is missing: $out_nii" >&2
-        exit 1
-    fi
-    echo
-    echo "Creating difference image..."
     "$imagemath_exe" """ + str(dimension) + r""" "$diff_nii" - "$out_nii" "$in_nii"
 fi
 
-rm -f "$tmp_otsu_pre_nii" "$tmp_otsu_post_nii" "$smoothed_masked_bfc_nii"
+rm -f "$tmp_otsu_pre_nii"
 
 echo "===== JOB END ====="
 date
@@ -393,64 +430,59 @@ date
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Submit one Slurm job per runno for N4 bias field correction of T2 images."
-    )
-    parser.add_argument("--base_dir", required=True, help="Path to all_niis directory.")
+    p = argparse.ArgumentParser()
+    p.add_argument("--base_dir", required=True)
 
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--runnos", nargs="+", help="One or more runnos.")
-    group.add_argument("--runno_file", help="Text file containing one runno per line.")
-    group.add_argument("--discover", action="store_true", help="Discover runnos from z* directories under base_dir.")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--runnos", nargs="+")
+    group.add_argument("--runno_file")
+    group.add_argument("--discover", action="store_true")
 
-    parser.add_argument("--sbatch_dir", default=None, help="Directory to store sbatch scripts and logs. Default: <base_dir>/n4_t2_sbatch")
+    p.add_argument("--sbatch_dir", default=None)
 
-    parser.add_argument("--n4_path", default="N4BiasFieldCorrection", help="Path to N4BiasFieldCorrection executable.")
-    parser.add_argument("--thresholdimage_path", default="ThresholdImage", help="Path to ThresholdImage executable.")
-    parser.add_argument("--imagemath_path", default="ImageMath", help="Path to ImageMath executable.")
-    parser.add_argument("--multiplyimages_path", default="MultiplyImages", help="Path to MultiplyImages executable.")
-    parser.add_argument("--smoothimage_path", default="SmoothImage", help="Path to SmoothImage executable.")
-    parser.add_argument("--printheader_path", default="PrintHeader", help="Path to PrintHeader executable.")
+    p.add_argument("--n4_path", default="N4BiasFieldCorrection")
+    p.add_argument("--thresholdimage_path", default="ThresholdImage")
+    p.add_argument("--imagemath_path", default="ImageMath")
+    p.add_argument("--printheader_path", default="PrintHeader")
 
-    parser.add_argument("--dimension", type=int, default=3, choices=[2, 3, 4], help="Image dimension. Default: 3")
+    p.add_argument("--dimension", type=int, default=3, choices=[2, 3, 4])
 
-    # Mouse-scale defaults
-    parser.add_argument("--shrink_factor", type=int, default=1, help="N4 shrink factor. Default: 1")
-    parser.add_argument("--convergence", default="[200x200x100x50,1e-8]", help='N4 convergence string.')
-    parser.add_argument("--bspline", default="[8]", help='N4 bspline distance in physical units.')
-    parser.add_argument("--histogram_sharpening", default="[0.15,0.01,200]", help='N4 histogram sharpening string.')
+    # Mouse-scale N4 defaults
+    p.add_argument("--shrink_factor", type=int, default=1)
+    p.add_argument("--convergence", default="[200x200x100x50,1e-8]")
+    p.add_argument("--bspline", default="[8]")
+    p.add_argument("--histogram_sharpening", default="[0.15,0.01,200]")
 
-    # Pre-N4 support mask: generous
-    parser.add_argument("--pre_otsu_keep_low", type=int, default=2)
-    parser.add_argument("--pre_otsu_keep_high", type=int, default=4)
-    parser.add_argument("--pre_close_radius", type=int, default=2)
-    parser.add_argument("--pre_dilate_radius_pre_glc", type=int, default=1)
-    parser.add_argument("--pre_fill_holes_radius", type=int, default=2)
-    parser.add_argument("--pre_dilate_radius_final", type=int, default=2)
+    # Pre-mask
+    p.add_argument("--pre_otsu_keep_low", type=int, default=2)
+    p.add_argument("--pre_otsu_keep_high", type=int, default=4)
+    p.add_argument("--pre_close_radius", type=int, default=2)
+    p.add_argument("--pre_dilate_radius_pre_glc", type=int, default=1)
+    p.add_argument("--pre_fill_holes_radius", type=int, default=2)
+    p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
-    # Post-N4 production mask: constrained inside support mask
-    parser.add_argument("--post_otsu_keep_low", type=int, default=1)
-    parser.add_argument("--post_otsu_keep_high", type=int, default=4)
-    parser.add_argument("--post_close_radius", type=int, default=1)
-    parser.add_argument("--post_fill_holes_radius", type=int, default=2)
-    parser.add_argument("--post_dilate_radius_final", type=int, default=1)
-    parser.add_argument("--post_smoothing_sigma", type=float, default=0.5)
+    # Production mask refinement
+    p.add_argument("--prod_norm_low_pct", type=float, default=2.0)
+    p.add_argument("--prod_norm_high_pct", type=float, default=98.0)
+    p.add_argument("--prod_threshold_frac", type=float, default=0.12)
+    p.add_argument("--prod_smooth_sigma", type=float, default=0.5)
+    p.add_argument("--prod_close_iters", type=int, default=2)
+    p.add_argument("--prod_dilate_iters", type=int, default=1)
 
-    # Tight mask mode
-    parser.add_argument("--tight_mask", action="store_true", help="Apply a final erosion to the production mask.")
-    parser.add_argument("--tight_mask_erode_radius", type=int, default=1, help="Final erosion radius for tight mask mode.")
+    p.add_argument("--tight_mask", action="store_true")
+    p.add_argument("--tight_mask_erode_iters", type=int, default=1)
 
-    parser.add_argument("--threads", type=int, default=4, help="ITK thread count inside each job.")
-    parser.add_argument("--cpus", type=int, default=4, help="Slurm cpus-per-task.")
-    parser.add_argument("--mem_gb", type=int, default=16, help="Slurm memory in GB.")
-    parser.add_argument("--time", default="04:00:00", help="Slurm time limit.")
-    parser.add_argument("--partition", default=None, help="Optional Slurm partition.")
+    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--cpus", type=int, default=4)
+    p.add_argument("--mem_gb", type=int, default=16)
+    p.add_argument("--time", default="04:00:00")
+    p.add_argument("--partition", default=None)
 
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
-    parser.add_argument("--save_diff", action="store_true", help="Also save corrected-minus-original difference image.")
-    parser.add_argument("--dry_run", action="store_true", help="Write sbatch scripts but do not submit.")
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--save_diff", action="store_true")
+    p.add_argument("--dry_run", action="store_true")
 
-    args = parser.parse_args()
+    args = p.parse_args()
 
     base_dir = Path(args.base_dir).expanduser().resolve()
     if not base_dir.exists():
@@ -465,7 +497,6 @@ def main():
         runnos = discover_runnos(base_dir)
 
     runnos = unique_preserve_order(runnos)
-
     if not runnos:
         eprint("[ERROR] No runnos found.")
         return 1
@@ -475,6 +506,9 @@ def main():
     logs_dir = sbatch_dir / "logs"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
+
+    helper_py = sbatch_dir / "make_prod_mask.py"
+    write_prodmask_helper(helper_py)
 
     print(f"[INFO] base_dir    : {base_dir}")
     print(f"[INFO] sbatch_dir  : {sbatch_dir}")
@@ -496,9 +530,7 @@ def main():
         bias_nii = run_dir / f"{runno}_bfc_biasfield.nii.gz"
         prodmask_nii = run_dir / f"{runno}_bfc_T2_mask.nii.gz"
         masked_bfc_nii = run_dir / f"{runno}_bfc_T2_masked.nii.gz"
-        smoothed_masked_bfc_nii = run_dir / f"{runno}_bfc_T2_masked_smooth.nii.gz"
         tmp_otsu_pre_nii = run_dir / f"{runno}_bfc_otsu_pre_tmp.nii.gz"
-        tmp_otsu_post_nii = run_dir / f"{runno}_bfc_otsu_post_tmp.nii.gz"
         diff_nii = run_dir / f"{runno}_bfc_diff_T2.nii.gz" if args.save_diff else None
 
         if not in_nii.exists():
@@ -509,8 +541,7 @@ def main():
         if not args.overwrite:
             have_core = out_nii.exists() and bias_nii.exists() and premask_nii.exists()
             have_prodmask = prodmask_nii.exists() and masked_bfc_nii.exists()
-            have_diff = (True if diff_nii is None else diff_nii.exists())
-
+            have_diff = True if diff_nii is None else diff_nii.exists()
             if have_core and have_prodmask and have_diff:
                 print(f"[SKIP] All requested outputs already exist for runno {runno}")
                 n_skipped += 1
@@ -531,15 +562,12 @@ def main():
             bias_nii=bias_nii,
             prodmask_nii=prodmask_nii,
             masked_bfc_nii=masked_bfc_nii,
-            smoothed_masked_bfc_nii=smoothed_masked_bfc_nii,
             diff_nii=diff_nii,
             tmp_otsu_pre_nii=tmp_otsu_pre_nii,
-            tmp_otsu_post_nii=tmp_otsu_post_nii,
+            helper_py=helper_py,
             n4_path=args.n4_path,
             thresholdimage_path=args.thresholdimage_path,
             imagemath_path=args.imagemath_path,
-            multiplyimages_path=args.multiplyimages_path,
-            smoothimage_path=args.smoothimage_path,
             printheader_path=args.printheader_path,
             dimension=args.dimension,
             shrink_factor=args.shrink_factor,
@@ -552,14 +580,14 @@ def main():
             pre_dilate_radius_pre_glc=args.pre_dilate_radius_pre_glc,
             pre_fill_holes_radius=args.pre_fill_holes_radius,
             pre_dilate_radius_final=args.pre_dilate_radius_final,
-            post_otsu_keep_low=args.post_otsu_keep_low,
-            post_otsu_keep_high=args.post_otsu_keep_high,
-            post_close_radius=args.post_close_radius,
-            post_fill_holes_radius=args.post_fill_holes_radius,
-            post_dilate_radius_final=args.post_dilate_radius_final,
-            post_smoothing_sigma=args.post_smoothing_sigma,
+            prod_norm_low_pct=args.prod_norm_low_pct,
+            prod_norm_high_pct=args.prod_norm_high_pct,
+            prod_threshold_frac=args.prod_threshold_frac,
+            prod_smooth_sigma=args.prod_smooth_sigma,
+            prod_close_iters=args.prod_close_iters,
+            prod_dilate_iters=args.prod_dilate_iters,
             tight_mask=args.tight_mask,
-            tight_mask_erode_radius=args.tight_mask_erode_radius,
+            tight_mask_erode_iters=args.tight_mask_erode_iters,
             threads=args.threads,
             job_name=job_name,
             log_out=log_out,
