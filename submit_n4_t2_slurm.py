@@ -6,36 +6,43 @@ Submit one Slurm job per runno to run ANTs N4 bias field correction on:
 
     all_niis/z${runno}/${runno}_T2.nii.gz
 
-Output:
-    all_niis/z${runno}/${runno}_bfc_T2.nii.gz
+Outputs in the same folder:
+    ${runno}_bfc_T2.nii.gz
+    ${runno}_bfc_T2.method
+    ${runno}_bfc_mask.nii.gz
+    ${runno}_bfc_biasfield.nii.gz
 
-Also copies:
-    all_niis/z${runno}/${runno}_T2.method
-to:
-    all_niis/z${runno}/${runno}_bfc_T2.method
+This version:
+- auto-creates a rough foreground mask per runno
+- saves the N4 bias field
+- uses more assertive N4 settings by default
+- submits one Slurm job per runno
 
 Examples
 --------
-# Submit specific runnos
+# Discover all runnos under all_niis/z*
 python submit_n4_t2_slurm.py \
     --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
-    --runnos 12345 12346 12347
+    --discover \
+    --n4_path N4BiasFieldCorrection
 
-# Submit from a file with one runno per line
+# Specific runnos
 python submit_n4_t2_slurm.py \
     --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
-    --runno_file runnos.txt
-
-# Auto-discover runnos from all_niis/z*/
-python submit_n4_t2_slurm.py \
-    --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
-    --discover
+    --runnos 12345 12346 12347 \
+    --n4_path N4BiasFieldCorrection
 
 # Dry run
 python submit_n4_t2_slurm.py \
     --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
     --discover \
     --dry_run
+
+# Overwrite prior outputs
+python submit_n4_t2_slurm.py \
+    --base_dir /mnt/newStor/paros/paros_MRI/DennisTurner/all_niis \
+    --discover \
+    --overwrite
 """
 
 import argparse
@@ -63,11 +70,10 @@ def read_runnos_from_file(path: Path):
 def discover_runnos(base_dir: Path):
     runnos = []
     for d in sorted(base_dir.glob("z*")):
-        if not d.is_dir():
-            continue
-        runno = d.name[1:]  # strip leading z
-        if runno:
-            runnos.append(runno)
+        if d.is_dir():
+            runno = d.name[1:]  # strip leading z
+            if runno:
+                runnos.append(runno)
     return runnos
 
 
@@ -85,19 +91,37 @@ def sanitize_job_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
 
 
+def shell_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def submit_job(script_path: Path):
+    result = subprocess.run(
+        ["sbatch", str(script_path)],
+        capture_output=True,
+        text=True
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
 def build_job_script(
     runno: str,
     in_nii: Path,
     out_nii: Path,
     in_method: Path,
     out_method: Path,
+    mask_nii: Path,
+    bias_nii: Path,
+    diff_nii: Path | None,
     n4_path: str,
+    thresholdimage_path: str,
+    imagemath_path: str,
     dimension: int,
     shrink_factor: int,
     convergence: str,
     bspline: str,
     histogram_sharpening: str,
-    mask_path: str | None,
+    mask_dilate_radius: int,
     threads: int,
     job_name: str,
     log_out: Path,
@@ -136,33 +160,74 @@ in_nii=""" + shell_quote(str(in_nii)) + r"""
 out_nii=""" + shell_quote(str(out_nii)) + r"""
 in_method=""" + shell_quote(str(in_method)) + r"""
 out_method=""" + shell_quote(str(out_method)) + r"""
+mask_nii=""" + shell_quote(str(mask_nii)) + r"""
+bias_nii=""" + shell_quote(str(bias_nii)) + r"""
+"""
+
+    if diff_nii is not None:
+        script += r"""diff_nii=""" + shell_quote(str(diff_nii)) + r"""
+"""
+    else:
+        script += r"""diff_nii=""
+"""
+
+    script += r"""
 n4_exe=""" + shell_quote(str(n4_path)) + r"""
+threshold_exe=""" + shell_quote(str(thresholdimage_path)) + r"""
+imagemath_exe=""" + shell_quote(str(imagemath_path)) + r"""
 
 mkdir -p "$(dirname "$out_nii")"
 
+echo "Input      : $in_nii"
+echo "Output     : $out_nii"
+echo "Mask       : $mask_nii"
+echo "Bias field : $bias_nii"
+if [[ -n "$diff_nii" ]]; then
+    echo "Diff image : $diff_nii"
+fi
+
+if [[ ! -f "$in_nii" ]]; then
+    echo "ERROR: Input not found: $in_nii" >&2
+    exit 1
+fi
+
+echo
+echo "Creating rough foreground mask..."
+"$threshold_exe" """ + str(dimension) + r""" "$in_nii" "$mask_nii" Otsu 4
+
+if [[ ! -f "$mask_nii" ]]; then
+    echo "ERROR: Mask creation failed: $mask_nii" >&2
+    exit 1
+fi
+
+"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" MD "$mask_nii" """ + str(mask_dilate_radius) + r"""
+"$imagemath_exe" """ + str(dimension) + r""" "$mask_nii" GetLargestComponent "$mask_nii"
+
+echo
+echo "Running N4BiasFieldCorrection..."
 cmd=(
     "$n4_exe"
     -d """ + str(dimension) + r"""
     -i "$in_nii"
+    -x "$mask_nii"
     -s """ + str(shrink_factor) + r"""
     -c """ + shell_quote(convergence) + r"""
     -b """ + shell_quote(bspline) + r"""
     -t """ + shell_quote(histogram_sharpening) + r"""
-    -o "$out_nii"
+    -o "[""$out_nii"",""$bias_nii""]"
 )
-"""
 
-    if mask_path:
-        script += 'cmd+=( -x ' + shell_quote(mask_path) + ' )\n'
-
-    script += r'''
-echo "Running N4BiasFieldCorrection..."
 printf '  %q' "${cmd[@]}"
 echo
 "${cmd[@]}"
 
 if [[ ! -f "$out_nii" ]]; then
-    echo "ERROR: Expected output not found: $out_nii" >&2
+    echo "ERROR: Expected corrected output not found: $out_nii" >&2
+    exit 1
+fi
+
+if [[ ! -f "$bias_nii" ]]; then
+    echo "ERROR: Expected bias field not found: $bias_nii" >&2
     exit 1
 fi
 
@@ -173,23 +238,16 @@ else
     echo "WARNING: Method file not found, skipping copy: $in_method" >&2
 fi
 
+if [[ -n "$diff_nii" ]]; then
+    echo
+    echo "Creating difference image..."
+    "$imagemath_exe" """ + str(dimension) + r""" "$diff_nii" - "$out_nii" "$in_nii"
+fi
+
 echo "===== JOB END ====="
 date
-'''
+"""
     return script
-
-
-def shell_quote(s: str) -> str:
-    return "'" + s.replace("'", "'\"'\"'") + "'"
-
-
-def submit_job(script_path: Path):
-    result = subprocess.run(
-        ["sbatch", str(script_path)],
-        capture_output=True,
-        text=True
-    )
-    return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
 def main():
@@ -201,6 +259,7 @@ def main():
         required=True,
         help="Path to all_niis directory."
     )
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--runnos",
@@ -220,18 +279,25 @@ def main():
     parser.add_argument(
         "--sbatch_dir",
         default=None,
-        help="Directory to store sbatch scripts and Slurm logs. Default: <base_dir>/n4_t2_sbatch"
+        help="Directory to store sbatch scripts and logs. Default: <base_dir>/n4_t2_sbatch"
     )
+
     parser.add_argument(
         "--n4_path",
         default="N4BiasFieldCorrection",
         help="Path to N4BiasFieldCorrection executable."
     )
     parser.add_argument(
-        "--mask",
-        default=None,
-        help="Optional mask image to use for all jobs."
+        "--thresholdimage_path",
+        default="ThresholdImage",
+        help="Path to ThresholdImage executable."
     )
+    parser.add_argument(
+        "--imagemath_path",
+        default="ImageMath",
+        help="Path to ImageMath executable."
+    )
+
     parser.add_argument(
         "--dimension",
         type=int,
@@ -239,27 +305,36 @@ def main():
         choices=[2, 3, 4],
         help="Image dimension. Default: 3"
     )
+
+    # More assertive defaults than before
     parser.add_argument(
         "--shrink_factor",
         type=int,
-        default=4,
-        help="N4 shrink factor. Default: 4"
+        default=2,
+        help="N4 shrink factor. Default: 2"
     )
     parser.add_argument(
         "--convergence",
-        default="[50x50x50x50,1e-7]",
-        help='N4 convergence string. Default: "[50x50x50x50,1e-7]"'
+        default="[100x100x70x50,1e-7]",
+        help='N4 convergence string. Default: "[100x100x70x50,1e-7]"'
     )
     parser.add_argument(
         "--bspline",
-        default="[200]",
-        help='N4 bspline string. Default: "[200]"'
+        default="[150]",
+        help='N4 bspline string. Default: "[150]"'
     )
     parser.add_argument(
         "--histogram_sharpening",
         default="[0.15,0.01,200]",
         help='N4 histogram sharpening string. Default: "[0.15,0.01,200]"'
     )
+    parser.add_argument(
+        "--mask_dilate_radius",
+        type=int,
+        default=1,
+        help="Mask dilation radius after Otsu thresholding. Default: 1"
+    )
+
     parser.add_argument(
         "--threads",
         type=int,
@@ -288,10 +363,16 @@ def main():
         default=None,
         help="Optional Slurm partition."
     )
+
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing outputs."
+    )
+    parser.add_argument(
+        "--save_diff",
+        action="store_true",
+        help="Also save corrected-minus-original difference image as ${runno}_bfc_diff_T2.nii.gz"
     )
     parser.add_argument(
         "--dry_run",
@@ -325,9 +406,10 @@ def main():
     scripts_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] base_dir   : {base_dir}")
-    print(f"[INFO] sbatch_dir : {sbatch_dir}")
-    print(f"[INFO] runnos     : {len(runnos)}")
+    print(f"[INFO] base_dir    : {base_dir}")
+    print(f"[INFO] sbatch_dir  : {sbatch_dir}")
+    print(f"[INFO] runno count : {len(runnos)}")
+    print(f"[INFO] N4 defaults : shrink={args.shrink_factor}, convergence={args.convergence}, bspline={args.bspline}")
 
     n_prepared = 0
     n_submitted = 0
@@ -341,14 +423,21 @@ def main():
         out_nii = run_dir / f"{runno}_bfc_T2.nii.gz"
         in_method = run_dir / f"{runno}_T2.method"
         out_method = run_dir / f"{runno}_bfc_T2.method"
+        mask_nii = run_dir / f"{runno}_bfc_mask.nii.gz"
+        bias_nii = run_dir / f"{runno}_bfc_biasfield.nii.gz"
+        diff_nii = run_dir / f"{runno}_bfc_diff_T2.nii.gz" if args.save_diff else None
 
         if not in_nii.exists():
             eprint(f"[MISSING] Input NIfTI not found for runno {runno}: {in_nii}")
             n_missing += 1
             continue
 
-        if out_nii.exists() and not args.overwrite:
-            print(f"[SKIP] Output exists for runno {runno}: {out_nii}")
+        outputs_to_check = [out_nii, mask_nii, bias_nii]
+        if diff_nii is not None:
+            outputs_to_check.append(diff_nii)
+
+        if all(p.exists() for p in outputs_to_check) and not args.overwrite:
+            print(f"[SKIP] Outputs already exist for runno {runno}")
             n_skipped += 1
             continue
 
@@ -363,13 +452,18 @@ def main():
             out_nii=out_nii,
             in_method=in_method,
             out_method=out_method,
+            mask_nii=mask_nii,
+            bias_nii=bias_nii,
+            diff_nii=diff_nii,
             n4_path=args.n4_path,
+            thresholdimage_path=args.thresholdimage_path,
+            imagemath_path=args.imagemath_path,
             dimension=args.dimension,
             shrink_factor=args.shrink_factor,
             convergence=args.convergence,
             bspline=args.bspline,
             histogram_sharpening=args.histogram_sharpening,
-            mask_path=args.mask,
+            mask_dilate_radius=args.mask_dilate_radius,
             threads=args.threads,
             job_name=job_name,
             log_out=log_out,
