@@ -71,7 +71,7 @@ from scipy.ndimage import (
     binary_dilation,
     binary_erosion,
     binary_fill_holes,
-    distance_transform_edt,
+    binary_propagation,
     gaussian_filter,
     gaussian_gradient_magnitude,
     generate_binary_structure,
@@ -104,6 +104,36 @@ def robust_normalize(vol: np.ndarray, mask: np.ndarray, low_pct=2.0, high_pct=98
     return np.clip(out, 0.0, 1.0)
 
 
+def remove_small_components(mask: np.ndarray, min_voxels: int, structure=None) -> np.ndarray:
+    if structure is None:
+        structure = generate_binary_structure(3, 2)
+    if min_voxels <= 1:
+        return mask.copy()
+    lab, nlab = label(mask, structure=structure)
+    if nlab == 0:
+        return np.zeros_like(mask, dtype=bool)
+    counts = np.bincount(lab.ravel())
+    keep = np.zeros(nlab + 1, dtype=bool)
+    for k in range(1, nlab + 1):
+        if counts[k] >= min_voxels:
+            keep[k] = True
+    return keep[lab]
+
+
+def boundary_seed(mask: np.ndarray) -> np.ndarray:
+    seed = np.zeros_like(mask, dtype=bool)
+    if mask.ndim != 3:
+        raise RuntimeError("Expected 3D mask.")
+    # all six faces
+    seed[0, :, :] |= mask[0, :, :]
+    seed[-1, :, :] |= mask[-1, :, :]
+    seed[:, 0, :] |= mask[:, 0, :]
+    seed[:, -1, :] |= mask[:, -1, :]
+    seed[:, :, 0] |= mask[:, :, 0]
+    seed[:, :, -1] |= mask[:, :, -1]
+    return seed
+
+
 def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
     img = nib.Nifti1Image(data, ref_img.affine, ref_img.header)
     nib.save(img, str(path))
@@ -111,7 +141,7 @@ def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build an edge-aware brain mask from a BFC T2 and a generous support mask."
+        description="Build a brain mask from BFC T2 using a gradient shell / enclosed-cavity strategy."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -121,20 +151,19 @@ def main():
 
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
     ap.add_argument("--grad_sigma", type=float, default=1.0)
+    ap.add_argument("--grad_threshold", type=float, default=0.10)
 
-    ap.add_argument("--seed_min_distance", type=float, default=4.0)
-    ap.add_argument("--seed_score_pct", type=float, default=92.0)
-    ap.add_argument("--seed_erode_iters", type=int, default=1)
+    # physical cleanup thresholds, in mm^3
+    ap.add_argument("--min_barrier_volume_mm3", type=float, default=0.05,
+                    help="Remove tiny white edge blobs smaller than this physical volume.")
+    ap.add_argument("--min_enclosed_volume_mm3", type=float, default=1.0,
+                    help="Remove tiny enclosed black regions smaller than this physical volume.")
 
-    ap.add_argument("--center_weight", type=float, default=1.5)
-    ap.add_argument("--grad_penalty", type=float, default=2.0)
+    ap.add_argument("--close_barrier_iters", type=int, default=1,
+                    help="Closing iterations on binary barrier shell.")
+    ap.add_argument("--brain_close_iters", type=int, default=2)
+    ap.add_argument("--brain_dilate_iters", type=int, default=0)
 
-    ap.add_argument("--candidate_intensity_min", type=float, default=0.08)
-    ap.add_argument("--candidate_gradient_max", type=float, default=0.45)
-    ap.add_argument("--max_grow_iters", type=int, default=200)
-
-    ap.add_argument("--close_iters", type=int, default=2)
-    ap.add_argument("--dilate_iters", type=int, default=1)
     ap.add_argument("--tight_mask", action="store_true")
     ap.add_argument("--tight_erode_iters", type=int, default=1)
 
@@ -151,57 +180,61 @@ def main():
     if not np.any(support):
         raise RuntimeError("Support mask is empty.")
 
+    zooms = bfc_img.header.get_zooms()[:3]
+    voxel_volume_mm3 = float(zooms[0] * zooms[1] * zooms[2])
+    if voxel_volume_mm3 <= 0:
+        raise RuntimeError(f"Bad voxel volume from header: {voxel_volume_mm3}")
+
+    min_barrier_vox = max(1, int(round(args.min_barrier_volume_mm3 / voxel_volume_mm3)))
+    min_enclosed_vox = max(1, int(round(args.min_enclosed_volume_mm3 / voxel_volume_mm3)))
+
     structure = generate_binary_structure(3, 2)
 
+    # Smooth BFC and compute gradient
     bfc_smooth = gaussian_filter(bfc, sigma=args.smooth_sigma)
-    inten_norm = robust_normalize(bfc_smooth, support, low_pct=2.0, high_pct=98.0)
-
     grad = gaussian_gradient_magnitude(bfc_smooth, sigma=args.grad_sigma)
     grad_norm = robust_normalize(grad, support, low_pct=2.0, high_pct=98.0)
 
-    dist = distance_transform_edt(support)
-    dist_norm = dist / max(float(dist.max()), 1.0)
+    # Binary shell/barrier
+    barrier = (grad_norm >= args.grad_threshold) & support
+    barrier = remove_small_components(barrier, min_barrier_vox, structure=structure)
 
-    interior = support & (dist >= args.seed_min_distance)
-    if not np.any(interior):
-        interior = support.copy()
+    if args.close_barrier_iters > 0 and np.any(barrier):
+        barrier = binary_closing(barrier, structure=structure, iterations=args.close_barrier_iters)
 
-    seed_score = inten_norm * (dist_norm ** args.center_weight) / (1.0 + args.grad_penalty * grad_norm)
+    # Open space inside support that the flood fill can occupy
+    open_space = support & (~barrier)
 
-    seed_vals = seed_score[interior]
-    thresh = np.percentile(seed_vals, args.seed_score_pct)
-    seed = interior & (seed_score >= thresh)
+    # Flood fill "outside" from the support-mask boundary, constrained to open_space
+    seeds = boundary_seed(open_space)
+    outside = binary_propagation(seeds, structure=structure, mask=open_space)
 
-    seed = largest_component(seed, structure=structure)
-    if args.seed_erode_iters > 0 and np.any(seed):
-        seed = binary_erosion(seed, structure=structure, iterations=args.seed_erode_iters)
+    # Enclosed cavity is whatever in open_space is NOT reachable from boundary
+    enclosed = open_space & (~outside)
 
-    if not np.any(seed):
-        raise RuntimeError("Seed generation failed; got empty seed.")
+    # Remove tiny enclosed junk
+    enclosed = remove_small_components(enclosed, min_enclosed_vox, structure=structure)
 
-    candidate = support & (inten_norm >= args.candidate_intensity_min) & (grad_norm <= args.candidate_gradient_max)
-    candidate |= seed
+    # Keep the largest enclosed component as brain candidate
+    brain = largest_component(enclosed, structure=structure)
+    if not np.any(brain):
+        raise RuntimeError("No enclosed brain candidate found. Try lowering grad threshold or barrier cleanup.")
 
-    grown = seed.copy()
-    for _ in range(args.max_grow_iters):
-        nxt = binary_dilation(grown, structure=structure) & candidate
-        if np.array_equal(nxt, grown):
-            break
-        grown = nxt
+    # Cleanup
+    brain = binary_fill_holes(brain)
+    if args.brain_close_iters > 0:
+        brain = binary_closing(brain, structure=structure, iterations=args.brain_close_iters)
+    if args.brain_dilate_iters > 0:
+        brain = binary_dilation(brain, structure=structure, iterations=args.brain_dilate_iters)
 
-    grown = largest_component(grown, structure=structure)
-    grown = binary_closing(grown, structure=structure, iterations=args.close_iters)
-    grown = binary_fill_holes(grown)
-    grown = binary_dilation(grown, structure=structure, iterations=args.dilate_iters)
-
-    grown &= support
-    grown = largest_component(grown, structure=structure)
+    brain &= support
+    brain = largest_component(brain, structure=structure)
 
     if args.tight_mask:
-        grown = binary_erosion(grown, structure=structure, iterations=args.tight_erode_iters)
-        grown = largest_component(grown, structure=structure)
+        brain = binary_erosion(brain, structure=structure, iterations=args.tight_erode_iters)
+        brain = largest_component(brain, structure=structure)
 
-    out_mask = grown.astype(np.uint8)
+    out_mask = brain.astype(np.uint8)
     out_masked_bfc = np.where(out_mask > 0, bfc, 0.0).astype(np.float32)
 
     save_like(Path(args.out_mask), out_mask, bfc_img)
@@ -209,12 +242,14 @@ def main():
 
     if args.debug_prefix:
         prefix = Path(args.debug_prefix)
-        save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_grad.nii.gz"), grad.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_dist_norm.nii.gz"), dist_norm.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_seed_score.nii.gz"), seed_score.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_seed.nii.gz"), seed.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_candidate.nii.gz"), candidate.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_barrier_raw.nii.gz"),
+                  ((grad_norm >= args.grad_threshold) & support).astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_barrier.nii.gz"), barrier.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_open_space.nii.gz"), open_space.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_outside.nii.gz"), outside.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_enclosed.nii.gz"), enclosed.astype(np.uint8), bfc_img)
 
 
 if __name__ == "__main__":
@@ -254,14 +289,10 @@ def build_job_script(
     pre_dilate_radius_final: int,
     brain_smooth_sigma: float,
     brain_grad_sigma: float,
-    brain_seed_min_distance: float,
-    brain_seed_score_pct: float,
-    brain_seed_erode_iters: int,
-    brain_center_weight: float,
-    brain_grad_penalty: float,
-    brain_candidate_intensity_min: float,
-    brain_candidate_gradient_max: float,
-    brain_max_grow_iters: int,
+    brain_grad_threshold: float,
+    brain_min_barrier_volume_mm3: float,
+    brain_min_enclosed_volume_mm3: float,
+    brain_close_barrier_iters: int,
     brain_close_iters: int,
     brain_dilate_iters: int,
     tight_mask: bool,
@@ -437,7 +468,7 @@ if [[ "$need_brainmask" == "1" ]]; then
     fi
 
     echo
-    echo "Creating gradient-aware seeded brain mask..."
+    echo "Creating shell-based brain mask..."
     brain_cmd=(
         python3 "$helper_py"
         --bfc "$out_nii"
@@ -446,16 +477,12 @@ if [[ "$need_brainmask" == "1" ]]; then
         --out_masked_bfc "$brain_t2_nii"
         --smooth_sigma """ + str(brain_smooth_sigma) + r"""
         --grad_sigma """ + str(brain_grad_sigma) + r"""
-        --seed_min_distance """ + str(brain_seed_min_distance) + r"""
-        --seed_score_pct """ + str(brain_seed_score_pct) + r"""
-        --seed_erode_iters """ + str(brain_seed_erode_iters) + r"""
-        --center_weight """ + str(brain_center_weight) + r"""
-        --grad_penalty """ + str(brain_grad_penalty) + r"""
-        --candidate_intensity_min """ + str(brain_candidate_intensity_min) + r"""
-        --candidate_gradient_max """ + str(brain_candidate_gradient_max) + r"""
-        --max_grow_iters """ + str(brain_max_grow_iters) + r"""
-        --close_iters """ + str(brain_close_iters) + r"""
-        --dilate_iters """ + str(brain_dilate_iters) + r"""
+        --grad_threshold """ + str(brain_grad_threshold) + r"""
+        --min_barrier_volume_mm3 """ + str(brain_min_barrier_volume_mm3) + r"""
+        --min_enclosed_volume_mm3 """ + str(brain_min_enclosed_volume_mm3) + r"""
+        --close_barrier_iters """ + str(brain_close_barrier_iters) + r"""
+        --brain_close_iters """ + str(brain_close_iters) + r"""
+        --brain_dilate_iters """ + str(brain_dilate_iters) + r"""
         --tight_erode_iters """ + str(tight_mask_erode_iters) + r"""
     )
 
@@ -524,19 +551,15 @@ def main():
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
-    # Brain-mask refinement
+    # Shell-based brain-mask parameters
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
-    p.add_argument("--brain_seed_min_distance", type=float, default=4.0)
-    p.add_argument("--brain_seed_score_pct", type=float, default=92.0)
-    p.add_argument("--brain_seed_erode_iters", type=int, default=1)
-    p.add_argument("--brain_center_weight", type=float, default=1.5)
-    p.add_argument("--brain_grad_penalty", type=float, default=2.0)
-    p.add_argument("--brain_candidate_intensity_min", type=float, default=0.08)
-    p.add_argument("--brain_candidate_gradient_max", type=float, default=0.45)
-    p.add_argument("--brain_max_grow_iters", type=int, default=200)
+    p.add_argument("--brain_grad_threshold", type=float, default=0.10)
+    p.add_argument("--brain_min_barrier_volume_mm3", type=float, default=0.05)
+    p.add_argument("--brain_min_enclosed_volume_mm3", type=float, default=1.0)
+    p.add_argument("--brain_close_barrier_iters", type=int, default=1)
     p.add_argument("--brain_close_iters", type=int, default=2)
-    p.add_argument("--brain_dilate_iters", type=int, default=1)
+    p.add_argument("--brain_dilate_iters", type=int, default=0)
 
     p.add_argument("--tight_mask", action="store_true")
     p.add_argument("--tight_mask_erode_iters", type=int, default=1)
@@ -653,14 +676,10 @@ def main():
             pre_dilate_radius_final=args.pre_dilate_radius_final,
             brain_smooth_sigma=args.brain_smooth_sigma,
             brain_grad_sigma=args.brain_grad_sigma,
-            brain_seed_min_distance=args.brain_seed_min_distance,
-            brain_seed_score_pct=args.brain_seed_score_pct,
-            brain_seed_erode_iters=args.brain_seed_erode_iters,
-            brain_center_weight=args.brain_center_weight,
-            brain_grad_penalty=args.brain_grad_penalty,
-            brain_candidate_intensity_min=args.brain_candidate_intensity_min,
-            brain_candidate_gradient_max=args.brain_candidate_gradient_max,
-            brain_max_grow_iters=args.brain_max_grow_iters,
+            brain_grad_threshold=args.brain_grad_threshold,
+            brain_min_barrier_volume_mm3=args.brain_min_barrier_volume_mm3,
+            brain_min_enclosed_volume_mm3=args.brain_min_enclosed_volume_mm3,
+            brain_close_barrier_iters=args.brain_close_barrier_iters,
             brain_close_iters=args.brain_close_iters,
             brain_dilate_iters=args.brain_dilate_iters,
             tight_mask=args.tight_mask,
