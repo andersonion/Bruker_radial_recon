@@ -58,39 +58,87 @@ def submit_job(script_path: Path):
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def write_prodmask_helper(helper_path: Path):
+def write_brainmask_helper(helper_path: Path):
     helper_code = r'''#!/usr/bin/env python3
+
 import argparse
-import sys
-import numpy as np
+from pathlib import Path
+
 import nibabel as nib
+import numpy as np
 from scipy.ndimage import (
     binary_closing,
-    binary_fill_holes,
     binary_dilation,
     binary_erosion,
-    center_of_mass,
+    binary_fill_holes,
+    distance_transform_edt,
     gaussian_filter,
-    label,
+    gaussian_gradient_magnitude,
     generate_binary_structure,
+    label,
 )
 
 
+def largest_component(mask: np.ndarray, structure=None) -> np.ndarray:
+    if structure is None:
+        structure = generate_binary_structure(3, 2)
+    lab, nlab = label(mask, structure=structure)
+    if nlab == 0:
+        return np.zeros_like(mask, dtype=bool)
+    counts = np.bincount(lab.ravel())
+    counts[0] = 0
+    best = counts.argmax()
+    return lab == best
+
+
+def robust_normalize(vol: np.ndarray, mask: np.ndarray, low_pct=2.0, high_pct=98.0) -> np.ndarray:
+    vals = vol[mask]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        raise RuntimeError("No finite values inside mask for normalization.")
+    lo = np.percentile(vals, low_pct)
+    hi = np.percentile(vals, high_pct)
+    if hi <= lo:
+        raise RuntimeError(f"Bad normalization range: lo={lo}, hi={hi}")
+    out = (vol - lo) / (hi - lo)
+    return np.clip(out, 0.0, 1.0)
+
+
+def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
+    img = nib.Nifti1Image(data, ref_img.affine, ref_img.header)
+    nib.save(img, str(path))
+
+
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--bfc", required=True)
-    p.add_argument("--support_mask", required=True)
-    p.add_argument("--out_mask", required=True)
-    p.add_argument("--out_masked_bfc", required=True)
-    p.add_argument("--norm_low_pct", type=float, default=2.0)
-    p.add_argument("--norm_high_pct", type=float, default=98.0)
-    p.add_argument("--threshold_frac", type=float, default=0.12)
-    p.add_argument("--smooth_sigma", type=float, default=0.5)
-    p.add_argument("--close_iters", type=int, default=2)
-    p.add_argument("--dilate_iters", type=int, default=1)
-    p.add_argument("--tight_mask", action="store_true")
-    p.add_argument("--tight_erode_iters", type=int, default=1)
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Build an edge-aware brain mask from a BFC T2 and a generous support mask."
+    )
+    ap.add_argument("--bfc", required=True)
+    ap.add_argument("--support_mask", required=True)
+    ap.add_argument("--out_mask", required=True)
+    ap.add_argument("--out_masked_bfc", required=True)
+    ap.add_argument("--debug_prefix", default=None)
+
+    ap.add_argument("--smooth_sigma", type=float, default=1.0)
+    ap.add_argument("--grad_sigma", type=float, default=1.0)
+
+    ap.add_argument("--seed_min_distance", type=float, default=4.0)
+    ap.add_argument("--seed_score_pct", type=float, default=92.0)
+    ap.add_argument("--seed_erode_iters", type=int, default=1)
+
+    ap.add_argument("--center_weight", type=float, default=1.5)
+    ap.add_argument("--grad_penalty", type=float, default=2.0)
+
+    ap.add_argument("--candidate_intensity_min", type=float, default=0.08)
+    ap.add_argument("--candidate_gradient_max", type=float, default=0.45)
+    ap.add_argument("--max_grow_iters", type=int, default=200)
+
+    ap.add_argument("--close_iters", type=int, default=2)
+    ap.add_argument("--dilate_iters", type=int, default=1)
+    ap.add_argument("--tight_mask", action="store_true")
+    ap.add_argument("--tight_erode_iters", type=int, default=1)
+
+    args = ap.parse_args()
 
     bfc_img = nib.load(args.bfc)
     sup_img = nib.load(args.support_mask)
@@ -98,78 +146,75 @@ def main():
     bfc = bfc_img.get_fdata(dtype=np.float32)
     support = sup_img.get_fdata() > 0
 
+    if bfc.shape != support.shape:
+        raise RuntimeError("BFC image and support mask shapes do not match.")
     if not np.any(support):
         raise RuntimeError("Support mask is empty.")
 
-    masked_bfc = np.where(support, bfc, 0.0).astype(np.float32)
+    structure = generate_binary_structure(3, 2)
 
-    smoothed = gaussian_filter(masked_bfc, sigma=args.smooth_sigma)
+    bfc_smooth = gaussian_filter(bfc, sigma=args.smooth_sigma)
+    inten_norm = robust_normalize(bfc_smooth, support, low_pct=2.0, high_pct=98.0)
 
-    vals = smoothed[support]
-    vals = vals[np.isfinite(vals)]
+    grad = gaussian_gradient_magnitude(bfc_smooth, sigma=args.grad_sigma)
+    grad_norm = robust_normalize(grad, support, low_pct=2.0, high_pct=98.0)
 
-    if vals.size == 0:
-        raise RuntimeError("No finite values inside support mask.")
+    dist = distance_transform_edt(support)
+    dist_norm = dist / max(float(dist.max()), 1.0)
 
-    p_lo = np.percentile(vals, args.norm_low_pct)
-    p_hi = np.percentile(vals, args.norm_high_pct)
+    interior = support & (dist >= args.seed_min_distance)
+    if not np.any(interior):
+        interior = support.copy()
 
-    if p_hi <= p_lo:
-        raise RuntimeError(f"Bad percentile range: low={p_lo}, high={p_hi}")
+    seed_score = inten_norm * (dist_norm ** args.center_weight) / (1.0 + args.grad_penalty * grad_norm)
 
-    norm = (smoothed - p_lo) / (p_hi - p_lo)
-    norm = np.clip(norm, 0.0, 1.0)
+    seed_vals = seed_score[interior]
+    thresh = np.percentile(seed_vals, args.seed_score_pct)
+    seed = interior & (seed_score >= thresh)
 
-    # Threshold only inside support mask
-    cand = (norm >= args.threshold_frac) & support
+    seed = largest_component(seed, structure=structure)
+    if args.seed_erode_iters > 0 and np.any(seed):
+        seed = binary_erosion(seed, structure=structure, iterations=args.seed_erode_iters)
 
-    if not np.any(cand):
-        # Fallback: just use support mask if thresholding somehow collapses
-        cand = support.copy()
+    if not np.any(seed):
+        raise RuntimeError("Seed generation failed; got empty seed.")
 
-    struct = generate_binary_structure(3, 2)
-    lab, nlab = label(cand, structure=struct)
+    candidate = support & (inten_norm >= args.candidate_intensity_min) & (grad_norm <= args.candidate_gradient_max)
+    candidate |= seed
 
-    if nlab == 0:
-        final_mask = support.copy()
-    else:
-        com = center_of_mass(support.astype(np.uint8))
-        com_idx = tuple(int(round(x)) for x in com)
-        com_idx = tuple(
-            min(max(0, com_idx[i]), lab.shape[i] - 1) for i in range(3)
-        )
+    grown = seed.copy()
+    for _ in range(args.max_grow_iters):
+        nxt = binary_dilation(grown, structure=structure) & candidate
+        if np.array_equal(nxt, grown):
+            break
+        grown = nxt
 
-        chosen_label = lab[com_idx]
+    grown = largest_component(grown, structure=structure)
+    grown = binary_closing(grown, structure=structure, iterations=args.close_iters)
+    grown = binary_fill_holes(grown)
+    grown = binary_dilation(grown, structure=structure, iterations=args.dilate_iters)
 
-        if chosen_label == 0:
-            # If COM falls in a gap, choose the labeled component with greatest overlap
-            # with the support mask center neighborhood.
-            overlaps = []
-            for k in range(1, nlab + 1):
-                comp = (lab == k)
-                overlaps.append((np.count_nonzero(comp & support), k))
-            overlaps.sort(reverse=True)
-            chosen_label = overlaps[0][1]
-
-        final_mask = (lab == chosen_label)
-
-    final_mask = binary_closing(final_mask, structure=struct, iterations=args.close_iters)
-    final_mask = binary_fill_holes(final_mask)
-    final_mask = binary_dilation(final_mask, structure=struct, iterations=args.dilate_iters)
-
-    # Always constrain back to support mask
-    final_mask = final_mask & support
+    grown &= support
+    grown = largest_component(grown, structure=structure)
 
     if args.tight_mask:
-        final_mask = binary_erosion(
-            final_mask, structure=struct, iterations=args.tight_erode_iters
-        )
+        grown = binary_erosion(grown, structure=structure, iterations=args.tight_erode_iters)
+        grown = largest_component(grown, structure=structure)
 
-    out_mask = final_mask.astype(np.uint8)
+    out_mask = grown.astype(np.uint8)
     out_masked_bfc = np.where(out_mask > 0, bfc, 0.0).astype(np.float32)
 
-    nib.save(nib.Nifti1Image(out_mask, bfc_img.affine, bfc_img.header), args.out_mask)
-    nib.save(nib.Nifti1Image(out_masked_bfc, bfc_img.affine, bfc_img.header), args.out_masked_bfc)
+    save_like(Path(args.out_mask), out_mask, bfc_img)
+    save_like(Path(args.out_masked_bfc), out_masked_bfc, bfc_img)
+
+    if args.debug_prefix:
+        prefix = Path(args.debug_prefix)
+        save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_dist_norm.nii.gz"), dist_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_seed_score.nii.gz"), seed_score.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_seed.nii.gz"), seed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_candidate.nii.gz"), candidate.astype(np.uint8), bfc_img)
 
 
 if __name__ == "__main__":
@@ -187,8 +232,8 @@ def build_job_script(
     out_method: Path,
     premask_nii: Path,
     bias_nii: Path,
-    prodmask_nii: Path,
-    masked_bfc_nii: Path,
+    brainmask_nii: Path,
+    brain_t2_nii: Path,
     diff_nii: Path | None,
     tmp_otsu_pre_nii: Path,
     helper_py: Path,
@@ -207,14 +252,21 @@ def build_job_script(
     pre_dilate_radius_pre_glc: int,
     pre_fill_holes_radius: int,
     pre_dilate_radius_final: int,
-    prod_norm_low_pct: float,
-    prod_norm_high_pct: float,
-    prod_threshold_frac: float,
-    prod_smooth_sigma: float,
-    prod_close_iters: int,
-    prod_dilate_iters: int,
+    brain_smooth_sigma: float,
+    brain_grad_sigma: float,
+    brain_seed_min_distance: float,
+    brain_seed_score_pct: float,
+    brain_seed_erode_iters: int,
+    brain_center_weight: float,
+    brain_grad_penalty: float,
+    brain_candidate_intensity_min: float,
+    brain_candidate_gradient_max: float,
+    brain_max_grow_iters: int,
+    brain_close_iters: int,
+    brain_dilate_iters: int,
     tight_mask: bool,
     tight_mask_erode_iters: int,
+    save_brain_debug: bool,
     threads: int,
     job_name: str,
     log_out: Path,
@@ -255,12 +307,13 @@ in_method=""" + shell_quote(str(in_method)) + r"""
 out_method=""" + shell_quote(str(out_method)) + r"""
 premask_nii=""" + shell_quote(str(premask_nii)) + r"""
 bias_nii=""" + shell_quote(str(bias_nii)) + r"""
-prodmask_nii=""" + shell_quote(str(prodmask_nii)) + r"""
-masked_bfc_nii=""" + shell_quote(str(masked_bfc_nii)) + r"""
+brainmask_nii=""" + shell_quote(str(brainmask_nii)) + r"""
+brain_t2_nii=""" + shell_quote(str(brain_t2_nii)) + r"""
 tmp_otsu_pre_nii=""" + shell_quote(str(tmp_otsu_pre_nii)) + r"""
 helper_py=""" + shell_quote(str(helper_py)) + r"""
 overwrite_flag=""" + ("1" if overwrite else "0") + r"""
 tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
+save_brain_debug_flag=""" + ("1" if save_brain_debug else "0") + r"""
 """
 
     if diff_nii is not None:
@@ -303,11 +356,11 @@ elif [[ ! -f "$out_nii" || ! -f "$bias_nii" || ! -f "$premask_nii" ]]; then
     need_n4=1
 fi
 
-need_prodmask=0
+need_brainmask=0
 if [[ "$overwrite_flag" == "1" ]]; then
-    need_prodmask=1
-elif [[ ! -f "$prodmask_nii" || ! -f "$masked_bfc_nii" ]]; then
-    need_prodmask=1
+    need_brainmask=1
+elif [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then
+    need_brainmask=1
 fi
 
 if [[ -n "$diff_nii" ]]; then
@@ -373,48 +426,58 @@ else
     echo "Skipping N4 stage; existing outputs found and overwrite is off."
 fi
 
-if [[ "$need_prodmask" == "1" ]]; then
+if [[ "$need_brainmask" == "1" ]]; then
     if [[ ! -f "$out_nii" ]]; then
-        echo "ERROR: Missing corrected image for production mask: $out_nii" >&2
+        echo "ERROR: Missing corrected image for brain mask: $out_nii" >&2
         exit 1
     fi
     if [[ ! -f "$premask_nii" ]]; then
-        echo "ERROR: Missing support mask for production mask: $premask_nii" >&2
+        echo "ERROR: Missing support mask for brain mask: $premask_nii" >&2
         exit 1
     fi
 
     echo
-    echo "Creating seeded/support-constrained production mask..."
-    prod_cmd=(
+    echo "Creating gradient-aware seeded brain mask..."
+    brain_cmd=(
         python3 "$helper_py"
         --bfc "$out_nii"
         --support_mask "$premask_nii"
-        --out_mask "$prodmask_nii"
-        --out_masked_bfc "$masked_bfc_nii"
-        --norm_low_pct """ + str(prod_norm_low_pct) + r"""
-        --norm_high_pct """ + str(prod_norm_high_pct) + r"""
-        --threshold_frac """ + str(prod_threshold_frac) + r"""
-        --smooth_sigma """ + str(prod_smooth_sigma) + r"""
-        --close_iters """ + str(prod_close_iters) + r"""
-        --dilate_iters """ + str(prod_dilate_iters) + r"""
+        --out_mask "$brainmask_nii"
+        --out_masked_bfc "$brain_t2_nii"
+        --smooth_sigma """ + str(brain_smooth_sigma) + r"""
+        --grad_sigma """ + str(brain_grad_sigma) + r"""
+        --seed_min_distance """ + str(brain_seed_min_distance) + r"""
+        --seed_score_pct """ + str(brain_seed_score_pct) + r"""
+        --seed_erode_iters """ + str(brain_seed_erode_iters) + r"""
+        --center_weight """ + str(brain_center_weight) + r"""
+        --grad_penalty """ + str(brain_grad_penalty) + r"""
+        --candidate_intensity_min """ + str(brain_candidate_intensity_min) + r"""
+        --candidate_gradient_max """ + str(brain_candidate_gradient_max) + r"""
+        --max_grow_iters """ + str(brain_max_grow_iters) + r"""
+        --close_iters """ + str(brain_close_iters) + r"""
+        --dilate_iters """ + str(brain_dilate_iters) + r"""
         --tight_erode_iters """ + str(tight_mask_erode_iters) + r"""
     )
 
     if [[ "$tight_mask_flag" == "1" ]]; then
-        prod_cmd+=( --tight_mask )
+        brain_cmd+=( --tight_mask )
     fi
 
-    printf '  %q' "${prod_cmd[@]}"
-    echo
-    "${prod_cmd[@]}"
+    if [[ "$save_brain_debug_flag" == "1" ]]; then
+        brain_cmd+=( --debug_prefix "$(dirname "$brainmask_nii")/""" + runno + r"""_bfc_brain_dbg" )
+    fi
 
-    if [[ ! -f "$prodmask_nii" ]]; then
-        echo "ERROR: Production mask was not created." >&2
+    printf '  %q' "${brain_cmd[@]}"
+    echo
+    "${brain_cmd[@]}"
+
+    if [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then
+        echo "ERROR: Brain-mask outputs missing." >&2
         exit 1
     fi
 else
     echo
-    echo "Skipping production mask stage; outputs exist and overwrite is off."
+    echo "Skipping brain-mask stage; outputs exist and overwrite is off."
 fi
 
 if [[ "$need_diff" == "1" ]]; then
@@ -453,7 +516,7 @@ def main():
     p.add_argument("--bspline", default="[8]")
     p.add_argument("--histogram_sharpening", default="[0.15,0.01,200]")
 
-    # Pre-mask
+    # Pre-N4 support mask
     p.add_argument("--pre_otsu_keep_low", type=int, default=2)
     p.add_argument("--pre_otsu_keep_high", type=int, default=4)
     p.add_argument("--pre_close_radius", type=int, default=2)
@@ -461,16 +524,24 @@ def main():
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
-    # Production mask refinement
-    p.add_argument("--prod_norm_low_pct", type=float, default=2.0)
-    p.add_argument("--prod_norm_high_pct", type=float, default=98.0)
-    p.add_argument("--prod_threshold_frac", type=float, default=0.12)
-    p.add_argument("--prod_smooth_sigma", type=float, default=0.5)
-    p.add_argument("--prod_close_iters", type=int, default=2)
-    p.add_argument("--prod_dilate_iters", type=int, default=1)
+    # Brain-mask refinement
+    p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
+    p.add_argument("--brain_grad_sigma", type=float, default=1.0)
+    p.add_argument("--brain_seed_min_distance", type=float, default=4.0)
+    p.add_argument("--brain_seed_score_pct", type=float, default=92.0)
+    p.add_argument("--brain_seed_erode_iters", type=int, default=1)
+    p.add_argument("--brain_center_weight", type=float, default=1.5)
+    p.add_argument("--brain_grad_penalty", type=float, default=2.0)
+    p.add_argument("--brain_candidate_intensity_min", type=float, default=0.08)
+    p.add_argument("--brain_candidate_gradient_max", type=float, default=0.45)
+    p.add_argument("--brain_max_grow_iters", type=int, default=200)
+    p.add_argument("--brain_close_iters", type=int, default=2)
+    p.add_argument("--brain_dilate_iters", type=int, default=1)
 
     p.add_argument("--tight_mask", action="store_true")
     p.add_argument("--tight_mask_erode_iters", type=int, default=1)
+
+    p.add_argument("--save_brain_debug", action="store_true")
 
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--cpus", type=int, default=4)
@@ -507,8 +578,8 @@ def main():
     scripts_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    helper_py = sbatch_dir / "make_prod_mask.py"
-    write_prodmask_helper(helper_py)
+    helper_py = sbatch_dir / "make_brain_mask_from_bfc.py"
+    write_brainmask_helper(helper_py)
 
     print(f"[INFO] base_dir    : {base_dir}")
     print(f"[INFO] sbatch_dir  : {sbatch_dir}")
@@ -528,8 +599,8 @@ def main():
         out_method = run_dir / f"{runno}_bfc_T2.method"
         premask_nii = run_dir / f"{runno}_bfc_mask.nii.gz"
         bias_nii = run_dir / f"{runno}_bfc_biasfield.nii.gz"
-        prodmask_nii = run_dir / f"{runno}_bfc_T2_mask.nii.gz"
-        masked_bfc_nii = run_dir / f"{runno}_bfc_T2_masked.nii.gz"
+        brainmask_nii = run_dir / f"{runno}_bfc_brain_mask.nii.gz"
+        brain_t2_nii = run_dir / f"{runno}_bfc_brain_T2.nii.gz"
         tmp_otsu_pre_nii = run_dir / f"{runno}_bfc_otsu_pre_tmp.nii.gz"
         diff_nii = run_dir / f"{runno}_bfc_diff_T2.nii.gz" if args.save_diff else None
 
@@ -540,9 +611,9 @@ def main():
 
         if not args.overwrite:
             have_core = out_nii.exists() and bias_nii.exists() and premask_nii.exists()
-            have_prodmask = prodmask_nii.exists() and masked_bfc_nii.exists()
+            have_brain = brainmask_nii.exists() and brain_t2_nii.exists()
             have_diff = True if diff_nii is None else diff_nii.exists()
-            if have_core and have_prodmask and have_diff:
+            if have_core and have_brain and have_diff:
                 print(f"[SKIP] All requested outputs already exist for runno {runno}")
                 n_skipped += 1
                 continue
@@ -560,8 +631,8 @@ def main():
             out_method=out_method,
             premask_nii=premask_nii,
             bias_nii=bias_nii,
-            prodmask_nii=prodmask_nii,
-            masked_bfc_nii=masked_bfc_nii,
+            brainmask_nii=brainmask_nii,
+            brain_t2_nii=brain_t2_nii,
             diff_nii=diff_nii,
             tmp_otsu_pre_nii=tmp_otsu_pre_nii,
             helper_py=helper_py,
@@ -580,14 +651,21 @@ def main():
             pre_dilate_radius_pre_glc=args.pre_dilate_radius_pre_glc,
             pre_fill_holes_radius=args.pre_fill_holes_radius,
             pre_dilate_radius_final=args.pre_dilate_radius_final,
-            prod_norm_low_pct=args.prod_norm_low_pct,
-            prod_norm_high_pct=args.prod_norm_high_pct,
-            prod_threshold_frac=args.prod_threshold_frac,
-            prod_smooth_sigma=args.prod_smooth_sigma,
-            prod_close_iters=args.prod_close_iters,
-            prod_dilate_iters=args.prod_dilate_iters,
+            brain_smooth_sigma=args.brain_smooth_sigma,
+            brain_grad_sigma=args.brain_grad_sigma,
+            brain_seed_min_distance=args.brain_seed_min_distance,
+            brain_seed_score_pct=args.brain_seed_score_pct,
+            brain_seed_erode_iters=args.brain_seed_erode_iters,
+            brain_center_weight=args.brain_center_weight,
+            brain_grad_penalty=args.brain_grad_penalty,
+            brain_candidate_intensity_min=args.brain_candidate_intensity_min,
+            brain_candidate_gradient_max=args.brain_candidate_gradient_max,
+            brain_max_grow_iters=args.brain_max_grow_iters,
+            brain_close_iters=args.brain_close_iters,
+            brain_dilate_iters=args.brain_dilate_iters,
             tight_mask=args.tight_mask,
             tight_mask_erode_iters=args.tight_mask_erode_iters,
+            save_brain_debug=args.save_brain_debug,
             threads=args.threads,
             job_name=job_name,
             log_out=log_out,
