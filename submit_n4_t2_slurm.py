@@ -53,7 +53,7 @@ def submit_job(script_path: Path):
     result = subprocess.run(
         ["sbatch", str(script_path)],
         capture_output=True,
-        text=True
+        text=True,
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
@@ -89,8 +89,7 @@ def largest_component(mask: np.ndarray, structure=None) -> np.ndarray:
         return np.zeros_like(mask, dtype=bool)
     counts = np.bincount(lab.ravel())
     counts[0] = 0
-    best = counts.argmax()
-    return lab == best
+    return lab == counts.argmax()
 
 
 def remove_small_components(mask: np.ndarray, min_voxels: int, structure=None) -> np.ndarray:
@@ -147,17 +146,18 @@ def build_candidate(
     support: np.ndarray,
     structure,
     voxel_volume_mm3: float,
+    mean_spacing: float,
     shell_threshold: float,
     shell_neighborhood_mm: float,
     dark_moat_threshold: float,
     moat_close_iters: int,
+    seed_min_distance_mm: float,
     seed_intensity_min: float,
     grow_intensity_min: float,
     grow_gradient_max: float,
     grow_iters: int,
     boundary_band_mm: float,
     boundary_add_intensity_min: float,
-    mean_spacing: float,
     min_component_mm3: float,
     brain_close_iters: int,
     brain_open_iters: int,
@@ -165,10 +165,10 @@ def build_candidate(
     brain_fill_holes: bool,
 ):
     shell_neighborhood_vox = max(1.0, shell_neighborhood_mm / max(mean_spacing, 1e-6))
+    seed_min_distance_vox = max(1.0, seed_min_distance_mm / max(mean_spacing, 1e-6))
     boundary_band_vox = max(1.0, boundary_band_mm / max(mean_spacing, 1e-6))
     min_component_vox = max(1, int(round(min_component_mm3 / voxel_volume_mm3)))
 
-    # Bright shell
     shell_raw = (inten_norm >= shell_threshold) & support
     shell = remove_small_components(shell_raw, min_component_vox, structure=structure)
     if np.any(shell):
@@ -177,27 +177,25 @@ def build_candidate(
     dist_to_shell = distance_transform_edt(~shell)
     shell_neighborhood = support & (dist_to_shell <= shell_neighborhood_vox)
 
-    # Dark moat
     moat_raw = (inten_norm <= dark_moat_threshold) & support
     moat = remove_small_components(moat_raw, min_component_vox, structure=structure)
     if moat_close_iters > 0 and np.any(moat):
         moat = binary_closing(moat, structure=structure, iterations=moat_close_iters)
 
-    # Central seed
     dist_to_support_edge = distance_transform_edt(support)
     seed_region = (
         support
-        & (dist_to_support_edge >= 1.0)
+        & (dist_to_support_edge >= seed_min_distance_vox)
         & (inten_norm >= seed_intensity_min)
         & (~moat)
     )
     seed = largest_component(seed_region, structure=structure)
-
     if not np.any(seed):
         return None
 
     tissue_gate = (inten_norm >= grow_intensity_min) & (grad_norm <= grow_gradient_max)
-    interior_gate = dist_to_support_edge >= 1.0
+    interior_gate = dist_to_support_edge >= max(1.0, 0.75 * seed_min_distance_vox)
+
     allowed = support & (~moat) & tissue_gate & (shell_neighborhood | interior_gate)
     allowed |= seed
 
@@ -233,12 +231,8 @@ def build_candidate(
     brain = largest_component(brain, structure=structure)
 
     volume_mm3 = mask_volume_mm3(brain, voxel_volume_mm3)
-
-    # Score:
-    # prefer compact masks with strong shell support and less moat overlap
-    shell_overlap = np.count_nonzero(brain & shell_neighborhood)
-    moat_overlap = np.count_nonzero(brain & moat)
-    score = float(shell_overlap - 2.0 * moat_overlap)
+    shell_support = int(np.count_nonzero(brain & shell_neighborhood))
+    moat_overlap = int(np.count_nonzero(brain & moat))
 
     debug = {
         "shell_raw": shell_raw,
@@ -254,27 +248,44 @@ def build_candidate(
 
     params = {
         "shell_threshold": shell_threshold,
-        "shell_neighborhood_mm": shell_neighborhood_mm,
         "dark_moat_threshold": dark_moat_threshold,
         "seed_intensity_min": seed_intensity_min,
         "grow_intensity_min": grow_intensity_min,
-        "grow_gradient_max": grow_gradient_max,
-        "boundary_band_mm": boundary_band_mm,
-        "boundary_add_intensity_min": boundary_add_intensity_min,
     }
 
     return {
         "mask": brain,
         "volume_mm3": volume_mm3,
-        "score": score,
+        "shell_support": shell_support,
+        "moat_overlap": moat_overlap,
         "params": params,
         "debug": debug,
     }
 
 
+def select_best_candidate(candidates, preferred_min, preferred_max, hard_min, hard_max):
+    pref_mid = 0.5 * (preferred_min + preferred_max)
+
+    preferred = [c for c in candidates if preferred_min <= c["volume_mm3"] <= preferred_max]
+    hard = [c for c in candidates if hard_min <= c["volume_mm3"] <= hard_max]
+
+    def rank_key(c):
+        return (
+            -c["moat_overlap"],
+            c["shell_support"],
+            -abs(c["volume_mm3"] - pref_mid),
+        )
+
+    if preferred:
+        return sorted(preferred, key=rank_key, reverse=True)[0], "preferred"
+    if hard:
+        return sorted(hard, key=rank_key, reverse=True)[0], "hard"
+    return sorted(candidates, key=lambda c: abs(c["volume_mm3"] - pref_mid))[0], "fallback"
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Build a brain mask from BFC T2 by sweeping candidate parameters and selecting by plausible brain volume."
+        description="Build a brain mask from BFC T2 by sweeping candidates and selecting by mouse-brain volume priors."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -285,29 +296,29 @@ def main():
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
     ap.add_argument("--grad_sigma", type=float, default=1.0)
 
-    # final support looseness
-    ap.add_argument("--final_support_dilate_mm", type=float, default=0.6)
+    # final brain search support: SMALL dilation only
+    ap.add_argument("--final_support_dilate_mm", type=float, default=0.2)
 
-    # candidate sweep values
     ap.add_argument("--shell_thresholds", default="0.50,0.55,0.60")
     ap.add_argument("--dark_moat_thresholds", default="0.16,0.18,0.20")
-    ap.add_argument("--seed_intensity_mins", default="0.22,0.26,0.30")
-    ap.add_argument("--grow_intensity_mins", default="0.05,0.07,0.09")
+    ap.add_argument("--seed_intensity_mins", default="0.24,0.28,0.32")
+    ap.add_argument("--grow_intensity_mins", default="0.06,0.08,0.10")
 
-    # fixed-ish knobs
     ap.add_argument("--shell_neighborhood_mm", type=float, default=0.45)
     ap.add_argument("--moat_close_iters", type=int, default=1)
-    ap.add_argument("--grow_gradient_max", type=float, default=0.90)
-    ap.add_argument("--grow_iters", type=int, default=250)
-    ap.add_argument("--boundary_band_mm", type=float, default=0.25)
+    ap.add_argument("--seed_min_distance_mm", type=float, default=0.8)
+    ap.add_argument("--grow_gradient_max", type=float, default=0.85)
+    ap.add_argument("--grow_iters", type=int, default=220)
+    ap.add_argument("--boundary_band_mm", type=float, default=0.20)
     ap.add_argument("--boundary_add_intensity_min", type=float, default=0.05)
     ap.add_argument("--min_component_mm3", type=float, default=0.03)
 
-    # volume selection
-    ap.add_argument("--brain_volume_min_mm3", type=float, required=True)
-    ap.add_argument("--brain_volume_max_mm3", type=float, required=True)
+    # hardcoded defaults for mouse brain volume
+    ap.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
+    ap.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
+    ap.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
+    ap.add_argument("--brain_volume_preferred_max_mm3", type=float, default=550.0)
 
-    # cleanup
     ap.add_argument("--brain_close_iters", type=int, default=2)
     ap.add_argument("--brain_open_iters", type=int, default=0)
     ap.add_argument("--brain_dilate_iters", type=int, default=0)
@@ -338,15 +349,15 @@ def main():
     structure = generate_binary_structure(3, 2)
 
     final_support_dilate_vox = max(1.0, args.final_support_dilate_mm / max(mean_spacing, 1e-6))
-    loose_support = binary_dilation(
+    final_support = binary_dilation(
         support, structure=structure, iterations=int(np.ceil(final_support_dilate_vox))
     )
-    loose_support = largest_component(loose_support, structure=structure)
+    final_support = largest_component(final_support, structure=structure)
 
     bfc_smooth = gaussian_filter(bfc, sigma=args.smooth_sigma)
-    inten_norm = robust_normalize(bfc_smooth, loose_support, low_pct=2.0, high_pct=98.0)
+    inten_norm = robust_normalize(bfc_smooth, final_support, low_pct=2.0, high_pct=98.0)
     grad = gaussian_gradient_magnitude(bfc_smooth, sigma=args.grad_sigma)
-    grad_norm = robust_normalize(grad, loose_support, low_pct=2.0, high_pct=98.0)
+    grad_norm = robust_normalize(grad, final_support, low_pct=2.0, high_pct=98.0)
 
     shell_thresholds = [float(x) for x in args.shell_thresholds.split(",") if x.strip()]
     moat_thresholds = [float(x) for x in args.dark_moat_thresholds.split(",") if x.strip()]
@@ -362,20 +373,21 @@ def main():
                     cand = build_candidate(
                         inten_norm=inten_norm,
                         grad_norm=grad_norm,
-                        support=loose_support,
+                        support=final_support,
                         structure=structure,
                         voxel_volume_mm3=voxel_volume_mm3,
+                        mean_spacing=mean_spacing,
                         shell_threshold=shell_threshold,
                         shell_neighborhood_mm=args.shell_neighborhood_mm,
                         dark_moat_threshold=moat_threshold,
                         moat_close_iters=args.moat_close_iters,
+                        seed_min_distance_mm=args.seed_min_distance_mm,
                         seed_intensity_min=seed_min,
                         grow_intensity_min=grow_min,
                         grow_gradient_max=args.grow_gradient_max,
                         grow_iters=args.grow_iters,
                         boundary_band_mm=args.boundary_band_mm,
                         boundary_add_intensity_min=args.boundary_add_intensity_min,
-                        mean_spacing=mean_spacing,
                         min_component_mm3=args.min_component_mm3,
                         brain_close_iters=args.brain_close_iters,
                         brain_open_iters=args.brain_open_iters,
@@ -388,23 +400,13 @@ def main():
     if not candidates:
         raise RuntimeError("No candidate brain masks were generated.")
 
-    valid = [
-        c for c in candidates
-        if args.brain_volume_min_mm3 <= c["volume_mm3"] <= args.brain_volume_max_mm3
-    ]
-
-    if valid:
-        # among valid masks, prefer best score, then closest to center of allowed volume range
-        vol_target = 0.5 * (args.brain_volume_min_mm3 + args.brain_volume_max_mm3)
-
-        def valid_key(c):
-            return (c["score"], -abs(c["volume_mm3"] - vol_target))
-
-        best = sorted(valid, key=valid_key, reverse=True)[0]
-    else:
-        # fallback: choose candidate closest to target range midpoint
-        vol_target = 0.5 * (args.brain_volume_min_mm3 + args.brain_volume_max_mm3)
-        best = sorted(candidates, key=lambda c: abs(c["volume_mm3"] - vol_target))[0]
+    best, selection_mode = select_best_candidate(
+        candidates,
+        args.brain_volume_preferred_min_mm3,
+        args.brain_volume_preferred_max_mm3,
+        args.brain_volume_hard_min_mm3,
+        args.brain_volume_hard_max_mm3,
+    )
 
     brain = best["mask"]
 
@@ -421,7 +423,7 @@ def main():
 
     if args.debug_prefix:
         prefix = Path(args.debug_prefix)
-        save_like(prefix.with_name(prefix.name + "_loose_support.nii.gz"), loose_support.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_final_support.nii.gz"), final_support.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
 
@@ -437,17 +439,21 @@ def main():
         save_like(prefix.with_name(prefix.name + "_boundary_add.nii.gz"), dbg["boundary_add"].astype(np.uint8), bfc_img)
 
         summary = {
+            "selection_mode": selection_mode,
             "selected_volume_mm3": best["volume_mm3"],
-            "selected_score": best["score"],
+            "selected_shell_support": best["shell_support"],
+            "selected_moat_overlap": best["moat_overlap"],
             "selected_params": best["params"],
-            "brain_volume_min_mm3": args.brain_volume_min_mm3,
-            "brain_volume_max_mm3": args.brain_volume_max_mm3,
+            "brain_volume_hard_min_mm3": args.brain_volume_hard_min_mm3,
+            "brain_volume_hard_max_mm3": args.brain_volume_hard_max_mm3,
+            "brain_volume_preferred_min_mm3": args.brain_volume_preferred_min_mm3,
+            "brain_volume_preferred_max_mm3": args.brain_volume_preferred_max_mm3,
             "n_candidates_total": len(candidates),
-            "n_candidates_in_range": len(valid),
             "all_candidates": [
                 {
                     "volume_mm3": c["volume_mm3"],
-                    "score": c["score"],
+                    "shell_support": c["shell_support"],
+                    "moat_overlap": c["moat_overlap"],
                     "params": c["params"],
                 }
                 for c in candidates
@@ -502,13 +508,16 @@ def build_job_script(
     brain_grow_intensity_mins: str,
     brain_shell_neighborhood_mm: float,
     brain_moat_close_iters: int,
+    brain_seed_min_distance_mm: float,
     brain_grow_gradient_max: float,
     brain_grow_iters: int,
     brain_boundary_band_mm: float,
     brain_boundary_add_intensity_min: float,
     brain_min_component_mm3: float,
-    brain_volume_min_mm3: float,
-    brain_volume_max_mm3: float,
+    brain_volume_hard_min_mm3: float,
+    brain_volume_hard_max_mm3: float,
+    brain_volume_preferred_min_mm3: float,
+    brain_volume_preferred_max_mm3: float,
     brain_close_iters: int,
     brain_open_iters: int,
     brain_dilate_iters: int,
@@ -671,7 +680,7 @@ if [[ "$need_brainmask" == "1" ]]; then
         exit 1
     fi
 
-    echo "Creating candidate brain masks with volume-based auto-selection..."
+    echo "Creating candidate brain masks with mouse-volume priors..."
     brain_cmd=(
         "$python_exe" "$helper_py"
         --bfc "$out_nii"
@@ -687,13 +696,16 @@ if [[ "$need_brainmask" == "1" ]]; then
         --grow_intensity_mins """ + shell_quote(brain_grow_intensity_mins) + r"""
         --shell_neighborhood_mm """ + str(brain_shell_neighborhood_mm) + r"""
         --moat_close_iters """ + str(brain_moat_close_iters) + r"""
+        --seed_min_distance_mm """ + str(brain_seed_min_distance_mm) + r"""
         --grow_gradient_max """ + str(brain_grow_gradient_max) + r"""
         --grow_iters """ + str(brain_grow_iters) + r"""
         --boundary_band_mm """ + str(brain_boundary_band_mm) + r"""
         --boundary_add_intensity_min """ + str(brain_boundary_add_intensity_min) + r"""
         --min_component_mm3 """ + str(brain_min_component_mm3) + r"""
-        --brain_volume_min_mm3 """ + str(brain_volume_min_mm3) + r"""
-        --brain_volume_max_mm3 """ + str(brain_volume_max_mm3) + r"""
+        --brain_volume_hard_min_mm3 """ + str(brain_volume_hard_min_mm3) + r"""
+        --brain_volume_hard_max_mm3 """ + str(brain_volume_hard_max_mm3) + r"""
+        --brain_volume_preferred_min_mm3 """ + str(brain_volume_preferred_min_mm3) + r"""
+        --brain_volume_preferred_max_mm3 """ + str(brain_volume_preferred_max_mm3) + r"""
         --brain_close_iters """ + str(brain_close_iters) + r"""
         --brain_open_iters """ + str(brain_open_iters) + r"""
         --brain_dilate_iters """ + str(brain_dilate_iters) + r"""
@@ -759,7 +771,6 @@ def main():
     p.add_argument("--bspline", default="[8]")
     p.add_argument("--histogram_sharpening", default="[0.15,0.01,200]")
 
-    # generous N4 support
     p.add_argument("--pre_otsu_keep_low", type=int, default=2)
     p.add_argument("--pre_otsu_keep_high", type=int, default=4)
     p.add_argument("--pre_close_radius", type=int, default=2)
@@ -768,27 +779,29 @@ def main():
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
     p.add_argument("--pre_support_extra_dilate_radius", type=int, default=4)
 
-    # final masking
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
-    p.add_argument("--brain_final_support_dilate_mm", type=float, default=0.4)
+    p.add_argument("--brain_final_support_dilate_mm", type=float, default=0.2)
 
     p.add_argument("--brain_shell_thresholds", default="0.50,0.55,0.60")
     p.add_argument("--brain_dark_moat_thresholds", default="0.16,0.18,0.20")
-    p.add_argument("--brain_seed_intensity_mins", default="0.22,0.26,0.30")
-    p.add_argument("--brain_grow_intensity_mins", default="0.05,0.07,0.09")
+    p.add_argument("--brain_seed_intensity_mins", default="0.24,0.28,0.32")
+    p.add_argument("--brain_grow_intensity_mins", default="0.06,0.08,0.10")
 
     p.add_argument("--brain_shell_neighborhood_mm", type=float, default=0.45)
     p.add_argument("--brain_moat_close_iters", type=int, default=1)
-    p.add_argument("--brain_grow_gradient_max", type=float, default=0.90)
-    p.add_argument("--brain_grow_iters", type=int, default=250)
-    p.add_argument("--brain_boundary_band_mm", type=float, default=0.25)
+    p.add_argument("--brain_seed_min_distance_mm", type=float, default=0.8)
+    p.add_argument("--brain_grow_gradient_max", type=float, default=0.85)
+    p.add_argument("--brain_grow_iters", type=int, default=220)
+    p.add_argument("--brain_boundary_band_mm", type=float, default=0.20)
     p.add_argument("--brain_boundary_add_intensity_min", type=float, default=0.05)
     p.add_argument("--brain_min_component_mm3", type=float, default=0.03)
 
-    # REQUIRED user-tunable biologic prior
-    p.add_argument("--brain_volume_min_mm3", type=float, required=True)
-    p.add_argument("--brain_volume_max_mm3", type=float, required=True)
+    # hardcoded mouse defaults
+    p.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
+    p.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
+    p.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
+    p.add_argument("--brain_volume_preferred_max_mm3", type=float, default=550.0)
 
     p.add_argument("--brain_close_iters", type=int, default=2)
     p.add_argument("--brain_open_iters", type=int, default=0)
@@ -918,13 +931,16 @@ def main():
             brain_grow_intensity_mins=args.brain_grow_intensity_mins,
             brain_shell_neighborhood_mm=args.brain_shell_neighborhood_mm,
             brain_moat_close_iters=args.brain_moat_close_iters,
+            brain_seed_min_distance_mm=args.brain_seed_min_distance_mm,
             brain_grow_gradient_max=args.brain_grow_gradient_max,
             brain_grow_iters=args.brain_grow_iters,
             brain_boundary_band_mm=args.brain_boundary_band_mm,
             brain_boundary_add_intensity_min=args.brain_boundary_add_intensity_min,
             brain_min_component_mm3=args.brain_min_component_mm3,
-            brain_volume_min_mm3=args.brain_volume_min_mm3,
-            brain_volume_max_mm3=args.brain_volume_max_mm3,
+            brain_volume_hard_min_mm3=args.brain_volume_hard_min_mm3,
+            brain_volume_hard_max_mm3=args.brain_volume_hard_max_mm3,
+            brain_volume_preferred_min_mm3=args.brain_volume_preferred_min_mm3,
+            brain_volume_preferred_max_mm3=args.brain_volume_preferred_max_mm3,
             brain_close_iters=args.brain_close_iters,
             brain_open_iters=args.brain_open_iters,
             brain_dilate_iters=args.brain_dilate_iters,
