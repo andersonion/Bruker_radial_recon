@@ -89,8 +89,7 @@ def largest_component(mask: np.ndarray, structure=None) -> np.ndarray:
         return np.zeros_like(mask, dtype=bool)
     counts = np.bincount(lab.ravel())
     counts[0] = 0
-    best = counts.argmax()
-    return lab == best
+    return lab == counts.argmax()
 
 
 def remove_small_components(mask: np.ndarray, min_voxels: int, structure=None) -> np.ndarray:
@@ -252,6 +251,7 @@ def build_candidate(
         "seed": seed,
         "allowed": allowed,
         "boundary_add": boundary_add,
+        "candidate_mask": brain,
     }
 
     return {
@@ -264,29 +264,81 @@ def build_candidate(
     }
 
 
+def rank_candidate(c, preferred_mid):
+    return (
+        -c["moat_overlap"],
+        c["shell_support"],
+        -abs(c["volume_mm3"] - preferred_mid),
+    )
+
+
+def save_failure_debug(prefix: Path, ref_img, final_support, inten_norm, grad_norm, candidates, hard_min, hard_max, pref_min, pref_max):
+    preferred_mid = 0.5 * (pref_min + pref_max)
+    ranked = sorted(candidates, key=lambda c: rank_candidate(c, preferred_mid), reverse=True)
+
+    save_like(prefix.with_name(prefix.name + "_final_support.nii.gz"), final_support.astype(np.uint8), ref_img)
+    save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), ref_img)
+    save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), ref_img)
+
+    topn = ranked[:5]
+    for i, cand in enumerate(topn):
+        dbg = cand["debug"]
+        stem = prefix.with_name(prefix.name + f"_cand{i:02d}")
+        save_like(stem.with_name(stem.name + "_mask.nii.gz"), dbg["candidate_mask"].astype(np.uint8), ref_img)
+        save_like(stem.with_name(stem.name + "_shell.nii.gz"), dbg["shell"].astype(np.uint8), ref_img)
+        save_like(stem.with_name(stem.name + "_shell_neighborhood.nii.gz"), dbg["shell_neighborhood"].astype(np.uint8), ref_img)
+        save_like(stem.with_name(stem.name + "_moat.nii.gz"), dbg["moat"].astype(np.uint8), ref_img)
+        save_like(stem.with_name(stem.name + "_seed.nii.gz"), dbg["seed"].astype(np.uint8), ref_img)
+        save_like(stem.with_name(stem.name + "_allowed.nii.gz"), dbg["allowed"].astype(np.uint8), ref_img)
+        save_like(stem.with_name(stem.name + "_boundary_add.nii.gz"), dbg["boundary_add"].astype(np.uint8), ref_img)
+
+    summary = {
+        "selection_mode": "none",
+        "reason": "No candidate satisfied hard physically allowed brain-volume constraints.",
+        "brain_volume_hard_min_mm3": hard_min,
+        "brain_volume_hard_max_mm3": hard_max,
+        "brain_volume_preferred_min_mm3": pref_min,
+        "brain_volume_preferred_max_mm3": pref_max,
+        "n_candidates_total": len(candidates),
+        "top_ranked_candidates": [
+            {
+                "volume_mm3": c["volume_mm3"],
+                "shell_support": c["shell_support"],
+                "moat_overlap": c["moat_overlap"],
+                "params": c["params"],
+            }
+            for c in topn
+        ],
+        "all_candidates": [
+            {
+                "volume_mm3": c["volume_mm3"],
+                "shell_support": c["shell_support"],
+                "moat_overlap": c["moat_overlap"],
+                "params": c["params"],
+            }
+            for c in candidates
+        ],
+    }
+    with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+
 def select_best_candidate(candidates, preferred_min, preferred_max, hard_min, hard_max):
     preferred = [c for c in candidates if preferred_min <= c["volume_mm3"] <= preferred_max]
     hard = [c for c in candidates if hard_min <= c["volume_mm3"] <= hard_max]
 
-    pref_mid = 0.5 * (preferred_min + preferred_max)
-
-    def rank_key(c):
-        return (
-            -c["moat_overlap"],
-            c["shell_support"],
-            -abs(c["volume_mm3"] - pref_mid),
-        )
+    preferred_mid = 0.5 * (preferred_min + preferred_max)
 
     if preferred:
-        return sorted(preferred, key=rank_key, reverse=True)[0], "preferred"
+        return sorted(preferred, key=lambda c: rank_candidate(c, preferred_mid), reverse=True)[0], "preferred"
     if hard:
-        return sorted(hard, key=rank_key, reverse=True)[0], "hard"
+        return sorted(hard, key=lambda c: rank_candidate(c, preferred_mid), reverse=True)[0], "hard"
     return None, "none"
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build a brain mask from BFC T2 using shell+moat+seed growth with hard mouse-brain volume constraints."
+        description="Build a brain mask from BFC T2 using the rollback shell+moat+seed growth branch, with hard mouse-brain volume constraints."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -297,14 +349,14 @@ def main():
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
     ap.add_argument("--grad_sigma", type=float, default=1.0)
 
-    # Keep final support tight-ish
+    # tight final support
     ap.add_argument("--final_support_dilate_mm", type=float, default=0.15)
 
-    # Candidate sweep
-    ap.add_argument("--shell_thresholds", default="0.48,0.52,0.56")
-    ap.add_argument("--moat_thresholds", default="0.14,0.16,0.18")
-    ap.add_argument("--seed_intensity_mins", default="0.24,0.28,0.32")
-    ap.add_argument("--grow_intensity_mins", default="0.06,0.08,0.10")
+    # candidate sweeps
+    ap.add_argument("--shell_thresholds", default="0.44,0.48,0.52,0.56")
+    ap.add_argument("--moat_thresholds", default="0.12,0.14,0.16,0.18,0.20")
+    ap.add_argument("--seed_intensity_mins", default="0.20,0.24,0.28,0.32")
+    ap.add_argument("--grow_intensity_mins", default="0.04,0.06,0.08,0.10")
 
     ap.add_argument("--shell_neighborhood_mm", type=float, default=0.45)
     ap.add_argument("--moat_close_iters", type=int, default=1)
@@ -315,13 +367,13 @@ def main():
     ap.add_argument("--boundary_add_intensity_min", type=float, default=0.05)
     ap.add_argument("--min_component_mm3", type=float, default=0.03)
 
-    # Mouse defaults
+    # mouse defaults
     ap.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
     ap.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
     ap.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
     ap.add_argument("--brain_volume_preferred_max_mm3", type=float, default=550.0)
 
-    # Cleanup
+    # cleanup
     ap.add_argument("--brain_close_iters", type=int, default=2)
     ap.add_argument("--brain_open_iters", type=int, default=0)
     ap.add_argument("--brain_dilate_iters", type=int, default=0)
@@ -412,28 +464,20 @@ def main():
     )
 
     if best is None:
-        summary = {
-            "selection_mode": selection_mode,
-            "reason": "No candidate satisfied hard physically allowed brain-volume constraints.",
-            "brain_volume_hard_min_mm3": args.brain_volume_hard_min_mm3,
-            "brain_volume_hard_max_mm3": args.brain_volume_hard_max_mm3,
-            "brain_volume_preferred_min_mm3": args.brain_volume_preferred_min_mm3,
-            "brain_volume_preferred_max_mm3": args.brain_volume_preferred_max_mm3,
-            "n_candidates_total": len(candidates),
-            "all_candidates": [
-                {
-                    "volume_mm3": c["volume_mm3"],
-                    "shell_support": c["shell_support"],
-                    "moat_overlap": c["moat_overlap"],
-                    "params": c["params"],
-                }
-                for c in candidates
-            ],
-        }
         if args.debug_prefix:
             prefix = Path(args.debug_prefix)
-            with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
-                json.dump(summary, f, indent=2)
+            save_failure_debug(
+                prefix=prefix,
+                ref_img=bfc_img,
+                final_support=final_support,
+                inten_norm=inten_norm,
+                grad_norm=grad_norm,
+                candidates=candidates,
+                hard_min=args.brain_volume_hard_min_mm3,
+                hard_max=args.brain_volume_hard_max_mm3,
+                pref_min=args.brain_volume_preferred_min_mm3,
+                pref_max=args.brain_volume_preferred_max_mm3,
+            )
         raise RuntimeError("No candidate mask satisfied hard physically allowed brain-volume constraints.")
 
     brain = best["mask"]
@@ -799,7 +843,6 @@ def main():
     p.add_argument("--bspline", default="[8]")
     p.add_argument("--histogram_sharpening", default="[0.15,0.01,200]")
 
-    # Generous N4 support
     p.add_argument("--pre_otsu_keep_low", type=int, default=2)
     p.add_argument("--pre_otsu_keep_high", type=int, default=4)
     p.add_argument("--pre_close_radius", type=int, default=2)
@@ -808,15 +851,14 @@ def main():
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
     p.add_argument("--pre_support_extra_dilate_radius", type=int, default=4)
 
-    # Rollback-style growth masker
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
     p.add_argument("--brain_final_support_dilate_mm", type=float, default=0.15)
 
-    p.add_argument("--brain_shell_thresholds", default="0.48,0.52,0.56")
-    p.add_argument("--brain_moat_thresholds", default="0.14,0.16,0.18")
-    p.add_argument("--brain_seed_intensity_mins", default="0.24,0.28,0.32")
-    p.add_argument("--brain_grow_intensity_mins", default="0.06,0.08,0.10")
+    p.add_argument("--brain_shell_thresholds", default="0.44,0.48,0.52,0.56")
+    p.add_argument("--brain_moat_thresholds", default="0.12,0.14,0.16,0.18,0.20")
+    p.add_argument("--brain_seed_intensity_mins", default="0.20,0.24,0.28,0.32")
+    p.add_argument("--brain_grow_intensity_mins", default="0.04,0.06,0.08,0.10")
 
     p.add_argument("--brain_shell_neighborhood_mm", type=float, default=0.45)
     p.add_argument("--brain_moat_close_iters", type=int, default=1)
@@ -827,7 +869,6 @@ def main():
     p.add_argument("--brain_boundary_add_intensity_min", type=float, default=0.05)
     p.add_argument("--brain_min_component_mm3", type=float, default=0.03)
 
-    # Mouse defaults
     p.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
     p.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
     p.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
