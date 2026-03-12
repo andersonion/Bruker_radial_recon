@@ -72,7 +72,6 @@ from scipy.ndimage import (
     binary_erosion,
     binary_fill_holes,
     binary_opening,
-    binary_propagation,
     distance_transform_edt,
     gaussian_filter,
     gaussian_gradient_magnitude,
@@ -93,19 +92,6 @@ def largest_component(mask: np.ndarray, structure=None) -> np.ndarray:
     return lab == best
 
 
-def robust_normalize(vol: np.ndarray, mask: np.ndarray, low_pct=2.0, high_pct=98.0) -> np.ndarray:
-    vals = vol[mask]
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        raise RuntimeError("No finite values inside mask for normalization.")
-    lo = np.percentile(vals, low_pct)
-    hi = np.percentile(vals, high_pct)
-    if hi <= lo:
-        raise RuntimeError(f"Bad normalization range: lo={lo}, hi={hi}")
-    out = (vol - lo) / (hi - lo)
-    return np.clip(out, 0.0, 1.0)
-
-
 def remove_small_components(mask: np.ndarray, min_voxels: int, structure=None) -> np.ndarray:
     if structure is None:
         structure = generate_binary_structure(3, 2)
@@ -122,15 +108,17 @@ def remove_small_components(mask: np.ndarray, min_voxels: int, structure=None) -
     return keep[lab]
 
 
-def boundary_seed(mask: np.ndarray) -> np.ndarray:
-    seed = np.zeros_like(mask, dtype=bool)
-    seed[0, :, :] |= mask[0, :, :]
-    seed[-1, :, :] |= mask[-1, :, :]
-    seed[:, 0, :] |= mask[:, 0, :]
-    seed[:, -1, :] |= mask[:, -1, :]
-    seed[:, :, 0] |= mask[:, :, 0]
-    seed[:, :, -1] |= mask[:, :, -1]
-    return seed
+def robust_normalize(vol: np.ndarray, mask: np.ndarray, low_pct=2.0, high_pct=98.0) -> np.ndarray:
+    vals = vol[mask]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        raise RuntimeError("No finite values inside mask for normalization.")
+    lo = np.percentile(vals, low_pct)
+    hi = np.percentile(vals, high_pct)
+    if hi <= lo:
+        raise RuntimeError(f"Bad normalization range: lo={lo}, hi={hi}")
+    out = (vol - lo) / (hi - lo)
+    return np.clip(out, 0.0, 1.0)
 
 
 def constrained_region_grow(seed: np.ndarray, allowed: np.ndarray, structure, max_iters: int) -> np.ndarray:
@@ -150,7 +138,7 @@ def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build a brain mask from BFC T2 using shell/barrier logic plus targeted brainstem rescue."
+        description="Build a brain mask from BFC T2 using a dark-moat exclusion model plus optional targeted brainstem rescue."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -160,38 +148,34 @@ def main():
 
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
     ap.add_argument("--grad_sigma", type=float, default=1.0)
-    ap.add_argument("--grad_threshold", type=float, default=0.10)
 
-    ap.add_argument("--min_barrier_volume_mm3", type=float, default=0.05)
-    ap.add_argument("--min_enclosed_volume_mm3", type=float, default=1.0)
-    ap.add_argument("--close_barrier_iters", type=int, default=1)
+    # Dark moat
+    ap.add_argument("--dark_moat_threshold", type=float, default=0.20)
+    ap.add_argument("--min_moat_volume_mm3", type=float, default=0.03)
+    ap.add_argument("--moat_close_iters", type=int, default=1)
 
-    # Main shell inclusion: stricter by default
-    ap.add_argument("--shell_thickness_mm", type=float, default=0.22)
-    ap.add_argument("--shell_grad_min", type=float, default=0.04)
-    ap.add_argument("--shell_intensity_min", type=float, default=0.04)
-    ap.add_argument("--shell_use_gate", action="store_true")
+    # Main brain seed / growth
+    ap.add_argument("--seed_min_distance_mm", type=float, default=0.8,
+                    help="Minimum distance from support boundary for central seed search.")
+    ap.add_argument("--seed_intensity_min", type=float, default=0.35)
+    ap.add_argument("--grow_intensity_min", type=float, default=0.08)
+    ap.add_argument("--grow_gradient_max", type=float, default=0.80)
+    ap.add_argument("--grow_iters", type=int, default=200)
 
-    # Broad rescue: OFF by default
-    ap.add_argument("--do_global_rescue", action="store_true")
-    ap.add_argument("--rescue_max_distance_mm", type=float, default=0.25)
-    ap.add_argument("--rescue_intensity_min", type=float, default=0.10)
-    ap.add_argument("--rescue_gradient_max", type=float, default=0.35)
-    ap.add_argument("--rescue_iters", type=int, default=20)
+    # Optional slight shell add-back after moat-constrained growth
+    ap.add_argument("--shell_add_mm", type=float, default=0.10)
+    ap.add_argument("--shell_add_intensity_min", type=float, default=0.06)
 
     # Brainstem-only rescue
     ap.add_argument("--do_brainstem_rescue", action="store_true")
-    ap.add_argument("--brainstem_seed_slice_frac", type=float, default=0.18,
-                    help="Use inferior-most fraction of current mask as brainstem seed band.")
-    ap.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.2,
-                    help="Lateral/overall corridor radius around inferior mask COM.")
-    ap.add_argument("--brainstem_max_inferior_mm", type=float, default=2.5,
-                    help="Max inferior extension below current brain mask.")
-    ap.add_argument("--brainstem_intensity_min", type=float, default=0.05)
-    ap.add_argument("--brainstem_gradient_max", type=float, default=0.70)
-    ap.add_argument("--brainstem_iters", type=int, default=40)
+    ap.add_argument("--brainstem_seed_slice_frac", type=float, default=0.18)
+    ap.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.0)
+    ap.add_argument("--brainstem_max_inferior_mm", type=float, default=3.0)
+    ap.add_argument("--brainstem_intensity_min", type=float, default=0.04)
+    ap.add_argument("--brainstem_gradient_max", type=float, default=0.80)
+    ap.add_argument("--brainstem_iters", type=int, default=50)
 
-    # final morphology
+    # Final morphology
     ap.add_argument("--brain_close_iters", type=int, default=2)
     ap.add_argument("--brain_open_iters", type=int, default=0)
     ap.add_argument("--brain_dilate_iters", type=int, default=0)
@@ -219,13 +203,11 @@ def main():
         raise RuntimeError(f"Bad voxel volume from header: {voxel_volume_mm3}")
 
     mean_spacing = float(np.mean(zooms))
-    shell_thickness_vox = max(1.0, args.shell_thickness_mm / max(mean_spacing, 1e-6))
-    rescue_max_distance_vox = max(1.0, args.rescue_max_distance_mm / max(mean_spacing, 1e-6))
+    seed_min_distance_vox = max(1.0, args.seed_min_distance_mm / max(mean_spacing, 1e-6))
+    shell_add_vox = max(1.0, args.shell_add_mm / max(mean_spacing, 1e-6))
     brainstem_corridor_radius_vox = max(1.0, args.brainstem_corridor_radius_mm / max(mean_spacing, 1e-6))
     brainstem_max_inferior_vox = max(1.0, args.brainstem_max_inferior_mm / max(mean_spacing, 1e-6))
-
-    min_barrier_vox = max(1, int(round(args.min_barrier_volume_mm3 / voxel_volume_mm3)))
-    min_enclosed_vox = max(1, int(round(args.min_enclosed_volume_mm3 / voxel_volume_mm3)))
+    min_moat_vox = max(1, int(round(args.min_moat_volume_mm3 / voxel_volume_mm3)))
 
     structure = generate_binary_structure(3, 2)
 
@@ -235,70 +217,55 @@ def main():
     grad = gaussian_gradient_magnitude(bfc_smooth, sigma=args.grad_sigma)
     grad_norm = robust_normalize(grad, support, low_pct=2.0, high_pct=98.0)
 
-    # 1) barrier / enclosed cavity
-    barrier_raw = (grad_norm >= args.grad_threshold) & support
-    barrier = remove_small_components(barrier_raw, min_barrier_vox, structure=structure)
+    # 1) Dark moat
+    moat_raw = (inten_norm <= args.dark_moat_threshold) & support
+    moat = remove_small_components(moat_raw, min_moat_vox, structure=structure)
+    if args.moat_close_iters > 0 and np.any(moat):
+        moat = binary_closing(moat, structure=structure, iterations=args.moat_close_iters)
 
-    if args.close_barrier_iters > 0 and np.any(barrier):
-        barrier = binary_closing(barrier, structure=structure, iterations=args.close_barrier_iters)
+    # 2) Central bright seed
+    dist_to_support_edge = distance_transform_edt(support)
+    seed_region = support & (dist_to_support_edge >= seed_min_distance_vox) & (inten_norm >= args.seed_intensity_min)
+    seed_region &= (~moat)
+    seed = largest_component(seed_region, structure=structure)
 
-    open_space = support & (~barrier)
-    seeds = boundary_seed(open_space)
-    outside = binary_propagation(seeds, structure=structure, mask=open_space)
+    if not np.any(seed):
+        # fallback: relax seed threshold
+        seed_region = support & (dist_to_support_edge >= max(1.0, 0.5 * seed_min_distance_vox)) & (inten_norm >= max(0.2, args.seed_intensity_min * 0.7))
+        seed_region &= (~moat)
+        seed = largest_component(seed_region, structure=structure)
 
-    enclosed = open_space & (~outside)
-    enclosed = remove_small_components(enclosed, min_enclosed_vox, structure=structure)
-    enclosed = largest_component(enclosed, structure=structure)
+    if not np.any(seed):
+        raise RuntimeError("No valid central seed found. Try lowering seed threshold.")
 
-    if not np.any(enclosed):
-        raise RuntimeError("No enclosed cavity found. Try lowering grad threshold or barrier cleanup.")
+    # 3) Main growth constrained by support and NOT moat
+    allowed = support & (~moat)
+    grow_gate = (inten_norm >= args.grow_intensity_min) & (grad_norm <= args.grow_gradient_max)
+    allowed &= grow_gate
+    allowed |= seed
 
-    # 2) filled cavity so ventricles stay included
-    cavity_filled = binary_fill_holes(enclosed)
-    cavity_filled = largest_component(cavity_filled, structure=structure)
-
-    # 3) add modest shell
-    dist_to_cavity = distance_transform_edt(~cavity_filled)
-    shell_zone = support & (dist_to_cavity <= shell_thickness_vox)
-
-    if args.shell_use_gate:
-        shell_gate = (grad_norm >= args.shell_grad_min) | (inten_norm >= args.shell_intensity_min)
-        shell_zone &= shell_gate
-
-    brain = cavity_filled | shell_zone
-    brain &= support
+    brain = constrained_region_grow(seed, allowed, structure, args.grow_iters)
     brain = largest_component(brain, structure=structure)
 
-    # 4) optional tiny global rescue
-    if args.do_global_rescue:
-        dist_to_brain = distance_transform_edt(~brain)
-        rescue_zone = support & (dist_to_brain <= rescue_max_distance_vox)
-        rescue_gate = (inten_norm >= args.rescue_intensity_min) & (grad_norm <= args.rescue_gradient_max)
-        rescue_allowed = rescue_zone & rescue_gate
-        rescue_allowed |= brain
-        brain = constrained_region_grow(brain, rescue_allowed, structure, args.rescue_iters)
-        brain = largest_component(brain, structure=structure)
-    else:
-        dist_to_brain = distance_transform_edt(~brain)
-        rescue_allowed = np.zeros_like(brain, dtype=bool)
+    # 4) Small shell add-back near grown brain only
+    dist_to_brain = distance_transform_edt(~brain)
+    shell_add = support & (dist_to_brain <= shell_add_vox) & (inten_norm >= args.shell_add_intensity_min) & (~moat)
+    brain |= shell_add
+    brain = largest_component(brain, structure=structure)
 
-    # 5) targeted brainstem rescue
-    brainstem_allowed = np.zeros_like(brain, dtype=bool)
+    # 5) Targeted brainstem rescue
     brainstem_seed = np.zeros_like(brain, dtype=bool)
+    brainstem_allowed = np.zeros_like(brain, dtype=bool)
 
     if args.do_brainstem_rescue and np.any(brain):
         coords = np.argwhere(brain)
-        zmax = coords[:, 2].max()
         zmin = coords[:, 2].min()
+        zmax = coords[:, 2].max()
         zspan = max(1, zmax - zmin + 1)
         seed_depth = max(1, int(round(args.brainstem_seed_slice_frac * zspan)))
-
-        # inferior-most band of current brain
-        inferior_band = brain.copy()
-        inferior_band[:, :, :max(0, zmax - zspan + 1)] = inferior_band[:, :, :max(0, zmax - zspan + 1)]  # no-op
         z_cut = zmax - seed_depth + 1
-        inferior_band = brain & (np.indices(brain.shape)[2] >= z_cut)
 
+        inferior_band = brain & (np.indices(brain.shape)[2] >= z_cut)
         inferior_band = largest_component(inferior_band, structure=structure)
         brainstem_seed = inferior_band.copy()
 
@@ -310,10 +277,9 @@ def main():
             rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
 
             inferior_limit = zz <= (seed_coords[:, 2].max() + brainstem_max_inferior_vox)
-
             corridor = support & (rr <= brainstem_corridor_radius_vox) & inferior_limit
 
-            tissue_gate = (inten_norm >= args.brainstem_intensity_min) & (grad_norm <= args.brainstem_gradient_max)
+            tissue_gate = (inten_norm >= args.brainstem_intensity_min) & (grad_norm <= args.brainstem_gradient_max) & (~moat)
             brainstem_allowed = corridor & tissue_gate
             brainstem_allowed |= brainstem_seed
 
@@ -321,7 +287,7 @@ def main():
             brain |= brainstem_grown
             brain = largest_component(brain, structure=structure)
 
-    # 6) cleanup
+    # 6) Cleanup
     if args.brain_fill_holes:
         brain = binary_fill_holes(brain)
 
@@ -352,19 +318,16 @@ def main():
 
     if args.debug_prefix:
         prefix = Path(args.debug_prefix)
-        save_like(prefix.with_name(prefix.name + "_grad.nii.gz"), grad.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_barrier_raw.nii.gz"), barrier_raw.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_barrier.nii.gz"), barrier.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_open_space.nii.gz"), open_space.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_outside.nii.gz"), outside.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_enclosed.nii.gz"), enclosed.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_cavity_filled.nii.gz"), cavity_filled.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_dist_to_cavity.nii.gz"), dist_to_cavity.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_shell_zone.nii.gz"), shell_zone.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_moat_raw.nii.gz"), moat_raw.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_moat.nii.gz"), moat.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_seed_region.nii.gz"), seed_region.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_seed.nii.gz"), seed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_allowed.nii.gz"), allowed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_dist_to_support_edge.nii.gz"), dist_to_support_edge.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_dist_to_brain.nii.gz"), dist_to_brain.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_rescue_allowed.nii.gz"), rescue_allowed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_shell_add.nii.gz"), shell_add.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_brainstem_seed.nii.gz"), brainstem_seed.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_brainstem_allowed.nii.gz"), brainstem_allowed.astype(np.uint8), bfc_img)
 
@@ -407,19 +370,16 @@ def build_job_script(
     pre_dilate_radius_final: int,
     brain_smooth_sigma: float,
     brain_grad_sigma: float,
-    brain_grad_threshold: float,
-    brain_min_barrier_volume_mm3: float,
-    brain_min_enclosed_volume_mm3: float,
-    brain_close_barrier_iters: int,
-    brain_shell_thickness_mm: float,
-    brain_shell_grad_min: float,
-    brain_shell_intensity_min: float,
-    brain_shell_use_gate: bool,
-    do_global_rescue: bool,
-    brain_rescue_max_distance_mm: float,
-    brain_rescue_intensity_min: float,
-    brain_rescue_gradient_max: float,
-    brain_rescue_iters: int,
+    brain_dark_moat_threshold: float,
+    brain_min_moat_volume_mm3: float,
+    brain_moat_close_iters: int,
+    brain_seed_min_distance_mm: float,
+    brain_seed_intensity_min: float,
+    brain_grow_intensity_min: float,
+    brain_grow_gradient_max: float,
+    brain_grow_iters: int,
+    brain_shell_add_mm: float,
+    brain_shell_add_intensity_min: float,
     do_brainstem_rescue: bool,
     brainstem_seed_slice_frac: float,
     brainstem_corridor_radius_mm: float,
@@ -483,8 +443,6 @@ overwrite_flag=""" + ("1" if overwrite else "0") + r"""
 tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
 save_brain_debug_flag=""" + ("1" if save_brain_debug else "0") + r"""
 brain_fill_holes_flag=""" + ("1" if brain_fill_holes else "0") + r"""
-brain_shell_use_gate_flag=""" + ("1" if brain_shell_use_gate else "0") + r"""
-do_global_rescue_flag=""" + ("1" if do_global_rescue else "0") + r"""
 do_brainstem_rescue_flag=""" + ("1" if do_brainstem_rescue else "0") + r"""
 """
 
@@ -609,7 +567,7 @@ if [[ "$need_brainmask" == "1" ]]; then
     fi
 
     echo
-    echo "Creating stricter brain mask with targeted brainstem rescue..."
+    echo "Creating dark-moat brain mask..."
     brain_cmd=(
         "$python_exe" "$helper_py"
         --bfc "$out_nii"
@@ -618,17 +576,16 @@ if [[ "$need_brainmask" == "1" ]]; then
         --out_masked_bfc "$brain_t2_nii"
         --smooth_sigma """ + str(brain_smooth_sigma) + r"""
         --grad_sigma """ + str(brain_grad_sigma) + r"""
-        --grad_threshold """ + str(brain_grad_threshold) + r"""
-        --min_barrier_volume_mm3 """ + str(brain_min_barrier_volume_mm3) + r"""
-        --min_enclosed_volume_mm3 """ + str(brain_min_enclosed_volume_mm3) + r"""
-        --close_barrier_iters """ + str(brain_close_barrier_iters) + r"""
-        --shell_thickness_mm """ + str(brain_shell_thickness_mm) + r"""
-        --shell_grad_min """ + str(brain_shell_grad_min) + r"""
-        --shell_intensity_min """ + str(brain_shell_intensity_min) + r"""
-        --rescue_max_distance_mm """ + str(brain_rescue_max_distance_mm) + r"""
-        --rescue_intensity_min """ + str(brain_rescue_intensity_min) + r"""
-        --rescue_gradient_max """ + str(brain_rescue_gradient_max) + r"""
-        --rescue_iters """ + str(brain_rescue_iters) + r"""
+        --dark_moat_threshold """ + str(brain_dark_moat_threshold) + r"""
+        --min_moat_volume_mm3 """ + str(brain_min_moat_volume_mm3) + r"""
+        --moat_close_iters """ + str(brain_moat_close_iters) + r"""
+        --seed_min_distance_mm """ + str(brain_seed_min_distance_mm) + r"""
+        --seed_intensity_min """ + str(brain_seed_intensity_min) + r"""
+        --grow_intensity_min """ + str(brain_grow_intensity_min) + r"""
+        --grow_gradient_max """ + str(brain_grow_gradient_max) + r"""
+        --grow_iters """ + str(brain_grow_iters) + r"""
+        --shell_add_mm """ + str(brain_shell_add_mm) + r"""
+        --shell_add_intensity_min """ + str(brain_shell_add_intensity_min) + r"""
         --brainstem_seed_slice_frac """ + str(brainstem_seed_slice_frac) + r"""
         --brainstem_corridor_radius_mm """ + str(brainstem_corridor_radius_mm) + r"""
         --brainstem_max_inferior_mm """ + str(brainstem_max_inferior_mm) + r"""
@@ -643,14 +600,6 @@ if [[ "$need_brainmask" == "1" ]]; then
 
     if [[ "$brain_fill_holes_flag" == "1" ]]; then
         brain_cmd+=( --brain_fill_holes )
-    fi
-
-    if [[ "$brain_shell_use_gate_flag" == "1" ]]; then
-        brain_cmd+=( --shell_use_gate )
-    fi
-
-    if [[ "$do_global_rescue_flag" == "1" ]]; then
-        brain_cmd+=( --do_global_rescue )
     fi
 
     if [[ "$do_brainstem_rescue_flag" == "1" ]]; then
@@ -721,31 +670,29 @@ def main():
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
+    # Dark-moat mask parameters
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
-    p.add_argument("--brain_grad_threshold", type=float, default=0.10)
-    p.add_argument("--brain_min_barrier_volume_mm3", type=float, default=0.05)
-    p.add_argument("--brain_min_enclosed_volume_mm3", type=float, default=1.0)
-    p.add_argument("--brain_close_barrier_iters", type=int, default=1)
+    p.add_argument("--brain_dark_moat_threshold", type=float, default=0.20)
+    p.add_argument("--brain_min_moat_volume_mm3", type=float, default=0.03)
+    p.add_argument("--brain_moat_close_iters", type=int, default=1)
 
-    p.add_argument("--brain_shell_thickness_mm", type=float, default=0.22)
-    p.add_argument("--brain_shell_grad_min", type=float, default=0.04)
-    p.add_argument("--brain_shell_intensity_min", type=float, default=0.04)
-    p.add_argument("--brain_shell_use_gate", action="store_true")
+    p.add_argument("--brain_seed_min_distance_mm", type=float, default=0.8)
+    p.add_argument("--brain_seed_intensity_min", type=float, default=0.35)
+    p.add_argument("--brain_grow_intensity_min", type=float, default=0.08)
+    p.add_argument("--brain_grow_gradient_max", type=float, default=0.80)
+    p.add_argument("--brain_grow_iters", type=int, default=200)
 
-    p.add_argument("--do_global_rescue", action="store_true")
-    p.add_argument("--brain_rescue_max_distance_mm", type=float, default=0.25)
-    p.add_argument("--brain_rescue_intensity_min", type=float, default=0.10)
-    p.add_argument("--brain_rescue_gradient_max", type=float, default=0.35)
-    p.add_argument("--brain_rescue_iters", type=int, default=20)
+    p.add_argument("--brain_shell_add_mm", type=float, default=0.10)
+    p.add_argument("--brain_shell_add_intensity_min", type=float, default=0.06)
 
     p.add_argument("--do_brainstem_rescue", action="store_true")
     p.add_argument("--brainstem_seed_slice_frac", type=float, default=0.18)
-    p.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.2)
-    p.add_argument("--brainstem_max_inferior_mm", type=float, default=2.5)
-    p.add_argument("--brainstem_intensity_min", type=float, default=0.05)
-    p.add_argument("--brainstem_gradient_max", type=float, default=0.70)
-    p.add_argument("--brainstem_iters", type=int, default=40)
+    p.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.0)
+    p.add_argument("--brainstem_max_inferior_mm", type=float, default=3.0)
+    p.add_argument("--brainstem_intensity_min", type=float, default=0.04)
+    p.add_argument("--brainstem_gradient_max", type=float, default=0.80)
+    p.add_argument("--brainstem_iters", type=int, default=50)
 
     p.add_argument("--brain_close_iters", type=int, default=2)
     p.add_argument("--brain_open_iters", type=int, default=0)
@@ -868,19 +815,16 @@ def main():
             pre_dilate_radius_final=args.pre_dilate_radius_final,
             brain_smooth_sigma=args.brain_smooth_sigma,
             brain_grad_sigma=args.brain_grad_sigma,
-            brain_grad_threshold=args.brain_grad_threshold,
-            brain_min_barrier_volume_mm3=args.brain_min_barrier_volume_mm3,
-            brain_min_enclosed_volume_mm3=args.brain_min_enclosed_volume_mm3,
-            brain_close_barrier_iters=args.brain_close_barrier_iters,
-            brain_shell_thickness_mm=args.brain_shell_thickness_mm,
-            brain_shell_grad_min=args.brain_shell_grad_min,
-            brain_shell_intensity_min=args.brain_shell_intensity_min,
-            brain_shell_use_gate=args.brain_shell_use_gate,
-            do_global_rescue=args.do_global_rescue,
-            brain_rescue_max_distance_mm=args.brain_rescue_max_distance_mm,
-            brain_rescue_intensity_min=args.brain_rescue_intensity_min,
-            brain_rescue_gradient_max=args.brain_rescue_gradient_max,
-            brain_rescue_iters=args.brain_rescue_iters,
+            brain_dark_moat_threshold=args.brain_dark_moat_threshold,
+            brain_min_moat_volume_mm3=args.brain_min_moat_volume_mm3,
+            brain_moat_close_iters=args.brain_moat_close_iters,
+            brain_seed_min_distance_mm=args.brain_seed_min_distance_mm,
+            brain_seed_intensity_min=args.brain_seed_intensity_min,
+            brain_grow_intensity_min=args.brain_grow_intensity_min,
+            brain_grow_gradient_max=args.brain_grow_gradient_max,
+            brain_grow_iters=args.brain_grow_iters,
+            brain_shell_add_mm=args.brain_shell_add_mm,
+            brain_shell_add_intensity_min=args.brain_shell_add_intensity_min,
             do_brainstem_rescue=args.do_brainstem_rescue,
             brainstem_seed_slice_frac=args.brainstem_seed_slice_frac,
             brainstem_corridor_radius_mm=args.brainstem_corridor_radius_mm,
