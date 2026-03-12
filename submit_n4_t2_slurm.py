@@ -53,7 +53,7 @@ def submit_job(script_path: Path):
     result = subprocess.run(
         ["sbatch", str(script_path)],
         capture_output=True,
-        text=True,
+        text=True
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
@@ -62,7 +62,6 @@ def write_brainmask_helper(helper_path: Path):
     helper_code = r'''#!/usr/bin/env python3
 
 import argparse
-import json
 from pathlib import Path
 
 import nibabel as nib
@@ -73,6 +72,7 @@ from scipy.ndimage import (
     binary_erosion,
     binary_fill_holes,
     binary_opening,
+    binary_propagation,
     distance_transform_edt,
     gaussian_filter,
     gaussian_gradient_magnitude,
@@ -89,7 +89,21 @@ def largest_component(mask: np.ndarray, structure=None) -> np.ndarray:
         return np.zeros_like(mask, dtype=bool)
     counts = np.bincount(lab.ravel())
     counts[0] = 0
-    return lab == counts.argmax()
+    best = counts.argmax()
+    return lab == best
+
+
+def robust_normalize(vol: np.ndarray, mask: np.ndarray, low_pct=2.0, high_pct=98.0) -> np.ndarray:
+    vals = vol[mask]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        raise RuntimeError("No finite values inside mask for normalization.")
+    lo = np.percentile(vals, low_pct)
+    hi = np.percentile(vals, high_pct)
+    if hi <= lo:
+        raise RuntimeError(f"Bad normalization range: lo={lo}, hi={hi}")
+    out = (vol - lo) / (hi - lo)
+    return np.clip(out, 0.0, 1.0)
 
 
 def remove_small_components(mask: np.ndarray, min_voxels: int, structure=None) -> np.ndarray:
@@ -108,31 +122,15 @@ def remove_small_components(mask: np.ndarray, min_voxels: int, structure=None) -
     return keep[lab]
 
 
-def robust_normalize(vol: np.ndarray, mask: np.ndarray, low_pct=2.0, high_pct=98.0) -> np.ndarray:
-    vals = vol[mask]
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        raise RuntimeError("No finite values inside mask for normalization.")
-    lo = np.percentile(vals, low_pct)
-    hi = np.percentile(vals, high_pct)
-    if hi <= lo:
-        raise RuntimeError(f"Bad normalization range: lo={lo}, hi={hi}")
-    out = (vol - lo) / (hi - lo)
-    return np.clip(out, 0.0, 1.0)
-
-
-def constrained_region_grow(seed: np.ndarray, allowed: np.ndarray, structure, max_iters: int) -> np.ndarray:
-    grown = seed.copy()
-    for _ in range(max_iters):
-        nxt = binary_dilation(grown, structure=structure) & allowed
-        if np.array_equal(nxt, grown):
-            break
-        grown = nxt
-    return grown
-
-
-def mask_volume_mm3(mask: np.ndarray, voxel_volume_mm3: float) -> float:
-    return float(np.count_nonzero(mask) * voxel_volume_mm3)
+def boundary_seed(mask: np.ndarray) -> np.ndarray:
+    seed = np.zeros_like(mask, dtype=bool)
+    seed[0, :, :] |= mask[0, :, :]
+    seed[-1, :, :] |= mask[-1, :, :]
+    seed[:, 0, :] |= mask[:, 0, :]
+    seed[:, -1, :] |= mask[:, -1, :]
+    seed[:, :, 0] |= mask[:, :, 0]
+    seed[:, :, -1] |= mask[:, :, -1]
+    return seed
 
 
 def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
@@ -140,205 +138,9 @@ def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
     nib.save(img, str(path))
 
 
-def build_candidate(
-    inten_norm: np.ndarray,
-    grad_norm: np.ndarray,
-    support: np.ndarray,
-    structure,
-    voxel_volume_mm3: float,
-    mean_spacing: float,
-    shell_threshold: float,
-    shell_neighborhood_mm: float,
-    moat_threshold: float,
-    moat_close_iters: int,
-    seed_min_distance_mm: float,
-    seed_intensity_min: float,
-    grow_intensity_min: float,
-    grow_gradient_max: float,
-    grow_iters: int,
-    boundary_band_mm: float,
-    boundary_add_intensity_min: float,
-    min_component_mm3: float,
-    brain_close_iters: int,
-    brain_open_iters: int,
-    brain_dilate_iters: int,
-    brain_fill_holes: bool,
-):
-    shell_neighborhood_vox = max(1.0, shell_neighborhood_mm / max(mean_spacing, 1e-6))
-    seed_min_distance_vox = max(1.0, seed_min_distance_mm / max(mean_spacing, 1e-6))
-    boundary_band_vox = max(1.0, boundary_band_mm / max(mean_spacing, 1e-6))
-    min_component_vox = max(1, int(round(min_component_mm3 / voxel_volume_mm3)))
-
-    shell_raw = (inten_norm >= shell_threshold) & support
-    shell = remove_small_components(shell_raw, min_component_vox, structure=structure)
-    if np.any(shell):
-        shell = binary_closing(shell, structure=structure, iterations=1)
-
-    dist_to_shell = distance_transform_edt(~shell)
-    shell_neighborhood = support & (dist_to_shell <= shell_neighborhood_vox)
-
-    moat_raw = (inten_norm <= moat_threshold) & support
-    moat = remove_small_components(moat_raw, min_component_vox, structure=structure)
-    if moat_close_iters > 0 and np.any(moat):
-        moat = binary_closing(moat, structure=structure, iterations=moat_close_iters)
-
-    dist_to_support_edge = distance_transform_edt(support)
-    seed_region = (
-        support
-        & (dist_to_support_edge >= seed_min_distance_vox)
-        & (inten_norm >= seed_intensity_min)
-        & (~moat)
-    )
-    seed = largest_component(seed_region, structure=structure)
-    if not np.any(seed):
-        return None
-
-    tissue_gate = (inten_norm >= grow_intensity_min) & (grad_norm <= grow_gradient_max)
-    interior_gate = dist_to_support_edge >= max(1.0, 0.75 * seed_min_distance_vox)
-
-    allowed = support & (~moat) & tissue_gate & (shell_neighborhood | interior_gate)
-    allowed |= seed
-
-    brain = constrained_region_grow(seed, allowed, structure, grow_iters)
-    brain = largest_component(brain, structure=structure)
-
-    dist_to_brain = distance_transform_edt(~brain)
-    boundary_add = (
-        support
-        & (~moat)
-        & shell_neighborhood
-        & (dist_to_brain <= boundary_band_vox)
-        & (inten_norm >= boundary_add_intensity_min)
-    )
-    brain |= boundary_add
-    brain = largest_component(brain, structure=structure)
-
-    if brain_fill_holes:
-        brain = binary_fill_holes(brain)
-
-    if brain_close_iters > 0:
-        brain = binary_closing(brain, structure=structure, iterations=brain_close_iters)
-
-    if brain_open_iters > 0:
-        brain = binary_opening(brain, structure=structure, iterations=brain_open_iters)
-
-    if brain_dilate_iters > 0:
-        brain = binary_dilation(brain, structure=structure, iterations=brain_dilate_iters)
-
-    brain &= support
-    brain = largest_component(brain, structure=structure)
-    brain = binary_fill_holes(brain)
-    brain = largest_component(brain, structure=structure)
-
-    volume_mm3 = mask_volume_mm3(brain, voxel_volume_mm3)
-    shell_support = int(np.count_nonzero(brain & shell_neighborhood))
-    moat_overlap = int(np.count_nonzero(brain & moat))
-
-    params = {
-        "shell_threshold": shell_threshold,
-        "moat_threshold": moat_threshold,
-        "seed_intensity_min": seed_intensity_min,
-        "grow_intensity_min": grow_intensity_min,
-    }
-
-    debug = {
-        "shell_raw": shell_raw,
-        "shell": shell,
-        "shell_neighborhood": shell_neighborhood,
-        "moat_raw": moat_raw,
-        "moat": moat,
-        "seed_region": seed_region,
-        "seed": seed,
-        "allowed": allowed,
-        "boundary_add": boundary_add,
-        "candidate_mask": brain,
-    }
-
-    return {
-        "mask": brain,
-        "volume_mm3": volume_mm3,
-        "shell_support": shell_support,
-        "moat_overlap": moat_overlap,
-        "params": params,
-        "debug": debug,
-    }
-
-
-def rank_candidate(c, preferred_mid):
-    return (
-        -c["moat_overlap"],
-        c["shell_support"],
-        -abs(c["volume_mm3"] - preferred_mid),
-    )
-
-
-def save_failure_debug(prefix: Path, ref_img, final_support, inten_norm, grad_norm, candidates, hard_min, hard_max, pref_min, pref_max):
-    preferred_mid = 0.5 * (pref_min + pref_max)
-    ranked = sorted(candidates, key=lambda c: rank_candidate(c, preferred_mid), reverse=True)
-
-    save_like(prefix.with_name(prefix.name + "_final_support.nii.gz"), final_support.astype(np.uint8), ref_img)
-    save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), ref_img)
-    save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), ref_img)
-
-    topn = ranked[:5]
-    for i, cand in enumerate(topn):
-        dbg = cand["debug"]
-        stem = prefix.with_name(prefix.name + f"_cand{i:02d}")
-        save_like(stem.with_name(stem.name + "_mask.nii.gz"), dbg["candidate_mask"].astype(np.uint8), ref_img)
-        save_like(stem.with_name(stem.name + "_shell.nii.gz"), dbg["shell"].astype(np.uint8), ref_img)
-        save_like(stem.with_name(stem.name + "_shell_neighborhood.nii.gz"), dbg["shell_neighborhood"].astype(np.uint8), ref_img)
-        save_like(stem.with_name(stem.name + "_moat.nii.gz"), dbg["moat"].astype(np.uint8), ref_img)
-        save_like(stem.with_name(stem.name + "_seed.nii.gz"), dbg["seed"].astype(np.uint8), ref_img)
-        save_like(stem.with_name(stem.name + "_allowed.nii.gz"), dbg["allowed"].astype(np.uint8), ref_img)
-        save_like(stem.with_name(stem.name + "_boundary_add.nii.gz"), dbg["boundary_add"].astype(np.uint8), ref_img)
-
-    summary = {
-        "selection_mode": "none",
-        "reason": "No candidate satisfied hard physically allowed brain-volume constraints.",
-        "brain_volume_hard_min_mm3": hard_min,
-        "brain_volume_hard_max_mm3": hard_max,
-        "brain_volume_preferred_min_mm3": pref_min,
-        "brain_volume_preferred_max_mm3": pref_max,
-        "n_candidates_total": len(candidates),
-        "top_ranked_candidates": [
-            {
-                "volume_mm3": c["volume_mm3"],
-                "shell_support": c["shell_support"],
-                "moat_overlap": c["moat_overlap"],
-                "params": c["params"],
-            }
-            for c in topn
-        ],
-        "all_candidates": [
-            {
-                "volume_mm3": c["volume_mm3"],
-                "shell_support": c["shell_support"],
-                "moat_overlap": c["moat_overlap"],
-                "params": c["params"],
-            }
-            for c in candidates
-        ],
-    }
-    with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-
-
-def select_best_candidate(candidates, preferred_min, preferred_max, hard_min, hard_max):
-    preferred = [c for c in candidates if preferred_min <= c["volume_mm3"] <= preferred_max]
-    hard = [c for c in candidates if hard_min <= c["volume_mm3"] <= hard_max]
-
-    preferred_mid = 0.5 * (preferred_min + preferred_max)
-
-    if preferred:
-        return sorted(preferred, key=lambda c: rank_candidate(c, preferred_mid), reverse=True)[0], "preferred"
-    if hard:
-        return sorted(hard, key=lambda c: rank_candidate(c, preferred_mid), reverse=True)[0], "hard"
-    return None, "none"
-
-
 def main():
     ap = argparse.ArgumentParser(
-        description="Build a brain mask from BFC T2 using the rollback shell+moat+seed growth branch, with hard mouse-brain volume constraints."
+        description="Build a brain mask from BFC T2 using shell/barrier logic plus cavity filling and shell inclusion."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -348,35 +150,29 @@ def main():
 
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
     ap.add_argument("--grad_sigma", type=float, default=1.0)
+    ap.add_argument("--grad_threshold", type=float, default=0.10)
 
-    # tight final support
-    ap.add_argument("--final_support_dilate_mm", type=float, default=0.15)
+    # physical cleanup thresholds, in mm^3
+    ap.add_argument("--min_barrier_volume_mm3", type=float, default=0.05)
+    ap.add_argument("--min_enclosed_volume_mm3", type=float, default=1.0)
 
-    # candidate sweeps
-    ap.add_argument("--shell_thresholds", default="0.44,0.48,0.52,0.56")
-    ap.add_argument("--moat_thresholds", default="0.12,0.14,0.16,0.18,0.20")
-    ap.add_argument("--seed_intensity_mins", default="0.20,0.24,0.28,0.32")
-    ap.add_argument("--grow_intensity_mins", default="0.04,0.06,0.08,0.10")
+    # barrier morphology
+    ap.add_argument("--close_barrier_iters", type=int, default=1)
 
-    ap.add_argument("--shell_neighborhood_mm", type=float, default=0.45)
-    ap.add_argument("--moat_close_iters", type=int, default=1)
-    ap.add_argument("--seed_min_distance_mm", type=float, default=0.8)
-    ap.add_argument("--grow_gradient_max", type=float, default=0.85)
-    ap.add_argument("--grow_iters", type=int, default=220)
-    ap.add_argument("--boundary_band_mm", type=float, default=0.20)
-    ap.add_argument("--boundary_add_intensity_min", type=float, default=0.05)
-    ap.add_argument("--min_component_mm3", type=float, default=0.03)
+    # shell inclusion
+    ap.add_argument("--shell_thickness_mm", type=float, default=0.35,
+                    help="Outward shell thickness to include around enclosed cavity.")
+    ap.add_argument("--shell_grad_min", type=float, default=0.03,
+                    help="Optional low gradient requirement for shell voxels.")
+    ap.add_argument("--shell_intensity_min", type=float, default=0.02,
+                    help="Optional low intensity requirement for shell voxels.")
+    ap.add_argument("--shell_use_gate", action="store_true",
+                    help="Require shell voxels to satisfy grad/intensity gate as well as thickness.")
 
-    # mouse defaults
-    ap.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
-    ap.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
-    ap.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
-    ap.add_argument("--brain_volume_preferred_max_mm3", type=float, default=550.0)
-
-    # cleanup
+    # final mask morphology
     ap.add_argument("--brain_close_iters", type=int, default=2)
     ap.add_argument("--brain_open_iters", type=int, default=0)
-    ap.add_argument("--brain_dilate_iters", type=int, default=0)
+    ap.add_argument("--brain_dilate_iters", type=int, default=1)
     ap.add_argument("--brain_fill_holes", action="store_true")
 
     ap.add_argument("--tight_mask", action="store_true")
@@ -397,90 +193,83 @@ def main():
 
     zooms = bfc_img.header.get_zooms()[:3]
     voxel_volume_mm3 = float(zooms[0] * zooms[1] * zooms[2])
-    mean_spacing = float(np.mean(zooms))
     if voxel_volume_mm3 <= 0:
         raise RuntimeError(f"Bad voxel volume from header: {voxel_volume_mm3}")
 
+    min_barrier_vox = max(1, int(round(args.min_barrier_volume_mm3 / voxel_volume_mm3)))
+    min_enclosed_vox = max(1, int(round(args.min_enclosed_volume_mm3 / voxel_volume_mm3)))
+
+    # convert shell thickness in mm to a conservative voxel radius
+    mean_spacing = float(np.mean(zooms))
+    shell_thickness_vox = max(1.0, args.shell_thickness_mm / max(mean_spacing, 1e-6))
+
     structure = generate_binary_structure(3, 2)
 
-    final_support_dilate_vox = max(1.0, args.final_support_dilate_mm / max(mean_spacing, 1e-6))
-    final_support = binary_dilation(
-        support, structure=structure, iterations=int(np.ceil(final_support_dilate_vox))
-    )
-    final_support = largest_component(final_support, structure=structure)
-
     bfc_smooth = gaussian_filter(bfc, sigma=args.smooth_sigma)
-    inten_norm = robust_normalize(bfc_smooth, final_support, low_pct=2.0, high_pct=98.0)
+    inten_norm = robust_normalize(bfc_smooth, support, low_pct=2.0, high_pct=98.0)
+
     grad = gaussian_gradient_magnitude(bfc_smooth, sigma=args.grad_sigma)
-    grad_norm = robust_normalize(grad, final_support, low_pct=2.0, high_pct=98.0)
+    grad_norm = robust_normalize(grad, support, low_pct=2.0, high_pct=98.0)
 
-    shell_thresholds = [float(x) for x in args.shell_thresholds.split(",") if x.strip()]
-    moat_thresholds = [float(x) for x in args.moat_thresholds.split(",") if x.strip()]
-    seed_mins = [float(x) for x in args.seed_intensity_mins.split(",") if x.strip()]
-    grow_mins = [float(x) for x in args.grow_intensity_mins.split(",") if x.strip()]
+    # Binary shell/barrier
+    barrier_raw = (grad_norm >= args.grad_threshold) & support
+    barrier = remove_small_components(barrier_raw, min_barrier_vox, structure=structure)
 
-    candidates = []
+    if args.close_barrier_iters > 0 and np.any(barrier):
+        barrier = binary_closing(barrier, structure=structure, iterations=args.close_barrier_iters)
 
-    for shell_threshold in shell_thresholds:
-        for moat_threshold in moat_thresholds:
-            for seed_min in seed_mins:
-                for grow_min in grow_mins:
-                    cand = build_candidate(
-                        inten_norm=inten_norm,
-                        grad_norm=grad_norm,
-                        support=final_support,
-                        structure=structure,
-                        voxel_volume_mm3=voxel_volume_mm3,
-                        mean_spacing=mean_spacing,
-                        shell_threshold=shell_threshold,
-                        shell_neighborhood_mm=args.shell_neighborhood_mm,
-                        moat_threshold=moat_threshold,
-                        moat_close_iters=args.moat_close_iters,
-                        seed_min_distance_mm=args.seed_min_distance_mm,
-                        seed_intensity_min=seed_min,
-                        grow_intensity_min=grow_min,
-                        grow_gradient_max=args.grow_gradient_max,
-                        grow_iters=args.grow_iters,
-                        boundary_band_mm=args.boundary_band_mm,
-                        boundary_add_intensity_min=args.boundary_add_intensity_min,
-                        min_component_mm3=args.min_component_mm3,
-                        brain_close_iters=args.brain_close_iters,
-                        brain_open_iters=args.brain_open_iters,
-                        brain_dilate_iters=args.brain_dilate_iters,
-                        brain_fill_holes=args.brain_fill_holes,
-                    )
-                    if cand is not None:
-                        candidates.append(cand)
+    # Open space inside support that outside flood can traverse
+    open_space = support & (~barrier)
 
-    if not candidates:
-        raise RuntimeError("No candidate brain masks were generated.")
+    seeds = boundary_seed(open_space)
+    outside = binary_propagation(seeds, structure=structure, mask=open_space)
 
-    best, selection_mode = select_best_candidate(
-        candidates,
-        args.brain_volume_preferred_min_mm3,
-        args.brain_volume_preferred_max_mm3,
-        args.brain_volume_hard_min_mm3,
-        args.brain_volume_hard_max_mm3,
-    )
+    enclosed = open_space & (~outside)
+    enclosed = remove_small_components(enclosed, min_enclosed_vox, structure=structure)
+    enclosed = largest_component(enclosed, structure=structure)
 
-    if best is None:
-        if args.debug_prefix:
-            prefix = Path(args.debug_prefix)
-            save_failure_debug(
-                prefix=prefix,
-                ref_img=bfc_img,
-                final_support=final_support,
-                inten_norm=inten_norm,
-                grad_norm=grad_norm,
-                candidates=candidates,
-                hard_min=args.brain_volume_hard_min_mm3,
-                hard_max=args.brain_volume_hard_max_mm3,
-                pref_min=args.brain_volume_preferred_min_mm3,
-                pref_max=args.brain_volume_preferred_max_mm3,
-            )
-        raise RuntimeError("No candidate mask satisfied hard physically allowed brain-volume constraints.")
+    if not np.any(enclosed):
+        raise RuntimeError("No enclosed cavity found. Try lowering grad threshold or barrier cleanup.")
 
-    brain = best["mask"]
+    # Fill internal holes so ventricles / dark interior spaces remain INCLUDED
+    cavity_filled = binary_fill_holes(enclosed)
+    cavity_filled = largest_component(cavity_filled, structure=structure)
+
+    # Add a shell band around cavity_filled within support
+    # distance to cavity: 0 inside cavity, increasing outward
+    dist_to_cavity = distance_transform_edt(~cavity_filled)
+
+    shell_zone = support & (dist_to_cavity <= shell_thickness_vox)
+
+    if args.shell_use_gate:
+        shell_gate = (grad_norm >= args.shell_grad_min) | (inten_norm >= args.shell_intensity_min)
+        shell_zone &= shell_gate
+
+    # final pre-cleanup mask includes cavity + shell band
+    brain = cavity_filled | shell_zone
+
+    # constrain and clean up
+    brain &= support
+    brain = largest_component(brain, structure=structure)
+
+    if args.brain_fill_holes:
+        brain = binary_fill_holes(brain)
+
+    if args.brain_close_iters > 0:
+        brain = binary_closing(brain, structure=structure, iterations=args.brain_close_iters)
+
+    if args.brain_open_iters > 0:
+        brain = binary_opening(brain, structure=structure, iterations=args.brain_open_iters)
+
+    if args.brain_dilate_iters > 0:
+        brain = binary_dilation(brain, structure=structure, iterations=args.brain_dilate_iters)
+
+    brain &= support
+    brain = largest_component(brain, structure=structure)
+
+    # fill holes again after morphology so internal cavities stay included
+    brain = binary_fill_holes(brain)
+    brain = largest_component(brain, structure=structure)
 
     if args.tight_mask:
         brain = binary_erosion(brain, structure=structure, iterations=args.tight_erode_iters)
@@ -495,44 +284,17 @@ def main():
 
     if args.debug_prefix:
         prefix = Path(args.debug_prefix)
-        save_like(prefix.with_name(prefix.name + "_final_support.nii.gz"), final_support.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_grad.nii.gz"), grad.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
-
-        dbg = best["debug"]
-        save_like(prefix.with_name(prefix.name + "_shell_raw.nii.gz"), dbg["shell_raw"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_shell.nii.gz"), dbg["shell"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_shell_neighborhood.nii.gz"), dbg["shell_neighborhood"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_moat_raw.nii.gz"), dbg["moat_raw"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_moat.nii.gz"), dbg["moat"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_seed_region.nii.gz"), dbg["seed_region"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_seed.nii.gz"), dbg["seed"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_allowed.nii.gz"), dbg["allowed"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_boundary_add.nii.gz"), dbg["boundary_add"].astype(np.uint8), bfc_img)
-
-        summary = {
-            "selection_mode": selection_mode,
-            "selected_volume_mm3": best["volume_mm3"],
-            "selected_shell_support": best["shell_support"],
-            "selected_moat_overlap": best["moat_overlap"],
-            "selected_params": best["params"],
-            "brain_volume_hard_min_mm3": args.brain_volume_hard_min_mm3,
-            "brain_volume_hard_max_mm3": args.brain_volume_hard_max_mm3,
-            "brain_volume_preferred_min_mm3": args.brain_volume_preferred_min_mm3,
-            "brain_volume_preferred_max_mm3": args.brain_volume_preferred_max_mm3,
-            "n_candidates_total": len(candidates),
-            "all_candidates": [
-                {
-                    "volume_mm3": c["volume_mm3"],
-                    "shell_support": c["shell_support"],
-                    "moat_overlap": c["moat_overlap"],
-                    "params": c["params"],
-                }
-                for c in candidates
-            ],
-        }
-        with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
-            json.dump(summary, f, indent=2)
+        save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_barrier_raw.nii.gz"), barrier_raw.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_barrier.nii.gz"), barrier.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_open_space.nii.gz"), open_space.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_outside.nii.gz"), outside.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_enclosed.nii.gz"), enclosed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_cavity_filled.nii.gz"), cavity_filled.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_dist_to_cavity.nii.gz"), dist_to_cavity.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_shell_zone.nii.gz"), shell_zone.astype(np.uint8), bfc_img)
 
 
 if __name__ == "__main__":
@@ -548,17 +310,17 @@ def build_job_script(
     out_nii: Path,
     in_method: Path,
     out_method: Path,
-    support_nii: Path,
+    premask_nii: Path,
     bias_nii: Path,
     brainmask_nii: Path,
     brain_t2_nii: Path,
     diff_nii: Path | None,
     tmp_otsu_pre_nii: Path,
     helper_py: Path,
-    python_path: str,
     n4_path: str,
     thresholdimage_path: str,
     imagemath_path: str,
+    printheader_path: str | None,
     dimension: int,
     shrink_factor: int,
     convergence: str,
@@ -570,26 +332,16 @@ def build_job_script(
     pre_dilate_radius_pre_glc: int,
     pre_fill_holes_radius: int,
     pre_dilate_radius_final: int,
-    pre_support_extra_dilate_radius: int,
     brain_smooth_sigma: float,
     brain_grad_sigma: float,
-    brain_final_support_dilate_mm: float,
-    brain_shell_thresholds: str,
-    brain_moat_thresholds: str,
-    brain_seed_intensity_mins: str,
-    brain_grow_intensity_mins: str,
-    brain_shell_neighborhood_mm: float,
-    brain_moat_close_iters: int,
-    brain_seed_min_distance_mm: float,
-    brain_grow_gradient_max: float,
-    brain_grow_iters: int,
-    brain_boundary_band_mm: float,
-    brain_boundary_add_intensity_min: float,
-    brain_min_component_mm3: float,
-    brain_volume_hard_min_mm3: float,
-    brain_volume_hard_max_mm3: float,
-    brain_volume_preferred_min_mm3: float,
-    brain_volume_preferred_max_mm3: float,
+    brain_grad_threshold: float,
+    brain_min_barrier_volume_mm3: float,
+    brain_min_enclosed_volume_mm3: float,
+    brain_close_barrier_iters: int,
+    brain_shell_thickness_mm: float,
+    brain_shell_grad_min: float,
+    brain_shell_intensity_min: float,
+    brain_shell_use_gate: bool,
     brain_close_iters: int,
     brain_open_iters: int,
     brain_dilate_iters: int,
@@ -635,17 +387,17 @@ in_nii=""" + shell_quote(str(in_nii)) + r"""
 out_nii=""" + shell_quote(str(out_nii)) + r"""
 in_method=""" + shell_quote(str(in_method)) + r"""
 out_method=""" + shell_quote(str(out_method)) + r"""
-support_nii=""" + shell_quote(str(support_nii)) + r"""
+premask_nii=""" + shell_quote(str(premask_nii)) + r"""
 bias_nii=""" + shell_quote(str(bias_nii)) + r"""
 brainmask_nii=""" + shell_quote(str(brainmask_nii)) + r"""
 brain_t2_nii=""" + shell_quote(str(brain_t2_nii)) + r"""
 tmp_otsu_pre_nii=""" + shell_quote(str(tmp_otsu_pre_nii)) + r"""
 helper_py=""" + shell_quote(str(helper_py)) + r"""
-python_exe=""" + shell_quote(str(python_path)) + r"""
 overwrite_flag=""" + ("1" if overwrite else "0") + r"""
 tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
 save_brain_debug_flag=""" + ("1" if save_brain_debug else "0") + r"""
 brain_fill_holes_flag=""" + ("1" if brain_fill_holes else "0") + r"""
+brain_shell_use_gate_flag=""" + ("1" if brain_shell_use_gate else "0") + r"""
 """
 
     if diff_nii is not None:
@@ -659,7 +411,15 @@ brain_fill_holes_flag=""" + ("1" if brain_fill_holes else "0") + r"""
 n4_exe=""" + shell_quote(str(n4_path)) + r"""
 threshold_exe=""" + shell_quote(str(thresholdimage_path)) + r"""
 imagemath_exe=""" + shell_quote(str(imagemath_path)) + r"""
+"""
+    if printheader_path:
+        script += r"""printheader_exe=""" + shell_quote(str(printheader_path)) + r"""
+"""
+    else:
+        script += r"""printheader_exe=""
+"""
 
+    script += r"""
 mkdir -p "$(dirname "$out_nii")"
 
 if [[ ! -f "$in_nii" ]]; then
@@ -667,10 +427,16 @@ if [[ ! -f "$in_nii" ]]; then
     exit 1
 fi
 
+if [[ -n "$printheader_exe" ]]; then
+    echo
+    echo "Header / spacing check:"
+    "$printheader_exe" "$in_nii" 1 || true
+fi
+
 need_n4=0
 if [[ "$overwrite_flag" == "1" ]]; then
     need_n4=1
-elif [[ ! -f "$out_nii" || ! -f "$bias_nii" || ! -f "$support_nii" ]]; then
+elif [[ ! -f "$out_nii" || ! -f "$bias_nii" || ! -f "$premask_nii" ]]; then
     need_n4=1
 fi
 
@@ -706,19 +472,20 @@ make_support_mask() {
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" FillHoles "$dst_mask" """ + str(pre_fill_holes_radius) + r"""
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" GetLargestComponent "$dst_mask"
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(pre_dilate_radius_final) + r"""
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(pre_support_extra_dilate_radius) + r"""
 }
 
 if [[ "$need_n4" == "1" ]]; then
-    echo "Creating generous N4 support mask..."
-    make_support_mask "$in_nii" "$tmp_otsu_pre_nii" "$support_nii"
+    echo
+    echo "Creating pre-N4 support mask..."
+    make_support_mask "$in_nii" "$tmp_otsu_pre_nii" "$premask_nii"
 
+    echo
     echo "Running N4BiasFieldCorrection..."
     cmd=(
         "$n4_exe"
         -d """ + str(dimension) + r"""
         -i "$in_nii"
-        -x "$support_nii"
+        -x "$premask_nii"
         -s """ + str(shrink_factor) + r"""
         -c """ + shell_quote(convergence) + r"""
         -b """ + shell_quote(bspline) + r"""
@@ -739,6 +506,7 @@ if [[ "$need_n4" == "1" ]]; then
         cp -f "$in_method" "$out_method"
     fi
 else
+    echo
     echo "Skipping N4 stage; existing outputs found and overwrite is off."
 fi
 
@@ -747,37 +515,28 @@ if [[ "$need_brainmask" == "1" ]]; then
         echo "ERROR: Missing corrected image for brain mask: $out_nii" >&2
         exit 1
     fi
-    if [[ ! -f "$support_nii" ]]; then
-        echo "ERROR: Missing support mask for brain mask: $support_nii" >&2
+    if [[ ! -f "$premask_nii" ]]; then
+        echo "ERROR: Missing support mask for brain mask: $premask_nii" >&2
         exit 1
     fi
 
-    echo "Creating rollback-style candidate brain masks with hard physical constraints..."
+    echo
+    echo "Creating shell-plus-cavity brain mask..."
     brain_cmd=(
-        "$python_exe" "$helper_py"
+        python3 "$helper_py"
         --bfc "$out_nii"
-        --support_mask "$support_nii"
+        --support_mask "$premask_nii"
         --out_mask "$brainmask_nii"
         --out_masked_bfc "$brain_t2_nii"
         --smooth_sigma """ + str(brain_smooth_sigma) + r"""
         --grad_sigma """ + str(brain_grad_sigma) + r"""
-        --final_support_dilate_mm """ + str(brain_final_support_dilate_mm) + r"""
-        --shell_thresholds """ + shell_quote(brain_shell_thresholds) + r"""
-        --moat_thresholds """ + shell_quote(brain_moat_thresholds) + r"""
-        --seed_intensity_mins """ + shell_quote(brain_seed_intensity_mins) + r"""
-        --grow_intensity_mins """ + shell_quote(brain_grow_intensity_mins) + r"""
-        --shell_neighborhood_mm """ + str(brain_shell_neighborhood_mm) + r"""
-        --moat_close_iters """ + str(brain_moat_close_iters) + r"""
-        --seed_min_distance_mm """ + str(brain_seed_min_distance_mm) + r"""
-        --grow_gradient_max """ + str(brain_grow_gradient_max) + r"""
-        --grow_iters """ + str(brain_grow_iters) + r"""
-        --boundary_band_mm """ + str(brain_boundary_band_mm) + r"""
-        --boundary_add_intensity_min """ + str(brain_boundary_add_intensity_min) + r"""
-        --min_component_mm3 """ + str(brain_min_component_mm3) + r"""
-        --brain_volume_hard_min_mm3 """ + str(brain_volume_hard_min_mm3) + r"""
-        --brain_volume_hard_max_mm3 """ + str(brain_volume_hard_max_mm3) + r"""
-        --brain_volume_preferred_min_mm3 """ + str(brain_volume_preferred_min_mm3) + r"""
-        --brain_volume_preferred_max_mm3 """ + str(brain_volume_preferred_max_mm3) + r"""
+        --grad_threshold """ + str(brain_grad_threshold) + r"""
+        --min_barrier_volume_mm3 """ + str(brain_min_barrier_volume_mm3) + r"""
+        --min_enclosed_volume_mm3 """ + str(brain_min_enclosed_volume_mm3) + r"""
+        --close_barrier_iters """ + str(brain_close_barrier_iters) + r"""
+        --shell_thickness_mm """ + str(brain_shell_thickness_mm) + r"""
+        --shell_grad_min """ + str(brain_shell_grad_min) + r"""
+        --shell_intensity_min """ + str(brain_shell_intensity_min) + r"""
         --brain_close_iters """ + str(brain_close_iters) + r"""
         --brain_open_iters """ + str(brain_open_iters) + r"""
         --brain_dilate_iters """ + str(brain_dilate_iters) + r"""
@@ -786,6 +545,10 @@ if [[ "$need_brainmask" == "1" ]]; then
 
     if [[ "$brain_fill_holes_flag" == "1" ]]; then
         brain_cmd+=( --brain_fill_holes )
+    fi
+
+    if [[ "$brain_shell_use_gate_flag" == "1" ]]; then
+        brain_cmd+=( --shell_use_gate )
     fi
 
     if [[ "$tight_mask_flag" == "1" ]]; then
@@ -805,6 +568,7 @@ if [[ "$need_brainmask" == "1" ]]; then
         exit 1
     fi
 else
+    echo
     echo "Skipping brain-mask stage; outputs exist and overwrite is off."
 fi
 
@@ -831,52 +595,43 @@ def main():
 
     p.add_argument("--sbatch_dir", default=None)
 
-    p.add_argument("--python_path", default="python3")
     p.add_argument("--n4_path", default="N4BiasFieldCorrection")
     p.add_argument("--thresholdimage_path", default="ThresholdImage")
     p.add_argument("--imagemath_path", default="ImageMath")
+    p.add_argument("--printheader_path", default="PrintHeader")
 
     p.add_argument("--dimension", type=int, default=3, choices=[2, 3, 4])
 
+    # Mouse-scale N4 defaults
     p.add_argument("--shrink_factor", type=int, default=1)
     p.add_argument("--convergence", default="[200x200x100x50,1e-8]")
     p.add_argument("--bspline", default="[8]")
     p.add_argument("--histogram_sharpening", default="[0.15,0.01,200]")
 
+    # Pre-N4 support mask
     p.add_argument("--pre_otsu_keep_low", type=int, default=2)
     p.add_argument("--pre_otsu_keep_high", type=int, default=4)
     p.add_argument("--pre_close_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_pre_glc", type=int, default=1)
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
-    p.add_argument("--pre_support_extra_dilate_radius", type=int, default=4)
 
+    # Brain mask parameters
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
-    p.add_argument("--brain_final_support_dilate_mm", type=float, default=0.15)
+    p.add_argument("--brain_grad_threshold", type=float, default=0.10)
+    p.add_argument("--brain_min_barrier_volume_mm3", type=float, default=0.05)
+    p.add_argument("--brain_min_enclosed_volume_mm3", type=float, default=1.0)
+    p.add_argument("--brain_close_barrier_iters", type=int, default=1)
 
-    p.add_argument("--brain_shell_thresholds", default="0.44,0.48,0.52,0.56")
-    p.add_argument("--brain_moat_thresholds", default="0.12,0.14,0.16,0.18,0.20")
-    p.add_argument("--brain_seed_intensity_mins", default="0.20,0.24,0.28,0.32")
-    p.add_argument("--brain_grow_intensity_mins", default="0.04,0.06,0.08,0.10")
-
-    p.add_argument("--brain_shell_neighborhood_mm", type=float, default=0.45)
-    p.add_argument("--brain_moat_close_iters", type=int, default=1)
-    p.add_argument("--brain_seed_min_distance_mm", type=float, default=0.8)
-    p.add_argument("--brain_grow_gradient_max", type=float, default=0.85)
-    p.add_argument("--brain_grow_iters", type=int, default=220)
-    p.add_argument("--brain_boundary_band_mm", type=float, default=0.20)
-    p.add_argument("--brain_boundary_add_intensity_min", type=float, default=0.05)
-    p.add_argument("--brain_min_component_mm3", type=float, default=0.03)
-
-    p.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
-    p.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
-    p.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
-    p.add_argument("--brain_volume_preferred_max_mm3", type=float, default=550.0)
+    p.add_argument("--brain_shell_thickness_mm", type=float, default=0.35)
+    p.add_argument("--brain_shell_grad_min", type=float, default=0.03)
+    p.add_argument("--brain_shell_intensity_min", type=float, default=0.02)
+    p.add_argument("--brain_shell_use_gate", action="store_true")
 
     p.add_argument("--brain_close_iters", type=int, default=2)
     p.add_argument("--brain_open_iters", type=int, default=0)
-    p.add_argument("--brain_dilate_iters", type=int, default=0)
+    p.add_argument("--brain_dilate_iters", type=int, default=1)
     p.add_argument("--brain_fill_holes", action="store_true")
 
     p.add_argument("--tight_mask", action="store_true")
@@ -938,7 +693,7 @@ def main():
         out_nii = run_dir / f"{runno}_bfc_T2.nii.gz"
         in_method = run_dir / f"{runno}_T2.method"
         out_method = run_dir / f"{runno}_bfc_T2.method"
-        support_nii = run_dir / f"{runno}_bfc_support_mask.nii.gz"
+        premask_nii = run_dir / f"{runno}_bfc_mask.nii.gz"
         bias_nii = run_dir / f"{runno}_bfc_biasfield.nii.gz"
         brainmask_nii = run_dir / f"{runno}_bfc_brain_mask.nii.gz"
         brain_t2_nii = run_dir / f"{runno}_bfc_brain_T2.nii.gz"
@@ -951,7 +706,7 @@ def main():
             continue
 
         if not args.overwrite:
-            have_core = out_nii.exists() and bias_nii.exists() and support_nii.exists()
+            have_core = out_nii.exists() and bias_nii.exists() and premask_nii.exists()
             have_brain = brainmask_nii.exists() and brain_t2_nii.exists()
             have_diff = True if diff_nii is None else diff_nii.exists()
             if have_core and have_brain and have_diff:
@@ -970,17 +725,17 @@ def main():
             out_nii=out_nii,
             in_method=in_method,
             out_method=out_method,
-            support_nii=support_nii,
+            premask_nii=premask_nii,
             bias_nii=bias_nii,
             brainmask_nii=brainmask_nii,
             brain_t2_nii=brain_t2_nii,
             diff_nii=diff_nii,
             tmp_otsu_pre_nii=tmp_otsu_pre_nii,
             helper_py=helper_py,
-            python_path=args.python_path,
             n4_path=args.n4_path,
             thresholdimage_path=args.thresholdimage_path,
             imagemath_path=args.imagemath_path,
+            printheader_path=args.printheader_path,
             dimension=args.dimension,
             shrink_factor=args.shrink_factor,
             convergence=args.convergence,
@@ -992,26 +747,16 @@ def main():
             pre_dilate_radius_pre_glc=args.pre_dilate_radius_pre_glc,
             pre_fill_holes_radius=args.pre_fill_holes_radius,
             pre_dilate_radius_final=args.pre_dilate_radius_final,
-            pre_support_extra_dilate_radius=args.pre_support_extra_dilate_radius,
             brain_smooth_sigma=args.brain_smooth_sigma,
             brain_grad_sigma=args.brain_grad_sigma,
-            brain_final_support_dilate_mm=args.brain_final_support_dilate_mm,
-            brain_shell_thresholds=args.brain_shell_thresholds,
-            brain_moat_thresholds=args.brain_moat_thresholds,
-            brain_seed_intensity_mins=args.brain_seed_intensity_mins,
-            brain_grow_intensity_mins=args.brain_grow_intensity_mins,
-            brain_shell_neighborhood_mm=args.brain_shell_neighborhood_mm,
-            brain_moat_close_iters=args.brain_moat_close_iters,
-            brain_seed_min_distance_mm=args.brain_seed_min_distance_mm,
-            brain_grow_gradient_max=args.brain_grow_gradient_max,
-            brain_grow_iters=args.brain_grow_iters,
-            brain_boundary_band_mm=args.brain_boundary_band_mm,
-            brain_boundary_add_intensity_min=args.brain_boundary_add_intensity_min,
-            brain_min_component_mm3=args.brain_min_component_mm3,
-            brain_volume_hard_min_mm3=args.brain_volume_hard_min_mm3,
-            brain_volume_hard_max_mm3=args.brain_volume_hard_max_mm3,
-            brain_volume_preferred_min_mm3=args.brain_volume_preferred_min_mm3,
-            brain_volume_preferred_max_mm3=args.brain_volume_preferred_max_mm3,
+            brain_grad_threshold=args.brain_grad_threshold,
+            brain_min_barrier_volume_mm3=args.brain_min_barrier_volume_mm3,
+            brain_min_enclosed_volume_mm3=args.brain_min_enclosed_volume_mm3,
+            brain_close_barrier_iters=args.brain_close_barrier_iters,
+            brain_shell_thickness_mm=args.brain_shell_thickness_mm,
+            brain_shell_grad_min=args.brain_shell_grad_min,
+            brain_shell_intensity_min=args.brain_shell_intensity_min,
+            brain_shell_use_gate=args.brain_shell_use_gate,
             brain_close_iters=args.brain_close_iters,
             brain_open_iters=args.brain_open_iters,
             brain_dilate_iters=args.brain_dilate_iters,
