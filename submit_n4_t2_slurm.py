@@ -138,7 +138,7 @@ def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build a brain mask from BFC T2 using a dark-moat exclusion model plus optional targeted brainstem rescue."
+        description="Hybrid shell+moat brain masking from BFC T2, with targeted brainstem rescue."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -149,30 +149,41 @@ def main():
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
     ap.add_argument("--grad_sigma", type=float, default=1.0)
 
+    # Bright shell
+    ap.add_argument("--shell_threshold", type=float, default=0.60,
+                    help="Threshold on normalized intensity for bright shell candidates.")
+    ap.add_argument("--min_shell_volume_mm3", type=float, default=0.03)
+    ap.add_argument("--shell_close_iters", type=int, default=1)
+    ap.add_argument("--shell_neighborhood_mm", type=float, default=0.45,
+                    help="Distance around shell that is considered a valid boundary neighborhood.")
+
     # Dark moat
-    ap.add_argument("--dark_moat_threshold", type=float, default=0.20)
+    ap.add_argument("--dark_moat_threshold", type=float, default=0.20,
+                    help="Threshold on normalized intensity for dark moat candidates.")
     ap.add_argument("--min_moat_volume_mm3", type=float, default=0.03)
     ap.add_argument("--moat_close_iters", type=int, default=1)
 
-    # Main brain seed / growth
-    ap.add_argument("--seed_min_distance_mm", type=float, default=0.8,
-                    help="Minimum distance from support boundary for central seed search.")
-    ap.add_argument("--seed_intensity_min", type=float, default=0.35)
+    # Central seed
+    ap.add_argument("--seed_min_distance_mm", type=float, default=0.8)
+    ap.add_argument("--seed_intensity_min", type=float, default=0.30)
+
+    # Main growth
     ap.add_argument("--grow_intensity_min", type=float, default=0.08)
-    ap.add_argument("--grow_gradient_max", type=float, default=0.80)
+    ap.add_argument("--grow_gradient_max", type=float, default=0.85)
     ap.add_argument("--grow_iters", type=int, default=200)
 
-    # Optional slight shell add-back after moat-constrained growth
-    ap.add_argument("--shell_add_mm", type=float, default=0.10)
-    ap.add_argument("--shell_add_intensity_min", type=float, default=0.06)
+    # Boundary completion
+    ap.add_argument("--boundary_band_mm", type=float, default=0.25,
+                    help="Small add-back band from grown mask toward shell neighborhood.")
+    ap.add_argument("--boundary_add_intensity_min", type=float, default=0.05)
 
-    # Brainstem-only rescue
+    # Brainstem rescue
     ap.add_argument("--do_brainstem_rescue", action="store_true")
     ap.add_argument("--brainstem_seed_slice_frac", type=float, default=0.18)
     ap.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.0)
     ap.add_argument("--brainstem_max_inferior_mm", type=float, default=3.0)
     ap.add_argument("--brainstem_intensity_min", type=float, default=0.04)
-    ap.add_argument("--brainstem_gradient_max", type=float, default=0.80)
+    ap.add_argument("--brainstem_gradient_max", type=float, default=0.85)
     ap.add_argument("--brainstem_iters", type=int, default=50)
 
     # Final morphology
@@ -204,56 +215,82 @@ def main():
 
     mean_spacing = float(np.mean(zooms))
     seed_min_distance_vox = max(1.0, args.seed_min_distance_mm / max(mean_spacing, 1e-6))
-    shell_add_vox = max(1.0, args.shell_add_mm / max(mean_spacing, 1e-6))
+    shell_neighborhood_vox = max(1.0, args.shell_neighborhood_mm / max(mean_spacing, 1e-6))
+    boundary_band_vox = max(1.0, args.boundary_band_mm / max(mean_spacing, 1e-6))
     brainstem_corridor_radius_vox = max(1.0, args.brainstem_corridor_radius_mm / max(mean_spacing, 1e-6))
     brainstem_max_inferior_vox = max(1.0, args.brainstem_max_inferior_mm / max(mean_spacing, 1e-6))
+
+    min_shell_vox = max(1, int(round(args.min_shell_volume_mm3 / voxel_volume_mm3)))
     min_moat_vox = max(1, int(round(args.min_moat_volume_mm3 / voxel_volume_mm3)))
 
     structure = generate_binary_structure(3, 2)
 
     bfc_smooth = gaussian_filter(bfc, sigma=args.smooth_sigma)
     inten_norm = robust_normalize(bfc_smooth, support, low_pct=2.0, high_pct=98.0)
-
     grad = gaussian_gradient_magnitude(bfc_smooth, sigma=args.grad_sigma)
     grad_norm = robust_normalize(grad, support, low_pct=2.0, high_pct=98.0)
 
-    # 1) Dark moat
+    # 1) bright shell
+    shell_raw = (inten_norm >= args.shell_threshold) & support
+    shell = remove_small_components(shell_raw, min_shell_vox, structure=structure)
+    if args.shell_close_iters > 0 and np.any(shell):
+        shell = binary_closing(shell, structure=structure, iterations=args.shell_close_iters)
+
+    dist_to_shell = distance_transform_edt(~shell)
+    shell_neighborhood = support & (dist_to_shell <= shell_neighborhood_vox)
+
+    # 2) dark moat
     moat_raw = (inten_norm <= args.dark_moat_threshold) & support
     moat = remove_small_components(moat_raw, min_moat_vox, structure=structure)
     if args.moat_close_iters > 0 and np.any(moat):
         moat = binary_closing(moat, structure=structure, iterations=args.moat_close_iters)
 
-    # 2) Central bright seed
+    # 3) central seed
     dist_to_support_edge = distance_transform_edt(support)
-    seed_region = support & (dist_to_support_edge >= seed_min_distance_vox) & (inten_norm >= args.seed_intensity_min)
-    seed_region &= (~moat)
+    seed_region = (
+        support
+        & (dist_to_support_edge >= seed_min_distance_vox)
+        & (inten_norm >= args.seed_intensity_min)
+        & (~moat)
+    )
     seed = largest_component(seed_region, structure=structure)
 
     if not np.any(seed):
-        # fallback: relax seed threshold
-        seed_region = support & (dist_to_support_edge >= max(1.0, 0.5 * seed_min_distance_vox)) & (inten_norm >= max(0.2, args.seed_intensity_min * 0.7))
-        seed_region &= (~moat)
+        seed_region = (
+            support
+            & (dist_to_support_edge >= max(1.0, 0.5 * seed_min_distance_vox))
+            & (inten_norm >= max(0.2, args.seed_intensity_min * 0.7))
+            & (~moat)
+        )
         seed = largest_component(seed_region, structure=structure)
 
     if not np.any(seed):
         raise RuntimeError("No valid central seed found. Try lowering seed threshold.")
 
-    # 3) Main growth constrained by support and NOT moat
-    allowed = support & (~moat)
-    grow_gate = (inten_norm >= args.grow_intensity_min) & (grad_norm <= args.grow_gradient_max)
-    allowed &= grow_gate
+    # 4) main growth:
+    # allow tissue-like voxels, do not cross moat, and stay near shell neighborhood
+    # OR central support interior.
+    tissue_gate = (inten_norm >= args.grow_intensity_min) & (grad_norm <= args.grow_gradient_max)
+    interior_gate = dist_to_support_edge >= max(1.0, 0.6 * seed_min_distance_vox)
+    allowed = support & (~moat) & tissue_gate & (shell_neighborhood | interior_gate)
     allowed |= seed
 
     brain = constrained_region_grow(seed, allowed, structure, args.grow_iters)
     brain = largest_component(brain, structure=structure)
 
-    # 4) Small shell add-back near grown brain only
+    # 5) small boundary add-back toward shell neighborhood
     dist_to_brain = distance_transform_edt(~brain)
-    shell_add = support & (dist_to_brain <= shell_add_vox) & (inten_norm >= args.shell_add_intensity_min) & (~moat)
-    brain |= shell_add
+    boundary_add = (
+        support
+        & (~moat)
+        & shell_neighborhood
+        & (dist_to_brain <= boundary_band_vox)
+        & (inten_norm >= args.boundary_add_intensity_min)
+    )
+    brain |= boundary_add
     brain = largest_component(brain, structure=structure)
 
-    # 5) Targeted brainstem rescue
+    # 6) targeted brainstem rescue
     brainstem_seed = np.zeros_like(brain, dtype=bool)
     brainstem_allowed = np.zeros_like(brain, dtype=bool)
 
@@ -279,15 +316,19 @@ def main():
             inferior_limit = zz <= (seed_coords[:, 2].max() + brainstem_max_inferior_vox)
             corridor = support & (rr <= brainstem_corridor_radius_vox) & inferior_limit
 
-            tissue_gate = (inten_norm >= args.brainstem_intensity_min) & (grad_norm <= args.brainstem_gradient_max) & (~moat)
-            brainstem_allowed = corridor & tissue_gate
+            tissue_gate_bs = (
+                (inten_norm >= args.brainstem_intensity_min)
+                & (grad_norm <= args.brainstem_gradient_max)
+                & (~moat)
+            )
+            brainstem_allowed = corridor & tissue_gate_bs
             brainstem_allowed |= brainstem_seed
 
             brainstem_grown = constrained_region_grow(brainstem_seed, brainstem_allowed, structure, args.brainstem_iters)
             brain |= brainstem_grown
             brain = largest_component(brain, structure=structure)
 
-    # 6) Cleanup
+    # 7) cleanup
     if args.brain_fill_holes:
         brain = binary_fill_holes(brain)
 
@@ -320,6 +361,10 @@ def main():
         prefix = Path(args.debug_prefix)
         save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_shell_raw.nii.gz"), shell_raw.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_shell.nii.gz"), shell.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_dist_to_shell.nii.gz"), dist_to_shell.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_shell_neighborhood.nii.gz"), shell_neighborhood.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_moat_raw.nii.gz"), moat_raw.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_moat.nii.gz"), moat.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_seed_region.nii.gz"), seed_region.astype(np.uint8), bfc_img)
@@ -327,7 +372,7 @@ def main():
         save_like(prefix.with_name(prefix.name + "_allowed.nii.gz"), allowed.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_dist_to_support_edge.nii.gz"), dist_to_support_edge.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_dist_to_brain.nii.gz"), dist_to_brain.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_shell_add.nii.gz"), shell_add.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_boundary_add.nii.gz"), boundary_add.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_brainstem_seed.nii.gz"), brainstem_seed.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_brainstem_allowed.nii.gz"), brainstem_allowed.astype(np.uint8), bfc_img)
 
@@ -370,6 +415,10 @@ def build_job_script(
     pre_dilate_radius_final: int,
     brain_smooth_sigma: float,
     brain_grad_sigma: float,
+    brain_shell_threshold: float,
+    brain_min_shell_volume_mm3: float,
+    brain_shell_close_iters: int,
+    brain_shell_neighborhood_mm: float,
     brain_dark_moat_threshold: float,
     brain_min_moat_volume_mm3: float,
     brain_moat_close_iters: int,
@@ -378,8 +427,8 @@ def build_job_script(
     brain_grow_intensity_min: float,
     brain_grow_gradient_max: float,
     brain_grow_iters: int,
-    brain_shell_add_mm: float,
-    brain_shell_add_intensity_min: float,
+    brain_boundary_band_mm: float,
+    brain_boundary_add_intensity_min: float,
     do_brainstem_rescue: bool,
     brainstem_seed_slice_frac: float,
     brainstem_corridor_radius_mm: float,
@@ -567,7 +616,7 @@ if [[ "$need_brainmask" == "1" ]]; then
     fi
 
     echo
-    echo "Creating dark-moat brain mask..."
+    echo "Creating hybrid shell+moat brain mask..."
     brain_cmd=(
         "$python_exe" "$helper_py"
         --bfc "$out_nii"
@@ -576,6 +625,10 @@ if [[ "$need_brainmask" == "1" ]]; then
         --out_masked_bfc "$brain_t2_nii"
         --smooth_sigma """ + str(brain_smooth_sigma) + r"""
         --grad_sigma """ + str(brain_grad_sigma) + r"""
+        --shell_threshold """ + str(brain_shell_threshold) + r"""
+        --min_shell_volume_mm3 """ + str(brain_min_shell_volume_mm3) + r"""
+        --shell_close_iters """ + str(brain_shell_close_iters) + r"""
+        --shell_neighborhood_mm """ + str(brain_shell_neighborhood_mm) + r"""
         --dark_moat_threshold """ + str(brain_dark_moat_threshold) + r"""
         --min_moat_volume_mm3 """ + str(brain_min_moat_volume_mm3) + r"""
         --moat_close_iters """ + str(brain_moat_close_iters) + r"""
@@ -584,8 +637,8 @@ if [[ "$need_brainmask" == "1" ]]; then
         --grow_intensity_min """ + str(brain_grow_intensity_min) + r"""
         --grow_gradient_max """ + str(brain_grow_gradient_max) + r"""
         --grow_iters """ + str(brain_grow_iters) + r"""
-        --shell_add_mm """ + str(brain_shell_add_mm) + r"""
-        --shell_add_intensity_min """ + str(brain_shell_add_intensity_min) + r"""
+        --boundary_band_mm """ + str(brain_boundary_band_mm) + r"""
+        --boundary_add_intensity_min """ + str(brain_boundary_add_intensity_min) + r"""
         --brainstem_seed_slice_frac """ + str(brainstem_seed_slice_frac) + r"""
         --brainstem_corridor_radius_mm """ + str(brainstem_corridor_radius_mm) + r"""
         --brainstem_max_inferior_mm """ + str(brainstem_max_inferior_mm) + r"""
@@ -670,28 +723,35 @@ def main():
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
-    # Dark-moat mask parameters
+    # Hybrid shell+moat parameters
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
+
+    p.add_argument("--brain_shell_threshold", type=float, default=0.60)
+    p.add_argument("--brain_min_shell_volume_mm3", type=float, default=0.03)
+    p.add_argument("--brain_shell_close_iters", type=int, default=1)
+    p.add_argument("--brain_shell_neighborhood_mm", type=float, default=0.45)
+
     p.add_argument("--brain_dark_moat_threshold", type=float, default=0.20)
     p.add_argument("--brain_min_moat_volume_mm3", type=float, default=0.03)
     p.add_argument("--brain_moat_close_iters", type=int, default=1)
 
     p.add_argument("--brain_seed_min_distance_mm", type=float, default=0.8)
-    p.add_argument("--brain_seed_intensity_min", type=float, default=0.35)
+    p.add_argument("--brain_seed_intensity_min", type=float, default=0.30)
+
     p.add_argument("--brain_grow_intensity_min", type=float, default=0.08)
-    p.add_argument("--brain_grow_gradient_max", type=float, default=0.80)
+    p.add_argument("--brain_grow_gradient_max", type=float, default=0.85)
     p.add_argument("--brain_grow_iters", type=int, default=200)
 
-    p.add_argument("--brain_shell_add_mm", type=float, default=0.10)
-    p.add_argument("--brain_shell_add_intensity_min", type=float, default=0.06)
+    p.add_argument("--brain_boundary_band_mm", type=float, default=0.25)
+    p.add_argument("--brain_boundary_add_intensity_min", type=float, default=0.05)
 
     p.add_argument("--do_brainstem_rescue", action="store_true")
     p.add_argument("--brainstem_seed_slice_frac", type=float, default=0.18)
     p.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.0)
     p.add_argument("--brainstem_max_inferior_mm", type=float, default=3.0)
     p.add_argument("--brainstem_intensity_min", type=float, default=0.04)
-    p.add_argument("--brainstem_gradient_max", type=float, default=0.80)
+    p.add_argument("--brainstem_gradient_max", type=float, default=0.85)
     p.add_argument("--brainstem_iters", type=int, default=50)
 
     p.add_argument("--brain_close_iters", type=int, default=2)
@@ -815,6 +875,10 @@ def main():
             pre_dilate_radius_final=args.pre_dilate_radius_final,
             brain_smooth_sigma=args.brain_smooth_sigma,
             brain_grad_sigma=args.brain_grad_sigma,
+            brain_shell_threshold=args.brain_shell_threshold,
+            brain_min_shell_volume_mm3=args.brain_min_shell_volume_mm3,
+            brain_shell_close_iters=args.brain_shell_close_iters,
+            brain_shell_neighborhood_mm=args.brain_shell_neighborhood_mm,
             brain_dark_moat_threshold=args.brain_dark_moat_threshold,
             brain_min_moat_volume_mm3=args.brain_min_moat_volume_mm3,
             brain_moat_close_iters=args.brain_moat_close_iters,
@@ -823,8 +887,8 @@ def main():
             brain_grow_intensity_min=args.brain_grow_intensity_min,
             brain_grow_gradient_max=args.brain_grow_gradient_max,
             brain_grow_iters=args.brain_grow_iters,
-            brain_shell_add_mm=args.brain_shell_add_mm,
-            brain_shell_add_intensity_min=args.brain_shell_add_intensity_min,
+            brain_boundary_band_mm=args.brain_boundary_band_mm,
+            brain_boundary_add_intensity_min=args.brain_boundary_add_intensity_min,
             do_brainstem_rescue=args.do_brainstem_rescue,
             brainstem_seed_slice_frac=args.brainstem_seed_slice_frac,
             brainstem_corridor_radius_mm=args.brainstem_corridor_radius_mm,
