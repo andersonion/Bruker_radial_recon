@@ -58,7 +58,7 @@ def submit_job(script_path: Path):
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def write_headmask_helper(helper_path: Path):
+def write_brainmask_helper(helper_path: Path):
     helper_code = r'''#!/usr/bin/env python3
 
 import argparse
@@ -72,9 +72,9 @@ from scipy.ndimage import (
     binary_erosion,
     binary_fill_holes,
     binary_opening,
-    binary_propagation,
     distance_transform_edt,
     gaussian_filter,
+    gaussian_gradient_magnitude,
     generate_binary_structure,
     label,
 )
@@ -121,15 +121,14 @@ def robust_normalize(vol: np.ndarray, mask: np.ndarray, low_pct=2.0, high_pct=98
     return np.clip(out, 0.0, 1.0)
 
 
-def boundary_seed(mask: np.ndarray) -> np.ndarray:
-    seed = np.zeros_like(mask, dtype=bool)
-    seed[0, :, :] |= mask[0, :, :]
-    seed[-1, :, :] |= mask[-1, :, :]
-    seed[:, 0, :] |= mask[:, 0, :]
-    seed[:, -1, :] |= mask[:, -1, :]
-    seed[:, :, 0] |= mask[:, :, 0]
-    seed[:, :, -1] |= mask[:, :, -1]
-    return seed
+def constrained_region_grow(seed: np.ndarray, allowed: np.ndarray, structure, max_iters: int) -> np.ndarray:
+    grown = seed.copy()
+    for _ in range(max_iters):
+        nxt = binary_dilation(grown, structure=structure) & allowed
+        if np.array_equal(nxt, grown):
+            break
+        grown = nxt
+    return grown
 
 
 def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
@@ -139,7 +138,7 @@ def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Refine a whole-head mask from BFC T2 using outer dark-background flood fill plus bright-shell protection."
+        description="Build a brain mask from BFC T2 using bright-shell + dark-moat + central-seed logic inside a loose support."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -148,26 +147,49 @@ def main():
     ap.add_argument("--debug_prefix", default=None)
 
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
+    ap.add_argument("--grad_sigma", type=float, default=1.0)
 
-    # Dark exterior/background
-    ap.add_argument("--dark_bg_threshold", type=float, default=0.20,
-                    help="Normalized intensity threshold for exterior/background candidates.")
-    ap.add_argument("--min_bg_volume_mm3", type=float, default=0.03)
-    ap.add_argument("--bg_close_iters", type=int, default=1)
+    # Final search space is a LOOSER support than the N4 support mask
+    ap.add_argument("--final_support_dilate_mm", type=float, default=0.8)
 
     # Bright shell
-    ap.add_argument("--shell_threshold", type=float, default=0.55,
-                    help="Normalized intensity threshold for outer bright shell candidates.")
+    ap.add_argument("--shell_threshold", type=float, default=0.55)
     ap.add_argument("--min_shell_volume_mm3", type=float, default=0.03)
     ap.add_argument("--shell_close_iters", type=int, default=1)
-    ap.add_argument("--shell_protect_mm", type=float, default=0.40,
-                    help="Distance around bright shell to protect from exterior subtraction.")
+    ap.add_argument("--shell_neighborhood_mm", type=float, default=0.45)
 
-    # Head cleanup / completion
-    ap.add_argument("--head_close_iters", type=int, default=2)
-    ap.add_argument("--head_open_iters", type=int, default=0)
-    ap.add_argument("--head_dilate_iters", type=int, default=0)
-    ap.add_argument("--head_fill_holes", action="store_true")
+    # Dark moat
+    ap.add_argument("--dark_moat_threshold", type=float, default=0.20)
+    ap.add_argument("--min_moat_volume_mm3", type=float, default=0.03)
+    ap.add_argument("--moat_close_iters", type=int, default=1)
+
+    # Central seed
+    ap.add_argument("--seed_min_distance_mm", type=float, default=0.8)
+    ap.add_argument("--seed_intensity_min", type=float, default=0.28)
+
+    # Main growth
+    ap.add_argument("--grow_intensity_min", type=float, default=0.07)
+    ap.add_argument("--grow_gradient_max", type=float, default=0.90)
+    ap.add_argument("--grow_iters", type=int, default=250)
+
+    # Small boundary completion
+    ap.add_argument("--boundary_band_mm", type=float, default=0.25)
+    ap.add_argument("--boundary_add_intensity_min", type=float, default=0.05)
+
+    # Optional targeted brainstem rescue
+    ap.add_argument("--do_brainstem_rescue", action="store_true")
+    ap.add_argument("--brainstem_seed_slice_frac", type=float, default=0.18)
+    ap.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.0)
+    ap.add_argument("--brainstem_max_inferior_mm", type=float, default=3.0)
+    ap.add_argument("--brainstem_intensity_min", type=float, default=0.04)
+    ap.add_argument("--brainstem_gradient_max", type=float, default=0.90)
+    ap.add_argument("--brainstem_iters", type=int, default=50)
+
+    # Final cleanup
+    ap.add_argument("--brain_close_iters", type=int, default=2)
+    ap.add_argument("--brain_open_iters", type=int, default=0)
+    ap.add_argument("--brain_dilate_iters", type=int, default=0)
+    ap.add_argument("--brain_fill_holes", action="store_true")
 
     ap.add_argument("--tight_mask", action="store_true")
     ap.add_argument("--tight_erode_iters", type=int, default=1)
@@ -187,71 +209,151 @@ def main():
 
     zooms = bfc_img.header.get_zooms()[:3]
     voxel_volume_mm3 = float(zooms[0] * zooms[1] * zooms[2])
+    mean_spacing = float(np.mean(zooms))
     if voxel_volume_mm3 <= 0:
         raise RuntimeError(f"Bad voxel volume from header: {voxel_volume_mm3}")
 
-    mean_spacing = float(np.mean(zooms))
-    shell_protect_vox = max(1.0, args.shell_protect_mm / max(mean_spacing, 1e-6))
-    min_bg_vox = max(1, int(round(args.min_bg_volume_mm3 / voxel_volume_mm3)))
-    min_shell_vox = max(1, int(round(args.min_shell_volume_mm3 / voxel_volume_mm3)))
-
     structure = generate_binary_structure(3, 2)
 
-    bfc_smooth = gaussian_filter(bfc, sigma=args.smooth_sigma)
-    inten_norm = robust_normalize(bfc_smooth, support, low_pct=2.0, high_pct=98.0)
+    final_support_dilate_vox = max(1.0, args.final_support_dilate_mm / max(mean_spacing, 1e-6))
+    shell_neighborhood_vox = max(1.0, args.shell_neighborhood_mm / max(mean_spacing, 1e-6))
+    seed_min_distance_vox = max(1.0, args.seed_min_distance_mm / max(mean_spacing, 1e-6))
+    boundary_band_vox = max(1.0, args.boundary_band_mm / max(mean_spacing, 1e-6))
+    brainstem_corridor_radius_vox = max(1.0, args.brainstem_corridor_radius_mm / max(mean_spacing, 1e-6))
+    brainstem_max_inferior_vox = max(1.0, args.brainstem_max_inferior_mm / max(mean_spacing, 1e-6))
 
-    # Bright shell candidates
-    shell_raw = (inten_norm >= args.shell_threshold) & support
+    min_shell_vox = max(1, int(round(args.min_shell_volume_mm3 / voxel_volume_mm3)))
+    min_moat_vox = max(1, int(round(args.min_moat_volume_mm3 / voxel_volume_mm3)))
+
+    # Loose support for final brain search
+    loose_support = binary_dilation(support, structure=structure, iterations=int(np.ceil(final_support_dilate_vox)))
+    loose_support = largest_component(loose_support, structure=structure)
+
+    bfc_smooth = gaussian_filter(bfc, sigma=args.smooth_sigma)
+    inten_norm = robust_normalize(bfc_smooth, loose_support, low_pct=2.0, high_pct=98.0)
+    grad = gaussian_gradient_magnitude(bfc_smooth, sigma=args.grad_sigma)
+    grad_norm = robust_normalize(grad, loose_support, low_pct=2.0, high_pct=98.0)
+
+    # Bright shell
+    shell_raw = (inten_norm >= args.shell_threshold) & loose_support
     shell = remove_small_components(shell_raw, min_shell_vox, structure=structure)
     if args.shell_close_iters > 0 and np.any(shell):
         shell = binary_closing(shell, structure=structure, iterations=args.shell_close_iters)
 
     dist_to_shell = distance_transform_edt(~shell)
-    shell_protect = support & (dist_to_shell <= shell_protect_vox)
+    shell_neighborhood = loose_support & (dist_to_shell <= shell_neighborhood_vox)
 
-    # Dark background candidates
-    bg_raw = (inten_norm <= args.dark_bg_threshold) & support
-    bg = remove_small_components(bg_raw, min_bg_vox, structure=structure)
-    if args.bg_close_iters > 0 and np.any(bg):
-        bg = binary_closing(bg, structure=structure, iterations=args.bg_close_iters)
+    # Dark moat
+    moat_raw = (inten_norm <= args.dark_moat_threshold) & loose_support
+    moat = remove_small_components(moat_raw, min_moat_vox, structure=structure)
+    if args.moat_close_iters > 0 and np.any(moat):
+        moat = binary_closing(moat, structure=structure, iterations=args.moat_close_iters)
 
-    # Exterior dark background: only what is connected to support boundary
-    bg_open = bg & (~shell_protect)
-    seeds = boundary_seed(bg_open)
-    exterior_bg = binary_propagation(seeds, structure=structure, mask=bg_open)
+    # Central seed
+    dist_to_loose_edge = distance_transform_edt(loose_support)
+    seed_region = (
+        loose_support
+        & (dist_to_loose_edge >= seed_min_distance_vox)
+        & (inten_norm >= args.seed_intensity_min)
+        & (~moat)
+    )
+    seed = largest_component(seed_region, structure=structure)
 
-    # Head mask = support minus exterior background
-    head = support & (~exterior_bg)
+    if not np.any(seed):
+        seed_region = (
+            loose_support
+            & (dist_to_loose_edge >= max(1.0, 0.5 * seed_min_distance_vox))
+            & (inten_norm >= max(0.18, args.seed_intensity_min * 0.7))
+            & (~moat)
+        )
+        seed = largest_component(seed_region, structure=structure)
 
-    # Add protected shell back explicitly, just in case
-    head |= shell_protect
+    if not np.any(seed):
+        raise RuntimeError("No valid brain seed found.")
 
-    head &= support
-    head = largest_component(head, structure=structure)
+    # Main growth
+    tissue_gate = (inten_norm >= args.grow_intensity_min) & (grad_norm <= args.grow_gradient_max)
+    interior_gate = dist_to_loose_edge >= max(1.0, 0.6 * seed_min_distance_vox)
+    allowed = loose_support & (~moat) & tissue_gate & (shell_neighborhood | interior_gate)
+    allowed |= seed
 
-    if args.head_fill_holes:
-        head = binary_fill_holes(head)
+    brain = constrained_region_grow(seed, allowed, structure, args.grow_iters)
+    brain = largest_component(brain, structure=structure)
 
-    if args.head_close_iters > 0:
-        head = binary_closing(head, structure=structure, iterations=args.head_close_iters)
+    # Boundary add-back near shell
+    dist_to_brain = distance_transform_edt(~brain)
+    boundary_add = (
+        loose_support
+        & (~moat)
+        & shell_neighborhood
+        & (dist_to_brain <= boundary_band_vox)
+        & (inten_norm >= args.boundary_add_intensity_min)
+    )
+    brain |= boundary_add
+    brain = largest_component(brain, structure=structure)
 
-    if args.head_open_iters > 0:
-        head = binary_opening(head, structure=structure, iterations=args.head_open_iters)
+    # Optional targeted brainstem rescue
+    brainstem_seed = np.zeros_like(brain, dtype=bool)
+    brainstem_allowed = np.zeros_like(brain, dtype=bool)
 
-    if args.head_dilate_iters > 0:
-        head = binary_dilation(head, structure=structure, iterations=args.head_dilate_iters)
+    if args.do_brainstem_rescue and np.any(brain):
+        coords = np.argwhere(brain)
+        zmin = coords[:, 2].min()
+        zmax = coords[:, 2].max()
+        zspan = max(1, zmax - zmin + 1)
+        seed_depth = max(1, int(round(args.brainstem_seed_slice_frac * zspan)))
+        z_cut = zmax - seed_depth + 1
 
-    head &= support
-    head = largest_component(head, structure=structure)
-    head = binary_fill_holes(head)
-    head = largest_component(head, structure=structure)
+        inferior_band = brain & (np.indices(brain.shape)[2] >= z_cut)
+        inferior_band = largest_component(inferior_band, structure=structure)
+        brainstem_seed = inferior_band.copy()
+
+        if np.any(brainstem_seed):
+            seed_coords = np.argwhere(brainstem_seed)
+            cy, cx, cz = seed_coords.mean(axis=0)
+
+            yy, xx, zz = np.indices(brain.shape)
+            rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+
+            inferior_limit = zz <= (seed_coords[:, 2].max() + brainstem_max_inferior_vox)
+            corridor = loose_support & (rr <= brainstem_corridor_radius_vox) & inferior_limit
+
+            tissue_gate_bs = (
+                (inten_norm >= args.brainstem_intensity_min)
+                & (grad_norm <= args.brainstem_gradient_max)
+                & (~moat)
+            )
+            brainstem_allowed = corridor & tissue_gate_bs
+            brainstem_allowed |= brainstem_seed
+
+            brainstem_grown = constrained_region_grow(brainstem_seed, brainstem_allowed, structure, args.brainstem_iters)
+            brain |= brainstem_grown
+            brain = largest_component(brain, structure=structure)
+
+    # Cleanup
+    if args.brain_fill_holes:
+        brain = binary_fill_holes(brain)
+
+    if args.brain_close_iters > 0:
+        brain = binary_closing(brain, structure=structure, iterations=args.brain_close_iters)
+
+    if args.brain_open_iters > 0:
+        brain = binary_opening(brain, structure=structure, iterations=args.brain_open_iters)
+
+    if args.brain_dilate_iters > 0:
+        brain = binary_dilation(brain, structure=structure, iterations=args.brain_dilate_iters)
+
+    brain &= loose_support
+    brain = largest_component(brain, structure=structure)
+    brain = binary_fill_holes(brain)
+    brain = largest_component(brain, structure=structure)
 
     if args.tight_mask:
-        head = binary_erosion(head, structure=structure, iterations=args.tight_erode_iters)
-        head = largest_component(head, structure=structure)
-        head = binary_fill_holes(head)
+        brain = binary_erosion(brain, structure=structure, iterations=args.tight_erode_iters)
+        brain = largest_component(brain, structure=structure)
+        brain = binary_fill_holes(brain)
 
-    out_mask = head.astype(np.uint8)
+    out_mask = brain.astype(np.uint8)
     out_masked_bfc = np.where(out_mask > 0, bfc, 0.0).astype(np.float32)
 
     save_like(Path(args.out_mask), out_mask, bfc_img)
@@ -259,15 +361,23 @@ def main():
 
     if args.debug_prefix:
         prefix = Path(args.debug_prefix)
+        save_like(prefix.with_name(prefix.name + "_loose_support.nii.gz"), loose_support.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_shell_raw.nii.gz"), shell_raw.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_shell.nii.gz"), shell.astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_dist_to_shell.nii.gz"), dist_to_shell.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_shell_protect.nii.gz"), shell_protect.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_bg_raw.nii.gz"), bg_raw.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_bg.nii.gz"), bg.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_bg_open.nii.gz"), bg_open.astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_exterior_bg.nii.gz"), exterior_bg.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_shell_neighborhood.nii.gz"), shell_neighborhood.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_moat_raw.nii.gz"), moat_raw.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_moat.nii.gz"), moat.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_seed_region.nii.gz"), seed_region.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_seed.nii.gz"), seed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_allowed.nii.gz"), allowed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_dist_to_loose_edge.nii.gz"), dist_to_loose_edge.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_dist_to_brain.nii.gz"), dist_to_brain.astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_boundary_add.nii.gz"), boundary_add.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_brainstem_seed.nii.gz"), brainstem_seed.astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_brainstem_allowed.nii.gz"), brainstem_allowed.astype(np.uint8), bfc_img)
 
 
 if __name__ == "__main__":
@@ -283,10 +393,10 @@ def build_job_script(
     out_nii: Path,
     in_method: Path,
     out_method: Path,
-    premask_nii: Path,
+    support_nii: Path,
     bias_nii: Path,
-    headmask_nii: Path,
-    head_t2_nii: Path,
+    brainmask_nii: Path,
+    brain_t2_nii: Path,
     diff_nii: Path | None,
     tmp_otsu_pre_nii: Path,
     helper_py: Path,
@@ -306,21 +416,38 @@ def build_job_script(
     pre_dilate_radius_pre_glc: int,
     pre_fill_holes_radius: int,
     pre_dilate_radius_final: int,
-    head_smooth_sigma: float,
-    head_dark_bg_threshold: float,
-    head_min_bg_volume_mm3: float,
-    head_bg_close_iters: int,
-    head_shell_threshold: float,
-    head_min_shell_volume_mm3: float,
-    head_shell_close_iters: int,
-    head_shell_protect_mm: float,
-    head_close_iters: int,
-    head_open_iters: int,
-    head_dilate_iters: int,
-    head_fill_holes: bool,
+    pre_support_extra_dilate_radius: int,
+    brain_smooth_sigma: float,
+    brain_grad_sigma: float,
+    brain_final_support_dilate_mm: float,
+    brain_shell_threshold: float,
+    brain_min_shell_volume_mm3: float,
+    brain_shell_close_iters: int,
+    brain_shell_neighborhood_mm: float,
+    brain_dark_moat_threshold: float,
+    brain_min_moat_volume_mm3: float,
+    brain_moat_close_iters: int,
+    brain_seed_min_distance_mm: float,
+    brain_seed_intensity_min: float,
+    brain_grow_intensity_min: float,
+    brain_grow_gradient_max: float,
+    brain_grow_iters: int,
+    brain_boundary_band_mm: float,
+    brain_boundary_add_intensity_min: float,
+    do_brainstem_rescue: bool,
+    brainstem_seed_slice_frac: float,
+    brainstem_corridor_radius_mm: float,
+    brainstem_max_inferior_mm: float,
+    brainstem_intensity_min: float,
+    brainstem_gradient_max: float,
+    brainstem_iters: int,
+    brain_close_iters: int,
+    brain_open_iters: int,
+    brain_dilate_iters: int,
+    brain_fill_holes: bool,
     tight_mask: bool,
     tight_mask_erode_iters: int,
-    save_head_debug: bool,
+    save_brain_debug: bool,
     threads: int,
     job_name: str,
     log_out: Path,
@@ -359,17 +486,18 @@ in_nii=""" + shell_quote(str(in_nii)) + r"""
 out_nii=""" + shell_quote(str(out_nii)) + r"""
 in_method=""" + shell_quote(str(in_method)) + r"""
 out_method=""" + shell_quote(str(out_method)) + r"""
-premask_nii=""" + shell_quote(str(premask_nii)) + r"""
+support_nii=""" + shell_quote(str(support_nii)) + r"""
 bias_nii=""" + shell_quote(str(bias_nii)) + r"""
-headmask_nii=""" + shell_quote(str(headmask_nii)) + r"""
-head_t2_nii=""" + shell_quote(str(head_t2_nii)) + r"""
+brainmask_nii=""" + shell_quote(str(brainmask_nii)) + r"""
+brain_t2_nii=""" + shell_quote(str(brain_t2_nii)) + r"""
 tmp_otsu_pre_nii=""" + shell_quote(str(tmp_otsu_pre_nii)) + r"""
 helper_py=""" + shell_quote(str(helper_py)) + r"""
 python_exe=""" + shell_quote(str(python_path)) + r"""
 overwrite_flag=""" + ("1" if overwrite else "0") + r"""
 tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
-save_head_debug_flag=""" + ("1" if save_head_debug else "0") + r"""
-head_fill_holes_flag=""" + ("1" if head_fill_holes else "0") + r"""
+save_brain_debug_flag=""" + ("1" if save_brain_debug else "0") + r"""
+brain_fill_holes_flag=""" + ("1" if brain_fill_holes else "0") + r"""
+do_brainstem_rescue_flag=""" + ("1" if do_brainstem_rescue else "0") + r"""
 """
 
     if diff_nii is not None:
@@ -399,24 +527,18 @@ if [[ ! -f "$in_nii" ]]; then
     exit 1
 fi
 
-if [[ -n "$printheader_exe" ]]; then
-    echo
-    echo "Header / spacing check:"
-    "$printheader_exe" "$in_nii" 1 || true
-fi
-
 need_n4=0
 if [[ "$overwrite_flag" == "1" ]]; then
     need_n4=1
-elif [[ ! -f "$out_nii" || ! -f "$bias_nii" || ! -f "$premask_nii" ]]; then
+elif [[ ! -f "$out_nii" || ! -f "$bias_nii" || ! -f "$support_nii" ]]; then
     need_n4=1
 fi
 
-need_headmask=0
+need_brainmask=0
 if [[ "$overwrite_flag" == "1" ]]; then
-    need_headmask=1
-elif [[ ! -f "$headmask_nii" || ! -f "$head_t2_nii" ]]; then
-    need_headmask=1
+    need_brainmask=1
+elif [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then
+    need_brainmask=1
 fi
 
 if [[ -n "$diff_nii" ]]; then
@@ -444,20 +566,19 @@ make_support_mask() {
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" FillHoles "$dst_mask" """ + str(pre_fill_holes_radius) + r"""
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" GetLargestComponent "$dst_mask"
     "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(pre_dilate_radius_final) + r"""
+    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(pre_support_extra_dilate_radius) + r"""
 }
 
 if [[ "$need_n4" == "1" ]]; then
-    echo
-    echo "Creating pre-N4 support mask..."
-    make_support_mask "$in_nii" "$tmp_otsu_pre_nii" "$premask_nii"
+    echo "Creating generous N4 support mask..."
+    make_support_mask "$in_nii" "$tmp_otsu_pre_nii" "$support_nii"
 
-    echo
     echo "Running N4BiasFieldCorrection..."
     cmd=(
         "$n4_exe"
         -d """ + str(dimension) + r"""
         -i "$in_nii"
-        -x "$premask_nii"
+        -x "$support_nii"
         -s """ + str(shrink_factor) + r"""
         -c """ + shell_quote(convergence) + r"""
         -b """ + shell_quote(bspline) + r"""
@@ -478,65 +599,81 @@ if [[ "$need_n4" == "1" ]]; then
         cp -f "$in_method" "$out_method"
     fi
 else
-    echo
     echo "Skipping N4 stage; existing outputs found and overwrite is off."
 fi
 
-if [[ "$need_headmask" == "1" ]]; then
+if [[ "$need_brainmask" == "1" ]]; then
     if [[ ! -f "$out_nii" ]]; then
-        echo "ERROR: Missing corrected image for head mask: $out_nii" >&2
+        echo "ERROR: Missing corrected image for brain mask: $out_nii" >&2
         exit 1
     fi
-    if [[ ! -f "$premask_nii" ]]; then
-        echo "ERROR: Missing support mask for head mask: $premask_nii" >&2
+    if [[ ! -f "$support_nii" ]]; then
+        echo "ERROR: Missing support mask for brain mask: $support_nii" >&2
         exit 1
     fi
 
-    echo
-    echo "Creating refined whole-head mask..."
-    head_cmd=(
+    echo "Creating brain mask from BFC using loose support..."
+    brain_cmd=(
         "$python_exe" "$helper_py"
         --bfc "$out_nii"
-        --support_mask "$premask_nii"
-        --out_mask "$headmask_nii"
-        --out_masked_bfc "$head_t2_nii"
-        --smooth_sigma """ + str(head_smooth_sigma) + r"""
-        --dark_bg_threshold """ + str(head_dark_bg_threshold) + r"""
-        --min_bg_volume_mm3 """ + str(head_min_bg_volume_mm3) + r"""
-        --bg_close_iters """ + str(head_bg_close_iters) + r"""
-        --shell_threshold """ + str(head_shell_threshold) + r"""
-        --min_shell_volume_mm3 """ + str(head_min_shell_volume_mm3) + r"""
-        --shell_close_iters """ + str(head_shell_close_iters) + r"""
-        --shell_protect_mm """ + str(head_shell_protect_mm) + r"""
-        --head_close_iters """ + str(head_close_iters) + r"""
-        --head_open_iters """ + str(head_open_iters) + r"""
-        --head_dilate_iters """ + str(head_dilate_iters) + r"""
+        --support_mask "$support_nii"
+        --out_mask "$brainmask_nii"
+        --out_masked_bfc "$brain_t2_nii"
+        --smooth_sigma """ + str(brain_smooth_sigma) + r"""
+        --grad_sigma """ + str(brain_grad_sigma) + r"""
+        --final_support_dilate_mm """ + str(brain_final_support_dilate_mm) + r"""
+        --shell_threshold """ + str(brain_shell_threshold) + r"""
+        --min_shell_volume_mm3 """ + str(brain_min_shell_volume_mm3) + r"""
+        --shell_close_iters """ + str(brain_shell_close_iters) + r"""
+        --shell_neighborhood_mm """ + str(brain_shell_neighborhood_mm) + r"""
+        --dark_moat_threshold """ + str(brain_dark_moat_threshold) + r"""
+        --min_moat_volume_mm3 """ + str(brain_min_moat_volume_mm3) + r"""
+        --moat_close_iters """ + str(brain_moat_close_iters) + r"""
+        --seed_min_distance_mm """ + str(brain_seed_min_distance_mm) + r"""
+        --seed_intensity_min """ + str(brain_seed_intensity_min) + r"""
+        --grow_intensity_min """ + str(brain_grow_intensity_min) + r"""
+        --grow_gradient_max """ + str(brain_grow_gradient_max) + r"""
+        --grow_iters """ + str(brain_grow_iters) + r"""
+        --boundary_band_mm """ + str(brain_boundary_band_mm) + r"""
+        --boundary_add_intensity_min """ + str(brain_boundary_add_intensity_min) + r"""
+        --brainstem_seed_slice_frac """ + str(brainstem_seed_slice_frac) + r"""
+        --brainstem_corridor_radius_mm """ + str(brainstem_corridor_radius_mm) + r"""
+        --brainstem_max_inferior_mm """ + str(brainstem_max_inferior_mm) + r"""
+        --brainstem_intensity_min """ + str(brainstem_intensity_min) + r"""
+        --brainstem_gradient_max """ + str(brainstem_gradient_max) + r"""
+        --brainstem_iters """ + str(brainstem_iters) + r"""
+        --brain_close_iters """ + str(brain_close_iters) + r"""
+        --brain_open_iters """ + str(brain_open_iters) + r"""
+        --brain_dilate_iters """ + str(brain_dilate_iters) + r"""
         --tight_erode_iters """ + str(tight_mask_erode_iters) + r"""
     )
 
-    if [[ "$head_fill_holes_flag" == "1" ]]; then
-        head_cmd+=( --head_fill_holes )
+    if [[ "$brain_fill_holes_flag" == "1" ]]; then
+        brain_cmd+=( --brain_fill_holes )
+    fi
+
+    if [[ "$do_brainstem_rescue_flag" == "1" ]]; then
+        brain_cmd+=( --do_brainstem_rescue )
     fi
 
     if [[ "$tight_mask_flag" == "1" ]]; then
-        head_cmd+=( --tight_mask )
+        brain_cmd+=( --tight_mask )
     fi
 
-    if [[ "$save_head_debug_flag" == "1" ]]; then
-        head_cmd+=( --debug_prefix "$(dirname "$headmask_nii")/""" + runno + r"""_bfc_head_dbg" )
+    if [[ "$save_brain_debug_flag" == "1" ]]; then
+        brain_cmd+=( --debug_prefix "$(dirname "$brainmask_nii")/""" + runno + r"""_bfc_brain_dbg" )
     fi
 
-    printf '  %q' "${head_cmd[@]}"
+    printf '  %q' "${brain_cmd[@]}"
     echo
-    "${head_cmd[@]}"
+    "${brain_cmd[@]}"
 
-    if [[ ! -f "$headmask_nii" || ! -f "$head_t2_nii" ]]; then
-        echo "ERROR: Head-mask outputs missing." >&2
+    if [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then
+        echo "ERROR: Brain-mask outputs missing." >&2
         exit 1
     fi
 else
-    echo
-    echo "Skipping head-mask stage; outputs exist and overwrite is off."
+    echo "Skipping brain-mask stage; outputs exist and overwrite is off."
 fi
 
 if [[ "$need_diff" == "1" ]]; then
@@ -575,34 +712,56 @@ def main():
     p.add_argument("--bspline", default="[8]")
     p.add_argument("--histogram_sharpening", default="[0.15,0.01,200]")
 
+    # Very generous N4 support mask
     p.add_argument("--pre_otsu_keep_low", type=int, default=2)
     p.add_argument("--pre_otsu_keep_high", type=int, default=4)
     p.add_argument("--pre_close_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_pre_glc", type=int, default=1)
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
+    p.add_argument("--pre_support_extra_dilate_radius", type=int, default=3)
 
-    # Whole-head refinement parameters
-    p.add_argument("--head_smooth_sigma", type=float, default=1.0)
+    # Final brain-mask parameters
+    p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
+    p.add_argument("--brain_grad_sigma", type=float, default=1.0)
+    p.add_argument("--brain_final_support_dilate_mm", type=float, default=0.8)
 
-    p.add_argument("--head_dark_bg_threshold", type=float, default=0.20)
-    p.add_argument("--head_min_bg_volume_mm3", type=float, default=0.03)
-    p.add_argument("--head_bg_close_iters", type=int, default=1)
+    p.add_argument("--brain_shell_threshold", type=float, default=0.55)
+    p.add_argument("--brain_min_shell_volume_mm3", type=float, default=0.03)
+    p.add_argument("--brain_shell_close_iters", type=int, default=1)
+    p.add_argument("--brain_shell_neighborhood_mm", type=float, default=0.45)
 
-    p.add_argument("--head_shell_threshold", type=float, default=0.55)
-    p.add_argument("--head_min_shell_volume_mm3", type=float, default=0.03)
-    p.add_argument("--head_shell_close_iters", type=int, default=1)
-    p.add_argument("--head_shell_protect_mm", type=float, default=0.40)
+    p.add_argument("--brain_dark_moat_threshold", type=float, default=0.20)
+    p.add_argument("--brain_min_moat_volume_mm3", type=float, default=0.03)
+    p.add_argument("--brain_moat_close_iters", type=int, default=1)
 
-    p.add_argument("--head_close_iters", type=int, default=2)
-    p.add_argument("--head_open_iters", type=int, default=0)
-    p.add_argument("--head_dilate_iters", type=int, default=0)
-    p.add_argument("--head_fill_holes", action="store_true")
+    p.add_argument("--brain_seed_min_distance_mm", type=float, default=0.8)
+    p.add_argument("--brain_seed_intensity_min", type=float, default=0.28)
+
+    p.add_argument("--brain_grow_intensity_min", type=float, default=0.07)
+    p.add_argument("--brain_grow_gradient_max", type=float, default=0.90)
+    p.add_argument("--brain_grow_iters", type=int, default=250)
+
+    p.add_argument("--brain_boundary_band_mm", type=float, default=0.25)
+    p.add_argument("--brain_boundary_add_intensity_min", type=float, default=0.05)
+
+    p.add_argument("--do_brainstem_rescue", action="store_true")
+    p.add_argument("--brainstem_seed_slice_frac", type=float, default=0.18)
+    p.add_argument("--brainstem_corridor_radius_mm", type=float, default=1.0)
+    p.add_argument("--brainstem_max_inferior_mm", type=float, default=3.0)
+    p.add_argument("--brainstem_intensity_min", type=float, default=0.04)
+    p.add_argument("--brainstem_gradient_max", type=float, default=0.90)
+    p.add_argument("--brainstem_iters", type=int, default=50)
+
+    p.add_argument("--brain_close_iters", type=int, default=2)
+    p.add_argument("--brain_open_iters", type=int, default=0)
+    p.add_argument("--brain_dilate_iters", type=int, default=0)
+    p.add_argument("--brain_fill_holes", action="store_true")
 
     p.add_argument("--tight_mask", action="store_true")
     p.add_argument("--tight_mask_erode_iters", type=int, default=1)
 
-    p.add_argument("--save_head_debug", action="store_true")
+    p.add_argument("--save_brain_debug", action="store_true")
 
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--cpus", type=int, default=4)
@@ -639,8 +798,8 @@ def main():
     scripts_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    helper_py = sbatch_dir / "make_head_mask_from_bfc.py"
-    write_headmask_helper(helper_py)
+    helper_py = sbatch_dir / "make_brain_mask_from_bfc.py"
+    write_brainmask_helper(helper_py)
 
     print(f"[INFO] base_dir    : {base_dir}")
     print(f"[INFO] sbatch_dir  : {sbatch_dir}")
@@ -658,10 +817,10 @@ def main():
         out_nii = run_dir / f"{runno}_bfc_T2.nii.gz"
         in_method = run_dir / f"{runno}_T2.method"
         out_method = run_dir / f"{runno}_bfc_T2.method"
-        premask_nii = run_dir / f"{runno}_bfc_mask.nii.gz"
+        support_nii = run_dir / f"{runno}_bfc_support_mask.nii.gz"
         bias_nii = run_dir / f"{runno}_bfc_biasfield.nii.gz"
-        headmask_nii = run_dir / f"{runno}_bfc_head_mask.nii.gz"
-        head_t2_nii = run_dir / f"{runno}_bfc_head_T2.nii.gz"
+        brainmask_nii = run_dir / f"{runno}_bfc_brain_mask.nii.gz"
+        brain_t2_nii = run_dir / f"{runno}_bfc_brain_T2.nii.gz"
         tmp_otsu_pre_nii = run_dir / f"{runno}_bfc_otsu_pre_tmp.nii.gz"
         diff_nii = run_dir / f"{runno}_bfc_diff_T2.nii.gz" if args.save_diff else None
 
@@ -671,10 +830,10 @@ def main():
             continue
 
         if not args.overwrite:
-            have_core = out_nii.exists() and bias_nii.exists() and premask_nii.exists()
-            have_head = headmask_nii.exists() and head_t2_nii.exists()
+            have_core = out_nii.exists() and bias_nii.exists() and support_nii.exists()
+            have_brain = brainmask_nii.exists() and brain_t2_nii.exists()
             have_diff = True if diff_nii is None else diff_nii.exists()
-            if have_core and have_head and have_diff:
+            if have_core and have_brain and have_diff:
                 print(f"[SKIP] All requested outputs already exist for runno {runno}")
                 n_skipped += 1
                 continue
@@ -690,10 +849,10 @@ def main():
             out_nii=out_nii,
             in_method=in_method,
             out_method=out_method,
-            premask_nii=premask_nii,
+            support_nii=support_nii,
             bias_nii=bias_nii,
-            headmask_nii=headmask_nii,
-            head_t2_nii=head_t2_nii,
+            brainmask_nii=brainmask_nii,
+            brain_t2_nii=brain_t2_nii,
             diff_nii=diff_nii,
             tmp_otsu_pre_nii=tmp_otsu_pre_nii,
             helper_py=helper_py,
@@ -713,21 +872,38 @@ def main():
             pre_dilate_radius_pre_glc=args.pre_dilate_radius_pre_glc,
             pre_fill_holes_radius=args.pre_fill_holes_radius,
             pre_dilate_radius_final=args.pre_dilate_radius_final,
-            head_smooth_sigma=args.head_smooth_sigma,
-            head_dark_bg_threshold=args.head_dark_bg_threshold,
-            head_min_bg_volume_mm3=args.head_min_bg_volume_mm3,
-            head_bg_close_iters=args.head_bg_close_iters,
-            head_shell_threshold=args.head_shell_threshold,
-            head_min_shell_volume_mm3=args.head_min_shell_volume_mm3,
-            head_shell_close_iters=args.head_shell_close_iters,
-            head_shell_protect_mm=args.head_shell_protect_mm,
-            head_close_iters=args.head_close_iters,
-            head_open_iters=args.head_open_iters,
-            head_dilate_iters=args.head_dilate_iters,
-            head_fill_holes=args.head_fill_holes,
+            pre_support_extra_dilate_radius=args.pre_support_extra_dilate_radius,
+            brain_smooth_sigma=args.brain_smooth_sigma,
+            brain_grad_sigma=args.brain_grad_sigma,
+            brain_final_support_dilate_mm=args.brain_final_support_dilate_mm,
+            brain_shell_threshold=args.brain_shell_threshold,
+            brain_min_shell_volume_mm3=args.brain_min_shell_volume_mm3,
+            brain_shell_close_iters=args.brain_shell_close_iters,
+            brain_shell_neighborhood_mm=args.brain_shell_neighborhood_mm,
+            brain_dark_moat_threshold=args.brain_dark_moat_threshold,
+            brain_min_moat_volume_mm3=args.brain_min_moat_volume_mm3,
+            brain_moat_close_iters=args.brain_moat_close_iters,
+            brain_seed_min_distance_mm=args.brain_seed_min_distance_mm,
+            brain_seed_intensity_min=args.brain_seed_intensity_min,
+            brain_grow_intensity_min=args.brain_grow_intensity_min,
+            brain_grow_gradient_max=args.brain_grow_gradient_max,
+            brain_grow_iters=args.brain_grow_iters,
+            brain_boundary_band_mm=args.brain_boundary_band_mm,
+            brain_boundary_add_intensity_min=args.brain_boundary_add_intensity_min,
+            do_brainstem_rescue=args.do_brainstem_rescue,
+            brainstem_seed_slice_frac=args.brainstem_seed_slice_frac,
+            brainstem_corridor_radius_mm=args.brainstem_corridor_radius_mm,
+            brainstem_max_inferior_mm=args.brainstem_max_inferior_mm,
+            brainstem_intensity_min=args.brainstem_intensity_min,
+            brainstem_gradient_max=args.brainstem_gradient_max,
+            brainstem_iters=args.brainstem_iters,
+            brain_close_iters=args.brain_close_iters,
+            brain_open_iters=args.brain_open_iters,
+            brain_dilate_iters=args.brain_dilate_iters,
+            brain_fill_holes=args.brain_fill_holes,
             tight_mask=args.tight_mask,
             tight_mask_erode_iters=args.tight_mask_erode_iters,
-            save_head_debug=args.save_head_debug,
+            save_brain_debug=args.save_brain_debug,
             threads=args.threads,
             job_name=job_name,
             log_out=log_out,
