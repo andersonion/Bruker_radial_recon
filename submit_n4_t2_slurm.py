@@ -111,15 +111,16 @@ def build_job_script(
     brain_shell_close_iters: int,
     brain_shell_open_iters: int,
     brain_shell_erode_iters: int,
-    brain_shell_volume_min_mm3: float,
-    brain_shell_volume_max_mm3: float,
+    brain_shell_min_volume_mm3: float,
+    brain_cavity_volume_min_mm3: float,
+    brain_cavity_volume_max_mm3: float,
     brain_extent_x_min_mm: float,
     brain_extent_x_max_mm: float,
     brain_extent_y_min_mm: float,
     brain_extent_y_max_mm: float,
     brain_extent_z_min_mm: float,
     brain_extent_z_max_mm: float,
-    brain_shell_bbox_fill_frac_max: float,
+    brain_cavity_bbox_fill_frac_min: float,
     brain_moat_thresholds: str,
     brain_shell_inner_band_mm: float,
     brain_moat_min_volume_mm3: float,
@@ -333,15 +334,16 @@ def build_job_script(
     lines.append(f"        --shell_close_iters {brain_shell_close_iters}")
     lines.append(f"        --shell_open_iters {brain_shell_open_iters}")
     lines.append(f"        --shell_erode_iters {brain_shell_erode_iters}")
-    lines.append(f"        --shell_volume_min_mm3 {brain_shell_volume_min_mm3}")
-    lines.append(f"        --shell_volume_max_mm3 {brain_shell_volume_max_mm3}")
+    lines.append(f"        --shell_min_volume_mm3 {brain_shell_min_volume_mm3}")
+    lines.append(f"        --cavity_volume_min_mm3 {brain_cavity_volume_min_mm3}")
+    lines.append(f"        --cavity_volume_max_mm3 {brain_cavity_volume_max_mm3}")
     lines.append(f"        --extent_x_min_mm {brain_extent_x_min_mm}")
     lines.append(f"        --extent_x_max_mm {brain_extent_x_max_mm}")
     lines.append(f"        --extent_y_min_mm {brain_extent_y_min_mm}")
     lines.append(f"        --extent_y_max_mm {brain_extent_y_max_mm}")
     lines.append(f"        --extent_z_min_mm {brain_extent_z_min_mm}")
     lines.append(f"        --extent_z_max_mm {brain_extent_z_max_mm}")
-    lines.append(f"        --shell_bbox_fill_frac_max {brain_shell_bbox_fill_frac_max}")
+    lines.append(f"        --cavity_bbox_fill_frac_min {brain_cavity_bbox_fill_frac_min}")
     lines.append(f"        --moat_thresholds {shell_quote(brain_moat_thresholds)}")
     lines.append(f"        --shell_inner_band_mm {brain_shell_inner_band_mm}")
     lines.append(f"        --moat_min_volume_mm3 {brain_moat_min_volume_mm3}")
@@ -436,17 +438,17 @@ def main():
     p.add_argument("--brain_shell_close_iters", type=int, default=1)
     p.add_argument("--brain_shell_open_iters", type=int, default=1)
     p.add_argument("--brain_shell_erode_iters", type=int, default=1)
+    p.add_argument("--brain_shell_min_volume_mm3", type=float, default=2.0)
 
-    p.add_argument("--brain_shell_volume_min_mm3", type=float, default=5.0)
-    p.add_argument("--brain_shell_volume_max_mm3", type=float, default=350.0)
-
+    p.add_argument("--brain_cavity_volume_min_mm3", type=float, default=250.0)
+    p.add_argument("--brain_cavity_volume_max_mm3", type=float, default=800.0)
     p.add_argument("--brain_extent_x_min_mm", type=float, default=7.0)
     p.add_argument("--brain_extent_x_max_mm", type=float, default=22.0)
     p.add_argument("--brain_extent_y_min_mm", type=float, default=7.0)
     p.add_argument("--brain_extent_y_max_mm", type=float, default=22.0)
     p.add_argument("--brain_extent_z_min_mm", type=float, default=4.0)
     p.add_argument("--brain_extent_z_max_mm", type=float, default=30.0)
-    p.add_argument("--brain_shell_bbox_fill_frac_max", type=float, default=0.22)
+    p.add_argument("--brain_cavity_bbox_fill_frac_min", type=float, default=0.35)
 
     p.add_argument("--brain_moat_thresholds", default="0.04,0.06,0.08,0.10,0.12,0.14")
     p.add_argument("--brain_shell_inner_band_mm", type=float, default=1.25)
@@ -599,15 +601,16 @@ def main():
             brain_shell_close_iters=args.brain_shell_close_iters,
             brain_shell_open_iters=args.brain_shell_open_iters,
             brain_shell_erode_iters=args.brain_shell_erode_iters,
-            brain_shell_volume_min_mm3=args.brain_shell_volume_min_mm3,
-            brain_shell_volume_max_mm3=args.brain_shell_volume_max_mm3,
+            brain_shell_min_volume_mm3=args.brain_shell_min_volume_mm3,
+            brain_cavity_volume_min_mm3=args.brain_cavity_volume_min_mm3,
+            brain_cavity_volume_max_mm3=args.brain_cavity_volume_max_mm3,
             brain_extent_x_min_mm=args.brain_extent_x_min_mm,
             brain_extent_x_max_mm=args.brain_extent_x_max_mm,
             brain_extent_y_min_mm=args.brain_extent_y_min_mm,
             brain_extent_y_max_mm=args.brain_extent_y_max_mm,
             brain_extent_z_min_mm=args.brain_extent_z_min_mm,
             brain_extent_z_max_mm=args.brain_extent_z_max_mm,
-            brain_shell_bbox_fill_frac_max=args.brain_shell_bbox_fill_frac_max,
+            brain_cavity_bbox_fill_frac_min=args.brain_cavity_bbox_fill_frac_min,
             brain_moat_thresholds=args.brain_moat_thresholds,
             brain_shell_inner_band_mm=args.brain_shell_inner_band_mm,
             brain_moat_min_volume_mm3=args.brain_moat_min_volume_mm3,

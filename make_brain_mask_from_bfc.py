@@ -83,7 +83,11 @@ def parse_float_list(text: str):
     return [float(x) for x in text.split(",") if x.strip()]
 
 
-def mm_to_vox(mm: float, spacing_mm: float) -> float:
+def mm3_to_vox(mm3: float, voxel_volume_mm3: float) -> int:
+    return max(1, int(round(mm3 / max(voxel_volume_mm3, 1e-8))))
+
+
+def mm_to_vox_axis(mm: float, spacing_mm: float) -> float:
     return mm / max(spacing_mm, 1e-8)
 
 
@@ -119,19 +123,65 @@ def flood_outside(open_space: np.ndarray, structure) -> np.ndarray:
     return binary_propagation(seeds, structure=structure, mask=open_space)
 
 
-def build_shell_candidate(
+def cavity_is_plausible(
+    cavity: np.ndarray,
+    voxel_volume_mm3: float,
+    zooms_xyz,
+    cavity_volume_min_mm3: float,
+    cavity_volume_max_mm3: float,
+    extent_x_min_mm: float,
+    extent_x_max_mm: float,
+    extent_y_min_mm: float,
+    extent_y_max_mm: float,
+    extent_z_min_mm: float,
+    extent_z_max_mm: float,
+    cavity_bbox_fill_frac_min: float,
+):
+    if not np.any(cavity):
+        return False, {"reason": "empty_cavity"}
+
+    vol_mm3 = mask_volume_mm3(cavity, voxel_volume_mm3)
+    ext_mm = bbox_extents_mm(cavity, zooms_xyz)
+    fill_frac = bbox_fill_fraction(cavity)
+
+    if ext_mm is None:
+        return False, {"reason": "no_bbox"}
+
+    ok = (
+        cavity_volume_min_mm3 <= vol_mm3 <= cavity_volume_max_mm3
+        and extent_x_min_mm <= ext_mm[0] <= extent_x_max_mm
+        and extent_y_min_mm <= ext_mm[1] <= extent_y_max_mm
+        and extent_z_min_mm <= ext_mm[2] <= extent_z_max_mm
+        and fill_frac >= cavity_bbox_fill_frac_min
+    )
+
+    info = {
+        "cavity_volume_mm3": vol_mm3,
+        "cavity_extent_x_mm": float(ext_mm[0]),
+        "cavity_extent_y_mm": float(ext_mm[1]),
+        "cavity_extent_z_mm": float(ext_mm[2]),
+        "cavity_bbox_fill_fraction": fill_frac,
+    }
+    return ok, info
+
+
+def build_shell_and_cavity_candidate(
     grad_norm: np.ndarray,
     support: np.ndarray,
     dist_to_support_edge_vox: np.ndarray,
     structure,
     grad_thr: float,
-    outer_rim_vox: float,
+    outer_rim_vox_x: float,
+    outer_rim_vox_y: float,
+    outer_rim_vox_z: float,
     shell_min_vox: int,
     shell_close_iters: int,
     shell_open_iters: int,
     shell_erode_iters: int,
 ):
-    outer_rim = support & (dist_to_support_edge_vox <= outer_rim_vox)
+    outer_rim = support & (
+        (dist_to_support_edge_vox <= max(outer_rim_vox_x, outer_rim_vox_y, outer_rim_vox_z))
+    )
 
     shell_raw = (grad_norm >= grad_thr) & outer_rim
     shell = remove_small_components(shell_raw, shell_min_vox, structure=structure)
@@ -146,61 +196,33 @@ def build_shell_candidate(
     shell = remove_small_components(shell, shell_min_vox, structure=structure)
     shell = largest_component(shell, structure=structure)
 
-    return outer_rim, shell_raw, shell
+    open_space = support & (~shell)
+    outside = flood_outside(open_space, structure=structure)
+    enclosed = open_space & (~outside)
+    enclosed = largest_component(enclosed, structure=structure)
 
-
-def shell_is_plausible(
-    shell: np.ndarray,
-    voxel_volume_mm3: float,
-    zooms_xyz,
-    shell_volume_min_mm3: float,
-    shell_volume_max_mm3: float,
-    extent_x_min_mm: float,
-    extent_x_max_mm: float,
-    extent_y_min_mm: float,
-    extent_y_max_mm: float,
-    extent_z_min_mm: float,
-    extent_z_max_mm: float,
-    shell_bbox_fill_frac_max: float,
-):
-    if not np.any(shell):
-        return False, {"reason": "empty_shell"}
-
-    shell_vol = mask_volume_mm3(shell, voxel_volume_mm3)
-    ext_mm = bbox_extents_mm(shell, zooms_xyz)
-    fill_frac = bbox_fill_fraction(shell)
-
-    if ext_mm is None:
-        return False, {"reason": "no_bbox"}
-
-    ok = (
-        shell_volume_min_mm3 <= shell_vol <= shell_volume_max_mm3
-        and extent_x_min_mm <= ext_mm[0] <= extent_x_max_mm
-        and extent_y_min_mm <= ext_mm[1] <= extent_y_max_mm
-        and extent_z_min_mm <= ext_mm[2] <= extent_z_max_mm
-        and fill_frac <= shell_bbox_fill_frac_max
-    )
-
-    info = {
-        "shell_volume_mm3": shell_vol,
-        "shell_extent_x_mm": float(ext_mm[0]),
-        "shell_extent_y_mm": float(ext_mm[1]),
-        "shell_extent_z_mm": float(ext_mm[2]),
-        "shell_bbox_fill_fraction": fill_frac,
+    return {
+        "outer_rim": outer_rim,
+        "shell_raw": shell_raw,
+        "shell": shell,
+        "open_space_pre_moat": open_space,
+        "outside_pre_moat": outside,
+        "enclosed_pre_moat": enclosed,
     }
-    return ok, info
 
 
-def build_brain_candidate(
+def build_final_brain_candidate(
     inten_norm: np.ndarray,
     grad_norm: np.ndarray,
     support: np.ndarray,
     shell: np.ndarray,
-    dist_to_shell_vox: np.ndarray,
+    cavity: np.ndarray,
+    zooms_xyz,
+    voxel_volume_mm3: float,
     structure,
     moat_thr: float,
-    shell_inner_band_vox: float,
-    moat_min_vox: int,
+    shell_inner_band_mm: float,
+    moat_min_volume_mm3: float,
     moat_close_iters: int,
     barrier_close_iters: int,
     brain_close_iters: int,
@@ -208,14 +230,21 @@ def build_brain_candidate(
     brain_dilate_iters: int,
     shell_gate_grad_max: float,
 ):
+    dist_to_shell_vox = distance_transform_edt(~shell)
+
+    mean_spacing = float(np.mean(zooms_xyz))
+    shell_inner_band_vox = mm_to_vox_axis(shell_inner_band_mm, mean_spacing)
+    moat_min_vox = mm3_to_vox(moat_min_volume_mm3, voxel_volume_mm3)
+
     shell_inner_band = support & (dist_to_shell_vox <= shell_inner_band_vox)
 
     moat_raw = shell_inner_band & (inten_norm <= moat_thr)
     moat = remove_small_components(moat_raw, moat_min_vox, structure=structure)
     if np.any(moat) and moat_close_iters > 0:
         moat = binary_closing(moat, structure=structure, iterations=moat_close_iters)
-    moat = largest_component(moat, structure=structure)
 
+    # Important: do NOT force moat to largest component globally.
+    # The moat can be a broken ring or multiple pieces.
     barrier = shell | moat
     if np.any(barrier) and barrier_close_iters > 0:
         barrier = binary_closing(barrier, structure=structure, iterations=barrier_close_iters)
@@ -263,7 +292,7 @@ def build_brain_candidate(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Outer-rim-constrained shell-first mouse brain masking from BFC T2."
+        description="Outer-rim shell -> inside cavity plausibility -> moat refinement -> final brain fill."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -280,31 +309,30 @@ def main():
     ap.add_argument("--shell_close_iters", type=int, default=1)
     ap.add_argument("--shell_open_iters", type=int, default=1)
     ap.add_argument("--shell_erode_iters", type=int, default=1)
+    ap.add_argument("--shell_min_volume_mm3", type=float, default=2.0)
 
-    # shell plausibility
-    ap.add_argument("--shell_volume_min_mm3", type=float, default=5.0)
-    ap.add_argument("--shell_volume_max_mm3", type=float, default=350.0)
+    # cavity plausibility = THIS is now the main early gate
+    ap.add_argument("--cavity_volume_min_mm3", type=float, default=250.0)
+    ap.add_argument("--cavity_volume_max_mm3", type=float, default=800.0)
     ap.add_argument("--extent_x_min_mm", type=float, default=7.0)
     ap.add_argument("--extent_x_max_mm", type=float, default=22.0)
     ap.add_argument("--extent_y_min_mm", type=float, default=7.0)
     ap.add_argument("--extent_y_max_mm", type=float, default=22.0)
     ap.add_argument("--extent_z_min_mm", type=float, default=4.0)
     ap.add_argument("--extent_z_max_mm", type=float, default=30.0)
-    ap.add_argument("--shell_bbox_fill_frac_max", type=float, default=0.22)
+    ap.add_argument("--cavity_bbox_fill_frac_min", type=float, default=0.35)
 
-    # moat
+    # moat / refinement
     ap.add_argument("--moat_thresholds", default="0.04,0.06,0.08,0.10,0.12,0.14")
     ap.add_argument("--shell_inner_band_mm", type=float, default=1.25)
     ap.add_argument("--moat_min_volume_mm3", type=float, default=1.0)
     ap.add_argument("--moat_close_iters", type=int, default=1)
     ap.add_argument("--barrier_close_iters", type=int, default=1)
 
-    # final brain cleanup
+    # final cleanup + hard brain volume gate
     ap.add_argument("--brain_close_iters", type=int, default=2)
     ap.add_argument("--brain_open_iters", type=int, default=0)
     ap.add_argument("--brain_dilate_iters", type=int, default=0)
-
-    # plausibility
     ap.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
     ap.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
     ap.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
@@ -330,7 +358,6 @@ def main():
 
     zooms = bfc_img.header.get_zooms()[:3]
     voxel_volume_mm3 = float(zooms[0] * zooms[1] * zooms[2])
-    mean_spacing = float(np.mean(zooms))
 
     structure = generate_binary_structure(3, 2)
 
@@ -342,10 +369,11 @@ def main():
 
     dist_to_support_edge_vox = distance_transform_edt(support)
 
-    outer_rim_vox = mm_to_vox(args.outer_rim_mm, mean_spacing)
-    shell_inner_band_vox = mm_to_vox(args.shell_inner_band_mm, mean_spacing)
-    shell_min_vox = max(1, int(round(args.shell_volume_min_mm3 / voxel_volume_mm3)))
-    moat_min_vox = max(1, int(round(args.moat_min_volume_mm3 / voxel_volume_mm3)))
+    shell_min_vox = mm3_to_vox(args.shell_min_volume_mm3, voxel_volume_mm3)
+
+    outer_rim_vox_x = mm_to_vox_axis(args.outer_rim_mm, zooms[0])
+    outer_rim_vox_y = mm_to_vox_axis(args.outer_rim_mm, zooms[1])
+    outer_rim_vox_z = mm_to_vox_axis(args.outer_rim_mm, zooms[2])
 
     grad_thresholds = parse_float_list(args.grad_thresholds)
     moat_thresholds = parse_float_list(args.moat_thresholds)
@@ -354,56 +382,60 @@ def main():
     candidates = []
 
     for grad_thr in grad_thresholds:
-        outer_rim, shell_raw, shell = build_shell_candidate(
+        built = build_shell_and_cavity_candidate(
             grad_norm=grad_norm,
             support=support,
             dist_to_support_edge_vox=dist_to_support_edge_vox,
             structure=structure,
             grad_thr=grad_thr,
-            outer_rim_vox=outer_rim_vox,
+            outer_rim_vox_x=outer_rim_vox_x,
+            outer_rim_vox_y=outer_rim_vox_y,
+            outer_rim_vox_z=outer_rim_vox_z,
             shell_min_vox=shell_min_vox,
             shell_close_iters=args.shell_close_iters,
             shell_open_iters=args.shell_open_iters,
             shell_erode_iters=args.shell_erode_iters,
         )
 
-        ok_shell, shell_info = shell_is_plausible(
-            shell=shell,
+        cavity = built["enclosed_pre_moat"]
+
+        ok_cavity, cavity_info = cavity_is_plausible(
+            cavity=cavity,
             voxel_volume_mm3=voxel_volume_mm3,
             zooms_xyz=zooms,
-            shell_volume_min_mm3=args.shell_volume_min_mm3,
-            shell_volume_max_mm3=args.shell_volume_max_mm3,
+            cavity_volume_min_mm3=args.cavity_volume_min_mm3,
+            cavity_volume_max_mm3=args.cavity_volume_max_mm3,
             extent_x_min_mm=args.extent_x_min_mm,
             extent_x_max_mm=args.extent_x_max_mm,
             extent_y_min_mm=args.extent_y_min_mm,
             extent_y_max_mm=args.extent_y_max_mm,
             extent_z_min_mm=args.extent_z_min_mm,
             extent_z_max_mm=args.extent_z_max_mm,
-            shell_bbox_fill_frac_max=args.shell_bbox_fill_frac_max,
+            cavity_bbox_fill_frac_min=args.cavity_bbox_fill_frac_min,
         )
 
         shell_candidates.append({
             "grad_threshold": grad_thr,
-            "ok_shell": ok_shell,
-            **shell_info,
+            "ok_cavity": ok_cavity,
+            **cavity_info,
         })
 
-        if not ok_shell:
+        if not ok_cavity:
             continue
 
-        dist_to_shell_vox = distance_transform_edt(~shell)
-
         for moat_thr in moat_thresholds:
-            built = build_brain_candidate(
+            final = build_final_brain_candidate(
                 inten_norm=inten_norm,
                 grad_norm=grad_norm,
                 support=support,
-                shell=shell,
-                dist_to_shell_vox=dist_to_shell_vox,
+                shell=built["shell"],
+                cavity=cavity,
+                zooms_xyz=zooms,
+                voxel_volume_mm3=voxel_volume_mm3,
                 structure=structure,
                 moat_thr=moat_thr,
-                shell_inner_band_vox=shell_inner_band_vox,
-                moat_min_vox=moat_min_vox,
+                shell_inner_band_mm=args.shell_inner_band_mm,
+                moat_min_volume_mm3=args.moat_min_volume_mm3,
                 moat_close_iters=args.moat_close_iters,
                 barrier_close_iters=args.barrier_close_iters,
                 brain_close_iters=args.brain_close_iters,
@@ -411,23 +443,25 @@ def main():
                 brain_dilate_iters=args.brain_dilate_iters,
                 shell_gate_grad_max=args.shell_gate_grad_max,
             )
-            if built is None:
+            if final is None:
                 continue
 
-            brain = built["brain"]
+            brain = final["brain"]
             brain_vol = mask_volume_mm3(brain, voxel_volume_mm3)
 
             if not (args.brain_volume_hard_min_mm3 <= brain_vol <= args.brain_volume_hard_max_mm3):
                 continue
 
-            preferred_mid = 0.5 * (args.brain_volume_preferred_min_mm3 + args.brain_volume_preferred_max_mm3)
+            preferred_mid = 0.5 * (
+                args.brain_volume_preferred_min_mm3 + args.brain_volume_preferred_max_mm3
+            )
             volume_penalty = abs(brain_vol - preferred_mid)
 
             score = (
-                4.0 * built["shell_contact"]
-                - 8.0 * built["moat_overlap"]
+                4.0 * final["shell_contact"]
+                - 8.0 * final["moat_overlap"]
                 - 1.0 * volume_penalty
-                + 0.15 * built["shell_grad_good"]
+                + 0.15 * final["shell_grad_good"]
             )
 
             candidates.append({
@@ -435,11 +469,14 @@ def main():
                 "moat_threshold": moat_thr,
                 "brain_volume_mm3": brain_vol,
                 "score": float(score),
-                "shell_info": shell_info,
-                "outer_rim": outer_rim,
-                "shell_raw": shell_raw,
-                "shell": shell,
-                **built,
+                "cavity_info": cavity_info,
+                "outer_rim": built["outer_rim"],
+                "shell_raw": built["shell_raw"],
+                "shell": built["shell"],
+                "open_space_pre_moat": built["open_space_pre_moat"],
+                "outside_pre_moat": built["outside_pre_moat"],
+                "enclosed_pre_moat": built["enclosed_pre_moat"],
+                **final,
             })
 
     if not candidates:
@@ -447,12 +484,16 @@ def main():
             prefix = Path(args.debug_prefix)
             save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
             save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
-            save_like(prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"), dist_to_support_edge_vox.astype(np.float32), bfc_img)
+            save_like(
+                prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"),
+                dist_to_support_edge_vox.astype(np.float32),
+                bfc_img,
+            )
             with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
                 json.dump(
                     {
                         "status": "failed",
-                        "reason": "No plausible shell+moat+brain candidate satisfied hard constraints.",
+                        "reason": "No plausible cavity+moat+brain candidate satisfied hard constraints.",
                         "shell_candidates": shell_candidates,
                         "brain_volume_hard_min_mm3": args.brain_volume_hard_min_mm3,
                         "brain_volume_hard_max_mm3": args.brain_volume_hard_max_mm3,
@@ -462,7 +503,7 @@ def main():
                     f,
                     indent=2,
                 )
-        raise RuntimeError("No plausible shell+moat+brain candidate satisfied hard constraints.")
+        raise RuntimeError("No plausible cavity+moat+brain candidate satisfied hard constraints.")
 
     preferred = [
         c for c in candidates
@@ -487,10 +528,17 @@ def main():
         prefix = Path(args.debug_prefix)
         save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"), dist_to_support_edge_vox.astype(np.float32), bfc_img)
+        save_like(
+            prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"),
+            dist_to_support_edge_vox.astype(np.float32),
+            bfc_img,
+        )
         save_like(prefix.with_name(prefix.name + "_outer_rim.nii.gz"), chosen["outer_rim"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_shell_raw.nii.gz"), chosen["shell_raw"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_shell.nii.gz"), chosen["shell"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_open_space_pre_moat.nii.gz"), chosen["open_space_pre_moat"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_outside_pre_moat.nii.gz"), chosen["outside_pre_moat"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_enclosed_pre_moat.nii.gz"), chosen["enclosed_pre_moat"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_moat_raw.nii.gz"), chosen["moat_raw"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_moat.nii.gz"), chosen["moat"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_barrier.nii.gz"), chosen["barrier"].astype(np.uint8), bfc_img)
@@ -506,7 +554,7 @@ def main():
                     "selected_moat_threshold": chosen["moat_threshold"],
                     "selected_brain_volume_mm3": chosen["brain_volume_mm3"],
                     "selected_score": chosen["score"],
-                    "selected_shell_info": chosen["shell_info"],
+                    "selected_cavity_info": chosen["cavity_info"],
                     "shell_candidates": shell_candidates,
                     "all_candidates": [
                         {
@@ -516,7 +564,7 @@ def main():
                             "score": c["score"],
                             "shell_contact": c["shell_contact"],
                             "moat_overlap": c["moat_overlap"],
-                            "shell_info": c["shell_info"],
+                            "cavity_info": c["cavity_info"],
                         }
                         for c in candidates
                     ],
