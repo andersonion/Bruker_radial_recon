@@ -66,7 +66,6 @@ def submit_job(script_path: Path):
 
 
 def parse_job_id(sbatch_stdout: str) -> str:
-    # slurm may return forms like "236924" or "236924;cluster"
     m = re.match(r"^(\d+)", sbatch_stdout.strip())
     if not m:
         raise RuntimeError(f"Could not parse job id from sbatch output: {sbatch_stdout!r}")
@@ -107,16 +106,28 @@ def build_job_script(
     pre_dilate_radius_final: int,
     brain_smooth_sigma: float,
     brain_grad_sigma: float,
-    brain_seed_min_distance: float,
-    brain_seed_score_pct: float,
-    brain_seed_erode_iters: int,
-    brain_center_weight: float,
-    brain_grad_penalty: float,
-    brain_candidate_intensity_min: float,
-    brain_candidate_gradient_max: float,
-    brain_max_grow_iters: int,
-    brain_close_iters: int,
-    brain_dilate_iters: int,
+    brain_grad_thresholds: str,
+    brain_shell_close_iters: int,
+    brain_shell_dilate_iters: int,
+    brain_shell_volume_min_mm3: float,
+    brain_shell_volume_max_mm3: float,
+    brain_extent_x_min_mm: float,
+    brain_extent_x_max_mm: float,
+    brain_extent_y_min_mm: float,
+    brain_extent_y_max_mm: float,
+    brain_extent_z_min_mm: float,
+    brain_extent_z_max_mm: float,
+    brain_moat_thresholds: str,
+    brain_shell_inner_band_mm: float,
+    brain_shell_fill_close_iters: int,
+    brain_shell_fill_open_iters: int,
+    brain_final_dilate_iters: int,
+    brain_final_erode_iters: int,
+    brain_volume_hard_min_mm3: float,
+    brain_volume_hard_max_mm3: float,
+    brain_volume_preferred_min_mm3: float,
+    brain_volume_preferred_max_mm3: float,
+    brain_shell_gate_grad_max: float,
     tight_mask: bool,
     tight_mask_erode_iters: int,
     save_brain_debug: bool,
@@ -324,16 +335,28 @@ if [[ "$need_brainmask" == "1" ]]; then
         --out_masked_bfc "$brain_t2_nii"
         --smooth_sigma """ + str(brain_smooth_sigma) + r"""
         --grad_sigma """ + str(brain_grad_sigma) + r"""
-        --seed_min_distance """ + str(brain_seed_min_distance) + r"""
-        --seed_score_pct """ + str(brain_seed_score_pct) + r"""
-        --seed_erode_iters """ + str(brain_seed_erode_iters) + r"""
-        --center_weight """ + str(brain_center_weight) + r"""
-        --grad_penalty """ + str(brain_grad_penalty) + r"""
-        --candidate_intensity_min """ + str(brain_candidate_intensity_min) + r"""
-        --candidate_gradient_max """ + str(brain_candidate_gradient_max) + r"""
-        --max_grow_iters """ + str(brain_max_grow_iters) + r"""
-        --close_iters """ + str(brain_close_iters) + r"""
-        --dilate_iters """ + str(brain_dilate_iters) + r"""
+        --grad_thresholds """ + shell_quote(brain_grad_thresholds) + r"""
+        --shell_close_iters """ + str(brain_shell_close_iters) + r"""
+        --shell_dilate_iters """ + str(brain_shell_dilate_iters) + r"""
+        --shell_volume_min_mm3 """ + str(brain_shell_volume_min_mm3) + r"""
+        --shell_volume_max_mm3 """ + str(brain_shell_volume_max_mm3) + r"""
+        --extent_x_min_mm """ + str(brain_extent_x_min_mm) + r"""
+        --extent_x_max_mm """ + str(brain_extent_x_max_mm) + r"""
+        --extent_y_min_mm """ + str(brain_extent_y_min_mm) + r"""
+        --extent_y_max_mm """ + str(brain_extent_y_max_mm) + r"""
+        --extent_z_min_mm """ + str(brain_extent_z_min_mm) + r"""
+        --extent_z_max_mm """ + str(brain_extent_z_max_mm) + r"""
+        --moat_thresholds """ + shell_quote(brain_moat_thresholds) + r"""
+        --shell_inner_band_mm """ + str(brain_shell_inner_band_mm) + r"""
+        --shell_fill_close_iters """ + str(brain_shell_fill_close_iters) + r"""
+        --shell_fill_open_iters """ + str(brain_shell_fill_open_iters) + r"""
+        --final_dilate_iters """ + str(brain_final_dilate_iters) + r"""
+        --final_erode_iters """ + str(brain_final_erode_iters) + r"""
+        --brain_volume_hard_min_mm3 """ + str(brain_volume_hard_min_mm3) + r"""
+        --brain_volume_hard_max_mm3 """ + str(brain_volume_hard_max_mm3) + r"""
+        --brain_volume_preferred_min_mm3 """ + str(brain_volume_preferred_min_mm3) + r"""
+        --brain_volume_preferred_max_mm3 """ + str(brain_volume_preferred_max_mm3) + r"""
+        --shell_gate_grad_max """ + str(brain_shell_gate_grad_max) + r"""
         --tight_erode_iters """ + str(tight_mask_erode_iters) + r"""
     )
 
@@ -407,19 +430,38 @@ def main():
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
-    # These now match your rolled-back helper exactly
+    # New shell-first helper args
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
-    p.add_argument("--brain_seed_min_distance", type=float, default=4.0)
-    p.add_argument("--brain_seed_score_pct", type=float, default=92.0)
-    p.add_argument("--brain_seed_erode_iters", type=int, default=1)
-    p.add_argument("--brain_center_weight", type=float, default=1.5)
-    p.add_argument("--brain_grad_penalty", type=float, default=2.0)
-    p.add_argument("--brain_candidate_intensity_min", type=float, default=0.08)
-    p.add_argument("--brain_candidate_gradient_max", type=float, default=0.45)
-    p.add_argument("--brain_max_grow_iters", type=int, default=200)
-    p.add_argument("--brain_close_iters", type=int, default=2)
-    p.add_argument("--brain_dilate_iters", type=int, default=1)
+
+    p.add_argument("--brain_grad_thresholds", default="0.08,0.10,0.12,0.14,0.16")
+    p.add_argument("--brain_shell_close_iters", type=int, default=1)
+    p.add_argument("--brain_shell_dilate_iters", type=int, default=0)
+
+    p.add_argument("--brain_shell_volume_min_mm3", type=float, default=15.0)
+    p.add_argument("--brain_shell_volume_max_mm3", type=float, default=220.0)
+
+    p.add_argument("--brain_extent_x_min_mm", type=float, default=7.0)
+    p.add_argument("--brain_extent_x_max_mm", type=float, default=22.0)
+    p.add_argument("--brain_extent_y_min_mm", type=float, default=7.0)
+    p.add_argument("--brain_extent_y_max_mm", type=float, default=22.0)
+    p.add_argument("--brain_extent_z_min_mm", type=float, default=7.0)
+    p.add_argument("--brain_extent_z_max_mm", type=float, default=30.0)
+
+    p.add_argument("--brain_moat_thresholds", default="0.06,0.08,0.10,0.12,0.14,0.16")
+
+    p.add_argument("--brain_shell_inner_band_mm", type=float, default=1.5)
+    p.add_argument("--brain_shell_fill_close_iters", type=int, default=2)
+    p.add_argument("--brain_shell_fill_open_iters", type=int, default=0)
+    p.add_argument("--brain_final_dilate_iters", type=int, default=0)
+    p.add_argument("--brain_final_erode_iters", type=int, default=0)
+
+    p.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
+    p.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
+    p.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
+    p.add_argument("--brain_volume_preferred_max_mm3", type=float, default=550.0)
+
+    p.add_argument("--brain_shell_gate_grad_max", type=float, default=0.35)
 
     p.add_argument("--tight_mask", action="store_true")
     p.add_argument("--tight_mask_erode_iters", type=int, default=1)
@@ -550,16 +592,28 @@ def main():
             pre_dilate_radius_final=args.pre_dilate_radius_final,
             brain_smooth_sigma=args.brain_smooth_sigma,
             brain_grad_sigma=args.brain_grad_sigma,
-            brain_seed_min_distance=args.brain_seed_min_distance,
-            brain_seed_score_pct=args.brain_seed_score_pct,
-            brain_seed_erode_iters=args.brain_seed_erode_iters,
-            brain_center_weight=args.brain_center_weight,
-            brain_grad_penalty=args.brain_grad_penalty,
-            brain_candidate_intensity_min=args.brain_candidate_intensity_min,
-            brain_candidate_gradient_max=args.brain_candidate_gradient_max,
-            brain_max_grow_iters=args.brain_max_grow_iters,
-            brain_close_iters=args.brain_close_iters,
-            brain_dilate_iters=args.brain_dilate_iters,
+            brain_grad_thresholds=args.brain_grad_thresholds,
+            brain_shell_close_iters=args.brain_shell_close_iters,
+            brain_shell_dilate_iters=args.brain_shell_dilate_iters,
+            brain_shell_volume_min_mm3=args.brain_shell_volume_min_mm3,
+            brain_shell_volume_max_mm3=args.brain_shell_volume_max_mm3,
+            brain_extent_x_min_mm=args.brain_extent_x_min_mm,
+            brain_extent_x_max_mm=args.brain_extent_x_max_mm,
+            brain_extent_y_min_mm=args.brain_extent_y_min_mm,
+            brain_extent_y_max_mm=args.brain_extent_y_max_mm,
+            brain_extent_z_min_mm=args.brain_extent_z_min_mm,
+            brain_extent_z_max_mm=args.brain_extent_z_max_mm,
+            brain_moat_thresholds=args.brain_moat_thresholds,
+            brain_shell_inner_band_mm=args.brain_shell_inner_band_mm,
+            brain_shell_fill_close_iters=args.brain_shell_fill_close_iters,
+            brain_shell_fill_open_iters=args.brain_shell_fill_open_iters,
+            brain_final_dilate_iters=args.brain_final_dilate_iters,
+            brain_final_erode_iters=args.brain_final_erode_iters,
+            brain_volume_hard_min_mm3=args.brain_volume_hard_min_mm3,
+            brain_volume_hard_max_mm3=args.brain_volume_hard_max_mm3,
+            brain_volume_preferred_min_mm3=args.brain_volume_preferred_min_mm3,
+            brain_volume_preferred_max_mm3=args.brain_volume_preferred_max_mm3,
+            brain_shell_gate_grad_max=args.brain_shell_gate_grad_max,
             tight_mask=args.tight_mask,
             tight_mask_erode_iters=args.tight_mask_erode_iters,
             save_brain_debug=args.save_brain_debug,
