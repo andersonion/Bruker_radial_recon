@@ -12,7 +12,6 @@ from scipy.ndimage import (
     binary_erosion,
     binary_fill_holes,
     binary_opening,
-    binary_propagation,
     distance_transform_edt,
     gaussian_filter,
     gaussian_gradient_magnitude,
@@ -68,17 +67,6 @@ def save_like(path: Path, data: np.ndarray, ref_img: nib.Nifti1Image):
     nib.save(img, str(path))
 
 
-def boundary_seed(mask: np.ndarray) -> np.ndarray:
-    seed = np.zeros_like(mask, dtype=bool)
-    seed[0, :, :] |= mask[0, :, :]
-    seed[-1, :, :] |= mask[-1, :, :]
-    seed[:, 0, :] |= mask[:, 0, :]
-    seed[:, -1, :] |= mask[:, -1, :]
-    seed[:, :, 0] |= mask[:, :, 0]
-    seed[:, :, -1] |= mask[:, :, -1]
-    return seed
-
-
 def parse_float_list(text: str):
     return [float(x) for x in text.split(",") if x.strip()]
 
@@ -87,7 +75,7 @@ def mm3_to_vox(mm3: float, voxel_volume_mm3: float) -> int:
     return max(1, int(round(mm3 / max(voxel_volume_mm3, 1e-8))))
 
 
-def mm_to_vox_axis(mm: float, spacing_mm: float) -> float:
+def mm_to_vox(mm: float, spacing_mm: float) -> float:
     return mm / max(spacing_mm, 1e-8)
 
 
@@ -116,11 +104,6 @@ def bbox_fill_fraction(mask: np.ndarray) -> float:
     if bbox_vox <= 0:
         return 0.0
     return float(np.count_nonzero(mask) / bbox_vox)
-
-
-def flood_outside(open_space: np.ndarray, structure) -> np.ndarray:
-    seeds = boundary_seed(open_space)
-    return binary_propagation(seeds, structure=structure, mask=open_space)
 
 
 def cavity_is_plausible(
@@ -165,53 +148,115 @@ def cavity_is_plausible(
     return ok, info
 
 
-def build_shell_and_cavity_candidate(
+def make_outer_rim_mask(support: np.ndarray, dist_to_support_edge_vox: np.ndarray, outer_rim_vox: float) -> np.ndarray:
+    return support & (dist_to_support_edge_vox <= outer_rim_vox)
+
+
+def build_shell_candidate(
     grad_norm: np.ndarray,
     support: np.ndarray,
-    dist_to_support_edge_vox: np.ndarray,
+    outer_rim: np.ndarray,
     structure,
     grad_thr: float,
-    outer_rim_vox_x: float,
-    outer_rim_vox_y: float,
-    outer_rim_vox_z: float,
     shell_min_vox: int,
     shell_close_iters: int,
+    shell_dilate_iters: int,
     shell_open_iters: int,
-    shell_erode_iters: int,
 ):
-    outer_rim = support & (
-        (dist_to_support_edge_vox <= max(outer_rim_vox_x, outer_rim_vox_y, outer_rim_vox_z))
-    )
-
     shell_raw = (grad_norm >= grad_thr) & outer_rim
     shell = remove_small_components(shell_raw, shell_min_vox, structure=structure)
 
     if np.any(shell) and shell_close_iters > 0:
         shell = binary_closing(shell, structure=structure, iterations=shell_close_iters)
+
+    if np.any(shell) and shell_dilate_iters > 0:
+        shell = binary_dilation(shell, structure=structure, iterations=shell_dilate_iters)
+
     if np.any(shell) and shell_open_iters > 0:
         shell = binary_opening(shell, structure=structure, iterations=shell_open_iters)
-    if np.any(shell) and shell_erode_iters > 0:
-        shell = binary_erosion(shell, structure=structure, iterations=shell_erode_iters)
 
     shell = remove_small_components(shell, shell_min_vox, structure=structure)
-    shell = largest_component(shell, structure=structure)
 
-    open_space = support & (~shell)
-    outside = flood_outside(open_space, structure=structure)
-    enclosed = open_space & (~outside)
-    enclosed = largest_component(enclosed, structure=structure)
+    # NOTE: intentionally NO largest_component(shell) here
+    return shell_raw, shell
+
+
+def choose_balloon_seed(
+    support: np.ndarray,
+    shell: np.ndarray,
+    structure,
+):
+    allowed = support & (~shell)
+    if not np.any(allowed):
+        return np.zeros_like(allowed, dtype=bool), np.zeros_like(allowed, dtype=np.float32)
+
+    dist = distance_transform_edt(allowed)
+    maxd = float(dist.max())
+    if maxd <= 0:
+        return np.zeros_like(allowed, dtype=bool), dist.astype(np.float32)
+
+    seed = allowed & (dist >= 0.90 * maxd)
+    seed = largest_component(seed, structure=structure)
+    return seed, dist.astype(np.float32)
+
+
+def balloon_grow(
+    seed: np.ndarray,
+    allowed: np.ndarray,
+    structure,
+    max_iters: int,
+):
+    grown = seed.copy()
+    for _ in range(max_iters):
+        nxt = binary_dilation(grown, structure=structure) & allowed
+        if np.array_equal(nxt, grown):
+            break
+        grown = nxt
+    return grown
+
+
+def build_cavity_from_shell_balloon(
+    support: np.ndarray,
+    shell: np.ndarray,
+    structure,
+    balloon_close_iters: int,
+    balloon_fill_holes: bool,
+    balloon_max_iters: int,
+):
+    seed, seed_dist = choose_balloon_seed(support, shell, structure)
+
+    if not np.any(seed):
+        return {
+            "seed": seed,
+            "seed_dist": seed_dist,
+            "allowed": support & (~shell),
+            "cavity_raw": np.zeros_like(support, dtype=bool),
+            "cavity": np.zeros_like(support, dtype=bool),
+        }
+
+    allowed = support & (~shell)
+    cavity_raw = balloon_grow(seed, allowed, structure, balloon_max_iters)
+    cavity = cavity_raw.copy()
+
+    if balloon_close_iters > 0:
+        cavity = binary_closing(cavity, structure=structure, iterations=balloon_close_iters)
+
+    if balloon_fill_holes:
+        cavity = binary_fill_holes(cavity)
+
+    cavity &= support
+    cavity = largest_component(cavity, structure=structure)
 
     return {
-        "outer_rim": outer_rim,
-        "shell_raw": shell_raw,
-        "shell": shell,
-        "open_space_pre_moat": open_space,
-        "outside_pre_moat": outside,
-        "enclosed_pre_moat": enclosed,
+        "seed": seed,
+        "seed_dist": seed_dist,
+        "allowed": allowed,
+        "cavity_raw": cavity_raw,
+        "cavity": cavity,
     }
 
 
-def build_final_brain_candidate(
+def refine_with_moat(
     inten_norm: np.ndarray,
     grad_norm: np.ndarray,
     support: np.ndarray,
@@ -230,34 +275,32 @@ def build_final_brain_candidate(
     brain_dilate_iters: int,
     shell_gate_grad_max: float,
 ):
-    dist_to_shell_vox = distance_transform_edt(~shell)
-
     mean_spacing = float(np.mean(zooms_xyz))
-    shell_inner_band_vox = mm_to_vox_axis(shell_inner_band_mm, mean_spacing)
+    shell_inner_band_vox = mm_to_vox(shell_inner_band_mm, mean_spacing)
     moat_min_vox = mm3_to_vox(moat_min_volume_mm3, voxel_volume_mm3)
 
+    dist_to_shell_vox = distance_transform_edt(~shell)
     shell_inner_band = support & (dist_to_shell_vox <= shell_inner_band_vox)
 
     moat_raw = shell_inner_band & (inten_norm <= moat_thr)
     moat = remove_small_components(moat_raw, moat_min_vox, structure=structure)
+
     if np.any(moat) and moat_close_iters > 0:
         moat = binary_closing(moat, structure=structure, iterations=moat_close_iters)
 
-    # Important: do NOT force moat to largest component globally.
-    # The moat can be a broken ring or multiple pieces.
     barrier = shell | moat
+
     if np.any(barrier) and barrier_close_iters > 0:
         barrier = binary_closing(barrier, structure=structure, iterations=barrier_close_iters)
 
-    open_space = support & (~barrier)
-    outside = flood_outside(open_space, structure=structure)
-    enclosed = open_space & (~outside)
-    enclosed = largest_component(enclosed, structure=structure)
+    allowed = support & (~barrier)
 
-    if not np.any(enclosed):
+    # Balloon refill again, but now with moat-aware barrier
+    seed, seed_dist = choose_balloon_seed(allowed, np.zeros_like(allowed, dtype=bool), structure)
+    if not np.any(seed):
         return None
 
-    brain = binary_fill_holes(enclosed)
+    brain = balloon_grow(seed, allowed, structure, max_iters=10000)
     brain = largest_component(brain, structure=structure)
 
     if brain_close_iters > 0:
@@ -277,13 +320,13 @@ def build_final_brain_candidate(
     shell_grad_good = int(np.count_nonzero(shell & (grad_norm <= shell_gate_grad_max)))
 
     return {
-        "brain": brain,
         "moat_raw": moat_raw,
         "moat": moat,
         "barrier": barrier,
-        "open_space": open_space,
-        "outside": outside,
-        "enclosed": enclosed,
+        "allowed_post_moat": allowed,
+        "refill_seed": seed,
+        "refill_seed_dist": seed_dist,
+        "brain": brain,
         "shell_contact": shell_contact,
         "moat_overlap": moat_overlap,
         "shell_grad_good": shell_grad_good,
@@ -292,7 +335,7 @@ def build_final_brain_candidate(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Outer-rim shell -> inside cavity plausibility -> moat refinement -> final brain fill."
+        description="Gradient-shell + balloon-fill mouse brain masking."
     )
     ap.add_argument("--bfc", required=True)
     ap.add_argument("--support_mask", required=True)
@@ -304,14 +347,14 @@ def main():
     ap.add_argument("--grad_sigma", type=float, default=1.0)
 
     # shell extraction
-    ap.add_argument("--grad_thresholds", default="0.06,0.08,0.10,0.12,0.14")
+    ap.add_argument("--grad_thresholds", default="0.10,0.12,0.14,0.16,0.18,0.20")
     ap.add_argument("--outer_rim_mm", type=float, default=1.25)
-    ap.add_argument("--shell_close_iters", type=int, default=1)
-    ap.add_argument("--shell_open_iters", type=int, default=1)
-    ap.add_argument("--shell_erode_iters", type=int, default=1)
+    ap.add_argument("--shell_close_iters", type=int, default=2)
+    ap.add_argument("--shell_dilate_iters", type=int, default=1)
+    ap.add_argument("--shell_open_iters", type=int, default=0)
     ap.add_argument("--shell_min_volume_mm3", type=float, default=2.0)
 
-    # cavity plausibility = THIS is now the main early gate
+    # cavity plausibility
     ap.add_argument("--cavity_volume_min_mm3", type=float, default=250.0)
     ap.add_argument("--cavity_volume_max_mm3", type=float, default=800.0)
     ap.add_argument("--extent_x_min_mm", type=float, default=7.0)
@@ -322,17 +365,23 @@ def main():
     ap.add_argument("--extent_z_max_mm", type=float, default=30.0)
     ap.add_argument("--cavity_bbox_fill_frac_min", type=float, default=0.35)
 
-    # moat / refinement
-    ap.add_argument("--moat_thresholds", default="0.04,0.06,0.08,0.10,0.12,0.14")
+    # balloon fill
+    ap.add_argument("--balloon_close_iters", type=int, default=2)
+    ap.add_argument("--balloon_fill_holes", action="store_true")
+    ap.add_argument("--balloon_max_iters", type=int, default=10000)
+
+    # moat refinement
+    ap.add_argument("--moat_thresholds", default="0.04,0.06,0.08,0.10")
     ap.add_argument("--shell_inner_band_mm", type=float, default=1.25)
     ap.add_argument("--moat_min_volume_mm3", type=float, default=1.0)
     ap.add_argument("--moat_close_iters", type=int, default=1)
     ap.add_argument("--barrier_close_iters", type=int, default=1)
 
-    # final cleanup + hard brain volume gate
+    # final cleanup and selection
     ap.add_argument("--brain_close_iters", type=int, default=2)
     ap.add_argument("--brain_open_iters", type=int, default=0)
     ap.add_argument("--brain_dilate_iters", type=int, default=0)
+
     ap.add_argument("--brain_volume_hard_min_mm3", type=float, default=300.0)
     ap.add_argument("--brain_volume_hard_max_mm3", type=float, default=650.0)
     ap.add_argument("--brain_volume_preferred_min_mm3", type=float, default=380.0)
@@ -358,6 +407,7 @@ def main():
 
     zooms = bfc_img.header.get_zooms()[:3]
     voxel_volume_mm3 = float(zooms[0] * zooms[1] * zooms[2])
+    mean_spacing = float(np.mean(zooms))
 
     structure = generate_binary_structure(3, 2)
 
@@ -368,12 +418,8 @@ def main():
     grad_norm = robust_normalize(grad, support, low_pct=2.0, high_pct=98.0)
 
     dist_to_support_edge_vox = distance_transform_edt(support)
-
+    outer_rim_vox = mm_to_vox(args.outer_rim_mm, mean_spacing)
     shell_min_vox = mm3_to_vox(args.shell_min_volume_mm3, voxel_volume_mm3)
-
-    outer_rim_vox_x = mm_to_vox_axis(args.outer_rim_mm, zooms[0])
-    outer_rim_vox_y = mm_to_vox_axis(args.outer_rim_mm, zooms[1])
-    outer_rim_vox_z = mm_to_vox_axis(args.outer_rim_mm, zooms[2])
 
     grad_thresholds = parse_float_list(args.grad_thresholds)
     moat_thresholds = parse_float_list(args.moat_thresholds)
@@ -382,22 +428,30 @@ def main():
     candidates = []
 
     for grad_thr in grad_thresholds:
-        built = build_shell_and_cavity_candidate(
+        outer_rim = make_outer_rim_mask(support, dist_to_support_edge_vox, outer_rim_vox)
+
+        shell_raw, shell = build_shell_candidate(
             grad_norm=grad_norm,
             support=support,
-            dist_to_support_edge_vox=dist_to_support_edge_vox,
+            outer_rim=outer_rim,
             structure=structure,
             grad_thr=grad_thr,
-            outer_rim_vox_x=outer_rim_vox_x,
-            outer_rim_vox_y=outer_rim_vox_y,
-            outer_rim_vox_z=outer_rim_vox_z,
             shell_min_vox=shell_min_vox,
             shell_close_iters=args.shell_close_iters,
+            shell_dilate_iters=args.shell_dilate_iters,
             shell_open_iters=args.shell_open_iters,
-            shell_erode_iters=args.shell_erode_iters,
         )
 
-        cavity = built["enclosed_pre_moat"]
+        cav_built = build_cavity_from_shell_balloon(
+            support=support,
+            shell=shell,
+            structure=structure,
+            balloon_close_iters=args.balloon_close_iters,
+            balloon_fill_holes=args.balloon_fill_holes,
+            balloon_max_iters=args.balloon_max_iters,
+        )
+
+        cavity = cav_built["cavity"]
 
         ok_cavity, cavity_info = cavity_is_plausible(
             cavity=cavity,
@@ -424,11 +478,11 @@ def main():
             continue
 
         for moat_thr in moat_thresholds:
-            final = build_final_brain_candidate(
+            refined = refine_with_moat(
                 inten_norm=inten_norm,
                 grad_norm=grad_norm,
                 support=support,
-                shell=built["shell"],
+                shell=shell,
                 cavity=cavity,
                 zooms_xyz=zooms,
                 voxel_volume_mm3=voxel_volume_mm3,
@@ -443,10 +497,10 @@ def main():
                 brain_dilate_iters=args.brain_dilate_iters,
                 shell_gate_grad_max=args.shell_gate_grad_max,
             )
-            if final is None:
+            if refined is None:
                 continue
 
-            brain = final["brain"]
+            brain = refined["brain"]
             brain_vol = mask_volume_mm3(brain, voxel_volume_mm3)
 
             if not (args.brain_volume_hard_min_mm3 <= brain_vol <= args.brain_volume_hard_max_mm3):
@@ -458,10 +512,10 @@ def main():
             volume_penalty = abs(brain_vol - preferred_mid)
 
             score = (
-                4.0 * final["shell_contact"]
-                - 8.0 * final["moat_overlap"]
+                4.0 * refined["shell_contact"]
+                - 8.0 * refined["moat_overlap"]
                 - 1.0 * volume_penalty
-                + 0.15 * final["shell_grad_good"]
+                + 0.15 * refined["shell_grad_good"]
             )
 
             candidates.append({
@@ -470,13 +524,11 @@ def main():
                 "brain_volume_mm3": brain_vol,
                 "score": float(score),
                 "cavity_info": cavity_info,
-                "outer_rim": built["outer_rim"],
-                "shell_raw": built["shell_raw"],
-                "shell": built["shell"],
-                "open_space_pre_moat": built["open_space_pre_moat"],
-                "outside_pre_moat": built["outside_pre_moat"],
-                "enclosed_pre_moat": built["enclosed_pre_moat"],
-                **final,
+                "outer_rim": outer_rim,
+                "shell_raw": shell_raw,
+                "shell": shell,
+                **cav_built,
+                **refined,
             })
 
     if not candidates:
@@ -484,11 +536,7 @@ def main():
             prefix = Path(args.debug_prefix)
             save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
             save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
-            save_like(
-                prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"),
-                dist_to_support_edge_vox.astype(np.float32),
-                bfc_img,
-            )
+            save_like(prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"), dist_to_support_edge_vox.astype(np.float32), bfc_img)
             with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
                 json.dump(
                     {
@@ -528,23 +576,21 @@ def main():
         prefix = Path(args.debug_prefix)
         save_like(prefix.with_name(prefix.name + "_inten_norm.nii.gz"), inten_norm.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_grad_norm.nii.gz"), grad_norm.astype(np.float32), bfc_img)
-        save_like(
-            prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"),
-            dist_to_support_edge_vox.astype(np.float32),
-            bfc_img,
-        )
+        save_like(prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"), dist_to_support_edge_vox.astype(np.float32), bfc_img)
         save_like(prefix.with_name(prefix.name + "_outer_rim.nii.gz"), chosen["outer_rim"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_shell_raw.nii.gz"), chosen["shell_raw"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_shell.nii.gz"), chosen["shell"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_open_space_pre_moat.nii.gz"), chosen["open_space_pre_moat"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_outside_pre_moat.nii.gz"), chosen["outside_pre_moat"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_enclosed_pre_moat.nii.gz"), chosen["enclosed_pre_moat"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_balloon_seed.nii.gz"), chosen["seed"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_balloon_seed_dist.nii.gz"), chosen["seed_dist"].astype(np.float32), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_balloon_allowed.nii.gz"), chosen["allowed"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_cavity_raw.nii.gz"), chosen["cavity_raw"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_cavity.nii.gz"), chosen["cavity"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_moat_raw.nii.gz"), chosen["moat_raw"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_moat.nii.gz"), chosen["moat"].astype(np.uint8), bfc_img)
         save_like(prefix.with_name(prefix.name + "_barrier.nii.gz"), chosen["barrier"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_open_space.nii.gz"), chosen["open_space"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_outside.nii.gz"), chosen["outside"].astype(np.uint8), bfc_img)
-        save_like(prefix.with_name(prefix.name + "_enclosed.nii.gz"), chosen["enclosed"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_allowed_post_moat.nii.gz"), chosen["allowed_post_moat"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_refill_seed.nii.gz"), chosen["refill_seed"].astype(np.uint8), bfc_img)
+        save_like(prefix.with_name(prefix.name + "_refill_seed_dist.nii.gz"), chosen["refill_seed_dist"].astype(np.float32), bfc_img)
 
         with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
             json.dump(
