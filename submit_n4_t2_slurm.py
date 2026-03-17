@@ -157,250 +157,238 @@ def build_job_script(
     if partition:
         sbatch_lines.append(f"#SBATCH --partition={partition}")
 
-    script = "\n".join(sbatch_lines) + "\n\n"
-
-    script += r"""set -euo pipefail
-
-echo "===== JOB START ====="
-date
-hostname
-echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
-echo "RUNNO=""" + runno + r""""
-
-export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=""" + str(threads) + r"""
-
-SBATCH_DIR=""" + shell_quote(str(sbatch_dir)) + r"""
-mkdir -p "$SBATCH_DIR"
-
-HELPER_SNAPSHOT="${SBATCH_DIR}/${SLURM_JOB_ID}_make_brain_mask_from_bfc.py"
-METADATA_JSON="${SBATCH_DIR}/${SLURM_JOB_ID}_job_metadata.json"
-
-cat > "$HELPER_SNAPSHOT" <<'PYTHON_HELPER_EOF'
-""" + helper_source_text + r"""
-PYTHON_HELPER_EOF
-chmod 755 "$HELPER_SNAPSHOT"
-
-cat > "$METADATA_JSON" <<'JSON_METADATA_EOF'
-""" + metadata_json_text + r"""
-JSON_METADATA_EOF
-
-in_nii=""" + shell_quote(str(in_nii)) + r"""
-out_nii=""" + shell_quote(str(out_nii)) + r"""
-in_method=""" + shell_quote(str(in_method)) + r"""
-out_method=""" + shell_quote(str(out_method)) + r"""
-support_nii=""" + shell_quote(str(support_nii)) + r"""
-bias_nii=""" + shell_quote(str(bias_nii)) + r"""
-brainmask_nii=""" + shell_quote(str(brainmask_nii)) + r"""
-brain_t2_nii=""" + shell_quote(str(brain_t2_nii)) + r"""
-tmp_otsu_pre_nii=""" + shell_quote(str(tmp_otsu_pre_nii)) + r"""
-python_exe=""" + shell_quote(str(python_path)) + r"""
-overwrite_flag=""" + ("1" if overwrite else "0") + r"""
-tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
-save_brain_debug_flag=""" + ("1" if save_brain_debug else "0") + r"""
-"""
-
-    if diff_nii is not None:
-        script += r"""diff_nii=""" + shell_quote(str(diff_nii)) + r"""
-"""
-    else:
-        script += r"""diff_nii=""
-"""
-
-    script += r"""
-n4_exe=""" + shell_quote(str(n4_path)) + r"""
-threshold_exe=""" + shell_quote(str(thresholdimage_path)) + r"""
-imagemath_exe=""" + shell_quote(str(imagemath_path)) + r"""
-"""
-    if printheader_path:
-        script += r"""printheader_exe=""" + shell_quote(str(printheader_path)) + r"""
-"""
-    else:
-        script += r"""printheader_exe=""
-"""
-
-    script += r"""
-echo
-echo "Metadata snapshot:"
-cat "$METADATA_JSON"
-
-mkdir -p "$(dirname "$out_nii")"
-
-if [[ ! -f "$in_nii" ]]; then
-    echo "ERROR: Input not found: $in_nii" >&2
-    exit 1
-fi
-
-if [[ ! -f "$HELPER_SNAPSHOT" ]]; then
-    echo "ERROR: Helper snapshot missing: $HELPER_SNAPSHOT" >&2
-    exit 1
-fi
-
-if [[ -n "$printheader_exe" ]]; then
-    echo
-    echo "Header / spacing check:"
-    "$printheader_exe" "$in_nii" 1 || true
-fi
-
-need_n4=0
-if [[ "$overwrite_flag" == "1" ]]; then
-    need_n4=1
-elif [[ ! -f "$out_nii" || ! -f "$bias_nii" || ! -f "$support_nii" ]]; then
-    need_n4=1
-fi
-
-need_brainmask=0
-if [[ "$overwrite_flag" == "1" ]]; then
-    need_brainmask=1
-elif [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then
-    need_brainmask=1
-fi
-
-if [[ -n "$diff_nii" ]]; then
-    need_diff=0
-    if [[ "$overwrite_flag" == "1" ]]; then
-        need_diff=1
-    elif [[ ! -f "$diff_nii" ]]; then
-        need_diff=1
-    fi
-else
-    need_diff=0
-fi
-
-make_support_mask() {
-    local src_nii="$1"
-    local tmp_otsu="$2"
-    local dst_mask="$3"
-
-    rm -f "$tmp_otsu" "$dst_mask"
-
-    "$threshold_exe" """ + str(dimension) + r""" "$src_nii" "$tmp_otsu" Otsu 4
-    "$threshold_exe" """ + str(dimension) + r""" "$tmp_otsu" "$dst_mask" """ + str(pre_otsu_keep_low) + r""" """ + str(pre_otsu_keep_high) + r""" 1 0
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MC "$dst_mask" """ + str(pre_close_radius) + r"""
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(pre_dilate_radius_pre_glc) + r"""
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" FillHoles "$dst_mask" """ + str(pre_fill_holes_radius) + r"""
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" GetLargestComponent "$dst_mask"
-    "$imagemath_exe" """ + str(dimension) + r""" "$dst_mask" MD "$dst_mask" """ + str(pre_dilate_radius_final) + r"""
-}
-
-if [[ "$need_n4" == "1" ]]; then
-    echo
-    echo "Creating pre-N4 support mask..."
-    make_support_mask "$in_nii" "$tmp_otsu_pre_nii" "$support_nii"
-
-    echo
-    echo "Running N4BiasFieldCorrection..."
-    cmd=(
-        "$n4_exe"
-        -d """ + str(dimension) + r"""
-        -i "$in_nii"
-        -x "$support_nii"
-        -s """ + str(shrink_factor) + r"""
-        -c """ + shell_quote(convergence) + r"""
-        -b """ + shell_quote(bspline) + r"""
-        -t """ + shell_quote(histogram_sharpening) + r"""
-        -r 1
-        -o "[""$out_nii"",""$bias_nii""]"
+    lines = []
+    lines.extend(sbatch_lines)
+    lines.append("")
+    lines.append("set -euo pipefail")
+    lines.append("")
+    lines.append('echo "===== JOB START ====="')
+    lines.append("date")
+    lines.append("hostname")
+    lines.append('echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"')
+    lines.append(f'echo "RUNNO={runno}"')
+    lines.append("")
+    lines.append(f"export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS={threads}")
+    lines.append("")
+    lines.append(f"SBATCH_DIR={shell_quote(str(sbatch_dir))}")
+    lines.append('mkdir -p "$SBATCH_DIR"')
+    lines.append("")
+    lines.append('HELPER_SNAPSHOT="${SBATCH_DIR}/${SLURM_JOB_ID}_make_brain_mask_from_bfc.py"')
+    lines.append('METADATA_JSON="${SBATCH_DIR}/${SLURM_JOB_ID}_job_metadata.json"')
+    lines.append("")
+    lines.append("cat > \"$HELPER_SNAPSHOT\" <<'PYTHON_HELPER_EOF'")
+    lines.append(helper_source_text.rstrip("\n"))
+    lines.append("PYTHON_HELPER_EOF")
+    lines.append('chmod 755 "$HELPER_SNAPSHOT"')
+    lines.append("")
+    lines.append("cat > \"$METADATA_JSON\" <<'JSON_METADATA_EOF'")
+    lines.append(metadata_json_text.rstrip("\n"))
+    lines.append("JSON_METADATA_EOF")
+    lines.append("")
+    lines.append(f"in_nii={shell_quote(str(in_nii))}")
+    lines.append(f"out_nii={shell_quote(str(out_nii))}")
+    lines.append(f"in_method={shell_quote(str(in_method))}")
+    lines.append(f"out_method={shell_quote(str(out_method))}")
+    lines.append(f"support_nii={shell_quote(str(support_nii))}")
+    lines.append(f"bias_nii={shell_quote(str(bias_nii))}")
+    lines.append(f"brainmask_nii={shell_quote(str(brainmask_nii))}")
+    lines.append(f"brain_t2_nii={shell_quote(str(brain_t2_nii))}")
+    lines.append(f"tmp_otsu_pre_nii={shell_quote(str(tmp_otsu_pre_nii))}")
+    lines.append(f"python_exe={shell_quote(str(python_path))}")
+    lines.append(f"overwrite_flag={'1' if overwrite else '0'}")
+    lines.append(f"tight_mask_flag={'1' if tight_mask else '0'}")
+    lines.append(f"save_brain_debug_flag={'1' if save_brain_debug else '0'}")
+    lines.append(f"diff_nii={shell_quote(str(diff_nii)) if diff_nii is not None else shell_quote('')}")
+    lines.append(f"n4_exe={shell_quote(str(n4_path))}")
+    lines.append(f"threshold_exe={shell_quote(str(thresholdimage_path))}")
+    lines.append(f"imagemath_exe={shell_quote(str(imagemath_path))}")
+    lines.append(f"printheader_exe={shell_quote(str(printheader_path)) if printheader_path else shell_quote('')}")
+    lines.append("")
+    lines.append('echo ""')
+    lines.append('echo "Metadata snapshot:"')
+    lines.append('cat "$METADATA_JSON"')
+    lines.append("")
+    lines.append('mkdir -p "$(dirname "$out_nii")"')
+    lines.append("")
+    lines.append('if [[ ! -f "$in_nii" ]]; then')
+    lines.append('    echo "ERROR: Input not found: $in_nii" >&2')
+    lines.append("    exit 1")
+    lines.append("fi")
+    lines.append("")
+    lines.append('if [[ ! -f "$HELPER_SNAPSHOT" ]]; then')
+    lines.append('    echo "ERROR: Helper snapshot missing: $HELPER_SNAPSHOT" >&2')
+    lines.append("    exit 1")
+    lines.append("fi")
+    lines.append("")
+    lines.append('if [[ -n "$printheader_exe" ]]; then')
+    lines.append('    echo ""')
+    lines.append('    echo "Header / spacing check:"')
+    lines.append('    "$printheader_exe" "$in_nii" 1 || true')
+    lines.append("fi")
+    lines.append("")
+    lines.append("need_n4=0")
+    lines.append('if [[ "$overwrite_flag" == "1" ]]; then')
+    lines.append("    need_n4=1")
+    lines.append('elif [[ ! -f "$out_nii" || ! -f "$bias_nii" || ! -f "$support_nii" ]]; then')
+    lines.append("    need_n4=1")
+    lines.append("fi")
+    lines.append("")
+    lines.append("need_brainmask=0")
+    lines.append('if [[ "$overwrite_flag" == "1" ]]; then')
+    lines.append("    need_brainmask=1")
+    lines.append('elif [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then')
+    lines.append("    need_brainmask=1")
+    lines.append("fi")
+    lines.append("")
+    lines.append('if [[ -n "$diff_nii" ]]; then')
+    lines.append("    need_diff=0")
+    lines.append('    if [[ "$overwrite_flag" == "1" ]]; then')
+    lines.append("        need_diff=1")
+    lines.append('    elif [[ ! -f "$diff_nii" ]]; then')
+    lines.append("        need_diff=1")
+    lines.append("    fi")
+    lines.append("else")
+    lines.append("    need_diff=0")
+    lines.append("fi")
+    lines.append("")
+    lines.append("make_support_mask() {")
+    lines.append('    local src_nii="$1"')
+    lines.append('    local tmp_otsu="$2"')
+    lines.append('    local dst_mask="$3"')
+    lines.append("")
+    lines.append('    rm -f "$tmp_otsu" "$dst_mask"')
+    lines.append("")
+    lines.append(f'    "$threshold_exe" {dimension} "$src_nii" "$tmp_otsu" Otsu 4')
+    lines.append(
+        f'    "$threshold_exe" {dimension} "$tmp_otsu" "$dst_mask" '
+        f"{pre_otsu_keep_low} {pre_otsu_keep_high} 1 0"
     )
-    printf '  %q' "${cmd[@]}"
-    echo
-    "${cmd[@]}"
+    lines.append(f'    "$imagemath_exe" {dimension} "$dst_mask" MC "$dst_mask" {pre_close_radius}')
+    lines.append(f'    "$imagemath_exe" {dimension} "$dst_mask" MD "$dst_mask" {pre_dilate_radius_pre_glc}')
+    lines.append(f'    "$imagemath_exe" {dimension} "$dst_mask" FillHoles "$dst_mask" {pre_fill_holes_radius}')
+    lines.append(f'    "$imagemath_exe" {dimension} "$dst_mask" GetLargestComponent "$dst_mask"')
+    lines.append(f'    "$imagemath_exe" {dimension} "$dst_mask" MD "$dst_mask" {pre_dilate_radius_final}')
+    lines.append("}")
+    lines.append("")
+    lines.append('if [[ "$need_n4" == "1" ]]; then')
+    lines.append('    echo ""')
+    lines.append('    echo "Creating pre-N4 support mask..."')
+    lines.append('    make_support_mask "$in_nii" "$tmp_otsu_pre_nii" "$support_nii"')
+    lines.append("")
+    lines.append('    echo ""')
+    lines.append('    echo "Running N4BiasFieldCorrection..."')
+    lines.append("    cmd=(")
+    lines.append('        "$n4_exe"')
+    lines.append(f"        -d {dimension}")
+    lines.append('        -i "$in_nii"')
+    lines.append('        -x "$support_nii"')
+    lines.append(f"        -s {shrink_factor}")
+    lines.append(f"        -c {shell_quote(convergence)}")
+    lines.append(f"        -b {shell_quote(bspline)}")
+    lines.append(f"        -t {shell_quote(histogram_sharpening)}")
+    lines.append("        -r 1")
+    lines.append('        -o "[""$out_nii"",""$bias_nii""]"')
+    lines.append("    )")
+    lines.append("    printf '  %q' \"${cmd[@]}\"")
+    lines.append('    echo ""')
+    lines.append('    "${cmd[@]}"')
+    lines.append("")
+    lines.append('    if [[ ! -f "$out_nii" || ! -f "$bias_nii" ]]; then')
+    lines.append('        echo "ERROR: N4 outputs missing." >&2')
+    lines.append("        exit 1")
+    lines.append("    fi")
+    lines.append("")
+    lines.append('    if [[ -f "$in_method" ]]; then')
+    lines.append('        cp -f "$in_method" "$out_method"')
+    lines.append("    fi")
+    lines.append("else")
+    lines.append('    echo ""')
+    lines.append('    echo "Skipping N4 stage; existing outputs found and overwrite is off."')
+    lines.append("fi")
+    lines.append("")
+    lines.append('if [[ "$need_brainmask" == "1" ]]; then')
+    lines.append('    if [[ ! -f "$out_nii" ]]; then')
+    lines.append('        echo "ERROR: Missing corrected image for brain mask: $out_nii" >&2')
+    lines.append("        exit 1")
+    lines.append("    fi")
+    lines.append('    if [[ ! -f "$support_nii" ]]; then')
+    lines.append('        echo "ERROR: Missing support mask for brain mask: $support_nii" >&2')
+    lines.append("        exit 1")
+    lines.append("    fi")
+    lines.append("")
+    lines.append('    echo ""')
+    lines.append('    echo "Running immutable helper snapshot:"')
+    lines.append('    ls -l "$HELPER_SNAPSHOT"')
+    lines.append("")
+    lines.append("    brain_cmd=(")
+    lines.append('        "$python_exe" "$HELPER_SNAPSHOT"')
+    lines.append('        --bfc "$out_nii"')
+    lines.append('        --support_mask "$support_nii"')
+    lines.append('        --out_mask "$brainmask_nii"')
+    lines.append('        --out_masked_bfc "$brain_t2_nii"')
+    lines.append(f"        --smooth_sigma {brain_smooth_sigma}")
+    lines.append(f"        --grad_sigma {brain_grad_sigma}")
+    lines.append(f"        --grad_thresholds {shell_quote(brain_grad_thresholds)}")
+    lines.append(f"        --outer_rim_mm {brain_outer_rim_mm}")
+    lines.append(f"        --shell_close_iters {brain_shell_close_iters}")
+    lines.append(f"        --shell_open_iters {brain_shell_open_iters}")
+    lines.append(f"        --shell_erode_iters {brain_shell_erode_iters}")
+    lines.append(f"        --shell_volume_min_mm3 {brain_shell_volume_min_mm3}")
+    lines.append(f"        --shell_volume_max_mm3 {brain_shell_volume_max_mm3}")
+    lines.append(f"        --extent_x_min_mm {brain_extent_x_min_mm}")
+    lines.append(f"        --extent_x_max_mm {brain_extent_x_max_mm}")
+    lines.append(f"        --extent_y_min_mm {brain_extent_y_min_mm}")
+    lines.append(f"        --extent_y_max_mm {brain_extent_y_max_mm}")
+    lines.append(f"        --extent_z_min_mm {brain_extent_z_min_mm}")
+    lines.append(f"        --extent_z_max_mm {brain_extent_z_max_mm}")
+    lines.append(f"        --shell_bbox_fill_frac_max {brain_shell_bbox_fill_frac_max}")
+    lines.append(f"        --moat_thresholds {shell_quote(brain_moat_thresholds)}")
+    lines.append(f"        --shell_inner_band_mm {brain_shell_inner_band_mm}")
+    lines.append(f"        --moat_min_volume_mm3 {brain_moat_min_volume_mm3}")
+    lines.append(f"        --moat_close_iters {brain_moat_close_iters}")
+    lines.append(f"        --barrier_close_iters {brain_barrier_close_iters}")
+    lines.append(f"        --brain_close_iters {brain_close_iters}")
+    lines.append(f"        --brain_open_iters {brain_open_iters}")
+    lines.append(f"        --brain_dilate_iters {brain_dilate_iters}")
+    lines.append(f"        --brain_volume_hard_min_mm3 {brain_volume_hard_min_mm3}")
+    lines.append(f"        --brain_volume_hard_max_mm3 {brain_volume_hard_max_mm3}")
+    lines.append(f"        --brain_volume_preferred_min_mm3 {brain_volume_preferred_min_mm3}")
+    lines.append(f"        --brain_volume_preferred_max_mm3 {brain_volume_preferred_max_mm3}")
+    lines.append(f"        --shell_gate_grad_max {brain_shell_gate_grad_max}")
+    lines.append(f"        --tight_erode_iters {tight_mask_erode_iters}")
+    lines.append("    )")
+    lines.append("")
+    lines.append('    if [[ "$tight_mask_flag" == "1" ]]; then')
+    lines.append("        brain_cmd+=( --tight_mask )")
+    lines.append("    fi")
+    lines.append("")
+    lines.append('    if [[ "$save_brain_debug_flag" == "1" ]]; then')
+    lines.append('        brain_cmd+=( --debug_prefix "${SBATCH_DIR}/${SLURM_JOB_ID}_brain_dbg" )')
+    lines.append("    fi")
+    lines.append("")
+    lines.append("    printf '  %q' \"${brain_cmd[@]}\"")
+    lines.append('    echo ""')
+    lines.append('    "${brain_cmd[@]}"')
+    lines.append("")
+    lines.append('    if [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then')
+    lines.append('        echo "ERROR: Brain-mask outputs missing." >&2')
+    lines.append("        exit 1")
+    lines.append("    fi")
+    lines.append("else")
+    lines.append('    echo ""')
+    lines.append('    echo "Skipping brain-mask stage; outputs exist and overwrite is off."')
+    lines.append("fi")
+    lines.append("")
+    lines.append('if [[ "$need_diff" == "1" ]]; then')
+    lines.append(f'    "$imagemath_exe" {dimension} "$diff_nii" - "$out_nii" "$in_nii"')
+    lines.append("fi")
+    lines.append("")
+    lines.append('rm -f "$tmp_otsu_pre_nii"')
+    lines.append("")
+    lines.append('echo "===== JOB END ====="')
+    lines.append("date")
 
-    if [[ ! -f "$out_nii" || ! -f "$bias_nii" ]]; then
-        echo "ERROR: N4 outputs missing." >&2
-        exit 1
-    fi
-
-    if [[ -f "$in_method" ]]; then
-        cp -f "$in_method" "$out_method"
-    fi
-else
-    echo
-    echo "Skipping N4 stage; existing outputs found and overwrite is off."
-fi
-
-if [[ "$need_brainmask" == "1" ]]; then
-    if [[ ! -f "$out_nii" ]]; then
-        echo "ERROR: Missing corrected image for brain mask: $out_nii" >&2
-        exit 1
-    fi
-    if [[ ! -f "$support_nii" ]]; then
-        echo "ERROR: Missing support mask for brain mask: $support_nii" >&2
-        exit 1
-    fi
-
-    echo
-    echo "Running immutable helper snapshot:"
-    ls -l "$HELPER_SNAPSHOT"
-
-    brain_cmd=(
-        "$python_exe" "$HELPER_SNAPSHOT"
-        --bfc "$out_nii"
-        --support_mask "$support_nii"
-        --out_mask "$brainmask_nii"
-        --out_masked_bfc "$brain_t2_nii"
-        --smooth_sigma """ + str(brain_smooth_sigma) + r"""
-        --grad_sigma """ + str(brain_grad_sigma) + r"""
-        --grad_thresholds """ + shell_quote(brain_grad_thresholds) + r"""
-        --outer_rim_mm """ + str(brain_outer_rim_mm) + r"""
-        --shell_close_iters """ + str(brain_shell_close_iters) + r"""
-        --shell_open_iters """ + str(brain_shell_open_iters) + r"""
-        --shell_erode_iters """ + str(brain_shell_erode_iters) + r"""
-        --shell_volume_min_mm3 """ + str(brain_shell_volume_min_mm3) + r"""
-        --shell_volume_max_mm3 """ + str(brain_shell_volume_max_mm3) + r"""
-        --extent_x_min_mm """ + str(brain_extent_x_min_mm) + r"""
-        --extent_x_max_mm """ + str(brain_extent_x_max_mm) + r"""
-        --extent_y_min_mm """ + str(brain_extent_y_min_mm) + r"""
-        --extent_y_max_mm """ + str(brain_extent_y_max_mm) + r"""
-        --extent_z_min_mm """ + str(brain_extent_z_min_mm) + r"""
-        --extent_z_max_mm """ + str(brain_extent_z_max_mm) + r"""
-        --shell_bbox_fill_frac_max """ + str(brain_shell_bbox_fill_frac_max) + r"""
-        --moat_thresholds """ + shell_quote(brain_moat_thresholds) + r"""
-        --shell_inner_band_mm """ + str(brain_shell_inner_band_mm) + r"""
-        --moat_min_volume_mm3 """ + str(brain_moat_min_volume_mm3) + r"""
-        --moat_close_iters """ + str(brain_moat_close_iters) + r"""
-        --barrier_close_iters """ + str(brain_barrier_close_iters) + r"""
-        --brain_close_iters """ + str(brain_close_iters) + r"""
-        --brain_open_iters """ + str(brain_open_iters) + r"""
-        --brain_dilate_iters """ + str(brain_dilate_iters) + r"""
-        --brain_volume_hard_min_mm3 """ + str(brain_volume_hard_min_mm3) + r"""
-        --brain_volume_hard_max_mm3 """ + str(brain_volume_hard_max_mm3) + r"""
-        --brain_volume_preferred_min_mm3 """ + str(brain_volume_preferred_min_mm3) + r"""
-        --brain_volume_preferred_max_mm3 """ + str(brain_volume_preferred_max_mm3) + r"""
-        --shell_gate_grad_max """ + str(brain_shell_gate_grad_max) + r"""
-        --tight_erode_iters """ + str(tight_mask_erode_iters) + r"""
-    )
-
-    if [[ "$tight_mask_flag" == "1" ]]; then
-        brain_cmd+=( --tight_mask )
-    fi
-
-    if [[ "$save_brain_debug_flag" == "1" ]]; then
-        brain_cmd+=( --debug_prefix "${SBATCH_DIR}/${SLURM_JOB_ID}_brain_dbg" )
-    fi
-
-    printf '  %q' "${brain_cmd[@]}"
-    echo
-    "${brain_cmd[@]}"
-
-    if [[ ! -f "$brainmask_nii" || ! -f "$brain_t2_nii" ]]; then
-        echo "ERROR: Brain-mask outputs missing." >&2
-        exit 1
-    fi
-else
-    echo
-    echo "Skipping brain-mask stage; outputs exist and overwrite is off."
-fi
-
-if [[ "$need_diff" == "1" ]]; then
-    "$imagemath_exe" """ + str(dimension) + r""" "$diff_nii" - "$out_nii" "$in_nii"
-fi
-
-rm -f "$tmp_otsu_pre_nii"
-
-echo "===== JOB END ====="
-date
-"""
-    return script
+    return "\n".join(lines) + "\n"
 
 
 def main():
@@ -440,7 +428,6 @@ def main():
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
-    # New shell-first helper args
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
 
