@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
-import hashlib
 import json
 import re
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 
 
@@ -52,42 +50,31 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
+def read_text(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    return path.read_text()
+
+
 def submit_job(script_path: Path):
     result = subprocess.run(
-        ["sbatch", str(script_path)],
+        ["sbatch", "--parsable", str(script_path)],
         capture_output=True,
         text=True,
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def load_helper_source(helper_path: Path):
-    if not helper_path.exists():
-        raise FileNotFoundError(f"Helper script not found: {helper_path}")
-    text = helper_path.read_text()
-    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    return text, sha
-
-
-def write_job_bundle(
-    bundle_dir: Path,
-    helper_text: str,
-    helper_name: str,
-    metadata: dict,
-):
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-
-    helper_snapshot = bundle_dir / helper_name
-    helper_snapshot.write_text(helper_text)
-    helper_snapshot.chmod(0o755)
-
-    metadata_path = bundle_dir / "job_metadata.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
-
-    return helper_snapshot, metadata_path
+def parse_job_id(sbatch_stdout: str) -> str:
+    # slurm may return forms like "236924" or "236924;cluster"
+    m = re.match(r"^(\d+)", sbatch_stdout.strip())
+    if not m:
+        raise RuntimeError(f"Could not parse job id from sbatch output: {sbatch_stdout!r}")
+    return m.group(1)
 
 
 def build_job_script(
+    *,
     runno: str,
     in_nii: Path,
     out_nii: Path,
@@ -99,8 +86,9 @@ def build_job_script(
     brain_t2_nii: Path,
     diff_nii: Path | None,
     tmp_otsu_pre_nii: Path,
-    helper_snapshot: Path,
-    metadata_path: Path,
+    sbatch_dir: Path,
+    helper_source_text: str,
+    metadata_json_text: str,
     python_path: str,
     n4_path: str,
     thresholdimage_path: str,
@@ -134,8 +122,7 @@ def build_job_script(
     save_brain_debug: bool,
     threads: int,
     job_name: str,
-    log_out: Path,
-    log_err: Path,
+    log_path_pattern: Path,
     partition: str | None,
     time_str: str,
     mem_gb: int,
@@ -145,8 +132,8 @@ def build_job_script(
     sbatch_lines = [
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name}",
-        f"#SBATCH --output={log_out}",
-        f"#SBATCH --error={log_err}",
+        f"#SBATCH --output={log_path_pattern}",
+        f"#SBATCH --error={log_path_pattern}",
         f"#SBATCH --time={time_str}",
         f"#SBATCH --mem={mem_gb}G",
         f"#SBATCH --cpus-per-task={cpus}",
@@ -166,6 +153,21 @@ echo "RUNNO=""" + runno + r""""
 
 export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=""" + str(threads) + r"""
 
+SBATCH_DIR=""" + shell_quote(str(sbatch_dir)) + r"""
+mkdir -p "$SBATCH_DIR"
+
+HELPER_SNAPSHOT="${SBATCH_DIR}/${SLURM_JOB_ID}_make_brain_mask_from_bfc.py"
+METADATA_JSON="${SBATCH_DIR}/${SLURM_JOB_ID}_job_metadata.json"
+
+cat > "$HELPER_SNAPSHOT" <<'PYTHON_HELPER_EOF'
+""" + helper_source_text + r"""
+PYTHON_HELPER_EOF
+chmod 755 "$HELPER_SNAPSHOT"
+
+cat > "$METADATA_JSON" <<'JSON_METADATA_EOF'
+""" + metadata_json_text + r"""
+JSON_METADATA_EOF
+
 in_nii=""" + shell_quote(str(in_nii)) + r"""
 out_nii=""" + shell_quote(str(out_nii)) + r"""
 in_method=""" + shell_quote(str(in_method)) + r"""
@@ -175,8 +177,6 @@ bias_nii=""" + shell_quote(str(bias_nii)) + r"""
 brainmask_nii=""" + shell_quote(str(brainmask_nii)) + r"""
 brain_t2_nii=""" + shell_quote(str(brain_t2_nii)) + r"""
 tmp_otsu_pre_nii=""" + shell_quote(str(tmp_otsu_pre_nii)) + r"""
-helper_snapshot=""" + shell_quote(str(helper_snapshot)) + r"""
-metadata_path=""" + shell_quote(str(metadata_path)) + r"""
 python_exe=""" + shell_quote(str(python_path)) + r"""
 overwrite_flag=""" + ("1" if overwrite else "0") + r"""
 tight_mask_flag=""" + ("1" if tight_mask else "0") + r"""
@@ -203,8 +203,9 @@ imagemath_exe=""" + shell_quote(str(imagemath_path)) + r"""
 """
 
     script += r"""
+echo
 echo "Metadata snapshot:"
-cat "$metadata_path"
+cat "$METADATA_JSON"
 
 mkdir -p "$(dirname "$out_nii")"
 
@@ -213,8 +214,8 @@ if [[ ! -f "$in_nii" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$helper_snapshot" ]]; then
-    echo "ERROR: Helper snapshot not found: $helper_snapshot" >&2
+if [[ ! -f "$HELPER_SNAPSHOT" ]]; then
+    echo "ERROR: Helper snapshot missing: $HELPER_SNAPSHOT" >&2
     exit 1
 fi
 
@@ -313,10 +314,10 @@ if [[ "$need_brainmask" == "1" ]]; then
 
     echo
     echo "Running immutable helper snapshot:"
-    ls -l "$helper_snapshot"
+    ls -l "$HELPER_SNAPSHOT"
 
     brain_cmd=(
-        "$python_exe" "$helper_snapshot"
+        "$python_exe" "$HELPER_SNAPSHOT"
         --bfc "$out_nii"
         --support_mask "$support_nii"
         --out_mask "$brainmask_nii"
@@ -341,7 +342,7 @@ if [[ "$need_brainmask" == "1" ]]; then
     fi
 
     if [[ "$save_brain_debug_flag" == "1" ]]; then
-        brain_cmd+=( --debug_prefix "$(dirname "$brainmask_nii")/""" + runno + r"""_bfc_brain_dbg" )
+        brain_cmd+=( --debug_prefix "${SBATCH_DIR}/${SLURM_JOB_ID}_brain_dbg" )
     fi
 
     printf '  %q' "${brain_cmd[@]}"
@@ -371,7 +372,7 @@ date
 
 def main():
     p = argparse.ArgumentParser(
-        description="Submit one Slurm job per runno for N4 + brain masking, with per-job immutable helper snapshots."
+        description="Submit one Slurm job per runno for N4 + brain masking, with per-job immutable helper snapshots in run-local sbatch folders."
     )
     p.add_argument("--base_dir", required=True)
 
@@ -380,11 +381,10 @@ def main():
     group.add_argument("--runno_file")
     group.add_argument("--discover", action="store_true")
 
-    p.add_argument("--sbatch_dir", default=None)
     p.add_argument(
         "--brainmask_helper",
         default=None,
-        help="Path to the actual make_brain_mask_from_bfc.py you want snapshotted per job. Defaults to sibling file next to this submit script.",
+        help="Path to the real make_brain_mask_from_bfc.py. Defaults to sibling file next to this submit script.",
     )
 
     p.add_argument("--python_path", default="python3")
@@ -395,13 +395,11 @@ def main():
 
     p.add_argument("--dimension", type=int, default=3, choices=[2, 3, 4])
 
-    # N4 defaults
     p.add_argument("--shrink_factor", type=int, default=1)
     p.add_argument("--convergence", default="[200x200x100x50,1e-8]")
     p.add_argument("--bspline", default="[8]")
     p.add_argument("--histogram_sharpening", default="[0.15,0.01,200]")
 
-    # Pre-N4 support mask
     p.add_argument("--pre_otsu_keep_low", type=int, default=2)
     p.add_argument("--pre_otsu_keep_high", type=int, default=4)
     p.add_argument("--pre_close_radius", type=int, default=2)
@@ -409,7 +407,7 @@ def main():
     p.add_argument("--pre_fill_holes_radius", type=int, default=2)
     p.add_argument("--pre_dilate_radius_final", type=int, default=2)
 
-    # Edge-aware helper args: these now actually match the helper
+    # These now match your rolled-back helper exactly
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
     p.add_argument("--brain_seed_min_distance", type=float, default=4.0)
@@ -447,7 +445,7 @@ def main():
 
     script_dir = Path(__file__).resolve().parent
     helper_path = Path(args.brainmask_helper).expanduser().resolve() if args.brainmask_helper else (script_dir / "make_brain_mask_from_bfc.py")
-    helper_text, helper_sha = load_helper_source(helper_path)
+    helper_source_text = read_text(helper_path)
 
     if args.runnos:
         runnos = [str(x).strip() for x in args.runnos if str(x).strip()]
@@ -461,18 +459,8 @@ def main():
         eprint("[ERROR] No runnos found.")
         return 1
 
-    sbatch_dir = Path(args.sbatch_dir).expanduser().resolve() if args.sbatch_dir else (base_dir / "n4_t2_sbatch")
-    scripts_dir = sbatch_dir / "scripts"
-    logs_dir = sbatch_dir / "logs"
-    jobs_dir = sbatch_dir / "jobs"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"[INFO] base_dir      : {base_dir}")
-    print(f"[INFO] sbatch_dir    : {sbatch_dir}")
     print(f"[INFO] helper_path   : {helper_path}")
-    print(f"[INFO] helper_sha    : {helper_sha}")
     print(f"[INFO] runno count   : {len(runnos)}")
 
     n_prepared = 0
@@ -483,6 +471,9 @@ def main():
 
     for runno in runnos:
         run_dir = base_dir / f"z{runno}"
+        sbatch_dir = run_dir / "sbatch"
+        sbatch_dir.mkdir(parents=True, exist_ok=True)
+
         in_nii = run_dir / f"{runno}_T2.nii.gz"
         out_nii = run_dir / f"{runno}_bfc_T2.nii.gz"
         in_method = run_dir / f"{runno}_T2.method"
@@ -509,38 +500,22 @@ def main():
                 continue
 
         job_name = sanitize_job_name(f"n4_t2_{runno}")
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        bundle_name = f"{job_name}.{stamp}.{helper_sha}"
-        bundle_dir = jobs_dir / bundle_name
+        tmp_script = sbatch_dir / f"TMP_{job_name}.sbatch"
+        log_path_pattern = sbatch_dir / "slurm-%j.out"
 
         metadata = {
-            "job_name": job_name,
             "runno": runno,
-            "generated_at": stamp,
+            "job_name": job_name,
+            "input": str(in_nii),
+            "output_bfc": str(out_nii),
+            "output_bias": str(bias_nii),
+            "output_support_mask": str(support_nii),
+            "output_brain_mask": str(brainmask_nii),
+            "output_brain_bfc": str(brain_t2_nii),
             "helper_source_path": str(helper_path),
-            "helper_sha256_short": helper_sha,
-            "paths": {
-                "input": str(in_nii),
-                "output_bfc": str(out_nii),
-                "output_bias": str(bias_nii),
-                "output_support_mask": str(support_nii),
-                "output_brain_mask": str(brainmask_nii),
-                "output_brain_bfc": str(brain_t2_nii),
-                "output_method": str(out_method),
-            },
-            "args": vars(args),
+            "submit_args": vars(args),
         }
-
-        helper_snapshot, metadata_path = write_job_bundle(
-            bundle_dir=bundle_dir,
-            helper_text=helper_text,
-            helper_name="make_brain_mask_from_bfc.py",
-            metadata=metadata,
-        )
-
-        log_out = logs_dir / f"{bundle_name}.%j.out"
-        log_err = logs_dir / f"{bundle_name}.%j.err"
-        script_path = scripts_dir / f"{bundle_name}.sbatch"
+        metadata_json_text = json.dumps(metadata, indent=2, sort_keys=True)
 
         script_text = build_job_script(
             runno=runno,
@@ -554,8 +529,9 @@ def main():
             brain_t2_nii=brain_t2_nii,
             diff_nii=diff_nii,
             tmp_otsu_pre_nii=tmp_otsu_pre_nii,
-            helper_snapshot=helper_snapshot,
-            metadata_path=metadata_path,
+            sbatch_dir=sbatch_dir,
+            helper_source_text=helper_source_text,
+            metadata_json_text=metadata_json_text,
             python_path=args.python_path,
             n4_path=args.n4_path,
             thresholdimage_path=args.thresholdimage_path,
@@ -589,8 +565,7 @@ def main():
             save_brain_debug=args.save_brain_debug,
             threads=args.threads,
             job_name=job_name,
-            log_out=log_out,
-            log_err=log_err,
+            log_path_pattern=log_path_pattern,
             partition=args.partition,
             time_str=args.time,
             mem_gb=args.mem_gb,
@@ -598,25 +573,31 @@ def main():
             overwrite=args.overwrite,
         )
 
-        script_path.write_text(script_text)
+        tmp_script.write_text(script_text)
         n_prepared += 1
-        print(f"[PREPARED] {script_path}")
-        print(f"[BUNDLE]   {bundle_dir}")
+        print(f"[PREPARED] {tmp_script}")
 
         if args.dry_run:
             continue
 
-        rc, stdout, stderr = submit_job(script_path)
-        if rc == 0:
-            print(f"[SUBMITTED] runno {runno}: {stdout}")
-            n_submitted += 1
-        else:
+        rc, stdout, stderr = submit_job(tmp_script)
+        if rc != 0:
             eprint(f"[SUBMIT FAIL] runno {runno}")
             if stdout:
                 eprint(stdout)
             if stderr:
                 eprint(stderr)
             n_failed_submit += 1
+            continue
+
+        job_id = parse_job_id(stdout)
+        final_script = sbatch_dir / f"{job_id}_{job_name}.sbatch"
+        tmp_script.rename(final_script)
+
+        print(f"[SUBMITTED] runno {runno}: job_id={job_id}")
+        print(f"[SCRIPT]    {final_script}")
+        print(f"[LOG]       {sbatch_dir / f'slurm-{job_id}.out'}")
+        n_submitted += 1
 
     print("\n[SUMMARY]")
     print(f"  Prepared     : {n_prepared}")
