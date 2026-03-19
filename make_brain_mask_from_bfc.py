@@ -106,6 +106,25 @@ def bbox_fill_fraction(mask: np.ndarray) -> float:
     return float(np.count_nonzero(mask) / bbox_vox)
 
 
+def json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        val = float(obj)
+        if np.isnan(val) or np.isinf(val):
+            return None
+        return val
+    return obj
+
+
 def cavity_is_plausible(
     cavity: np.ndarray,
     voxel_volume_mm3: float,
@@ -139,13 +158,13 @@ def cavity_is_plausible(
     )
 
     info = {
-        "cavity_volume_mm3": vol_mm3,
+        "cavity_volume_mm3": float(vol_mm3),
         "cavity_extent_x_mm": float(ext_mm[0]),
         "cavity_extent_y_mm": float(ext_mm[1]),
         "cavity_extent_z_mm": float(ext_mm[2]),
-        "cavity_bbox_fill_fraction": fill_frac,
+        "cavity_bbox_fill_fraction": float(fill_frac),
     }
-    return ok, info
+    return bool(ok), info
 
 
 def make_outer_rim_mask(support: np.ndarray, dist_to_support_edge_vox: np.ndarray, outer_rim_vox: float) -> np.ndarray:
@@ -176,8 +195,6 @@ def build_shell_candidate(
         shell = binary_opening(shell, structure=structure, iterations=shell_open_iters)
 
     shell = remove_small_components(shell, shell_min_vox, structure=structure)
-
-    # NOTE: intentionally NO largest_component(shell) here
     return shell_raw, shell
 
 
@@ -295,7 +312,6 @@ def refine_with_moat(
 
     allowed = support & (~barrier)
 
-    # Balloon refill again, but now with moat-aware barrier
     seed, seed_dist = choose_balloon_seed(allowed, np.zeros_like(allowed, dtype=bool), structure)
     if not np.any(seed):
         return None
@@ -346,7 +362,6 @@ def main():
     ap.add_argument("--smooth_sigma", type=float, default=1.0)
     ap.add_argument("--grad_sigma", type=float, default=1.0)
 
-    # shell extraction
     ap.add_argument("--grad_thresholds", default="0.10,0.12,0.14,0.16,0.18,0.20")
     ap.add_argument("--outer_rim_mm", type=float, default=1.25)
     ap.add_argument("--shell_close_iters", type=int, default=2)
@@ -354,7 +369,6 @@ def main():
     ap.add_argument("--shell_open_iters", type=int, default=0)
     ap.add_argument("--shell_min_volume_mm3", type=float, default=2.0)
 
-    # cavity plausibility
     ap.add_argument("--cavity_volume_min_mm3", type=float, default=250.0)
     ap.add_argument("--cavity_volume_max_mm3", type=float, default=800.0)
     ap.add_argument("--extent_x_min_mm", type=float, default=7.0)
@@ -365,19 +379,16 @@ def main():
     ap.add_argument("--extent_z_max_mm", type=float, default=30.0)
     ap.add_argument("--cavity_bbox_fill_frac_min", type=float, default=0.35)
 
-    # balloon fill
     ap.add_argument("--balloon_close_iters", type=int, default=2)
     ap.add_argument("--balloon_fill_holes", action="store_true")
     ap.add_argument("--balloon_max_iters", type=int, default=10000)
 
-    # moat refinement
     ap.add_argument("--moat_thresholds", default="0.04,0.06,0.08,0.10")
     ap.add_argument("--shell_inner_band_mm", type=float, default=1.25)
     ap.add_argument("--moat_min_volume_mm3", type=float, default=1.0)
     ap.add_argument("--moat_close_iters", type=int, default=1)
     ap.add_argument("--barrier_close_iters", type=int, default=1)
 
-    # final cleanup and selection
     ap.add_argument("--brain_close_iters", type=int, default=2)
     ap.add_argument("--brain_open_iters", type=int, default=0)
     ap.add_argument("--brain_dilate_iters", type=int, default=0)
@@ -469,8 +480,8 @@ def main():
         )
 
         shell_candidates.append({
-            "grad_threshold": grad_thr,
-            "ok_cavity": ok_cavity,
+            "grad_threshold": float(grad_thr),
+            "ok_cavity": bool(ok_cavity),
             **cavity_info,
         })
 
@@ -519,9 +530,9 @@ def main():
             )
 
             candidates.append({
-                "grad_threshold": grad_thr,
-                "moat_threshold": moat_thr,
-                "brain_volume_mm3": brain_vol,
+                "grad_threshold": float(grad_thr),
+                "moat_threshold": float(moat_thr),
+                "brain_volume_mm3": float(brain_vol),
                 "score": float(score),
                 "cavity_info": cavity_info,
                 "outer_rim": outer_rim,
@@ -539,7 +550,7 @@ def main():
             save_like(prefix.with_name(prefix.name + "_dist_to_support_edge_vox.nii.gz"), dist_to_support_edge_vox.astype(np.float32), bfc_img)
             with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
                 json.dump(
-                    {
+                    json_safe({
                         "status": "failed",
                         "reason": "No plausible cavity+moat+brain candidate satisfied hard constraints.",
                         "shell_candidates": shell_candidates,
@@ -547,7 +558,7 @@ def main():
                         "brain_volume_hard_max_mm3": args.brain_volume_hard_max_mm3,
                         "brain_volume_preferred_min_mm3": args.brain_volume_preferred_min_mm3,
                         "brain_volume_preferred_max_mm3": args.brain_volume_preferred_max_mm3,
-                    },
+                    }),
                     f,
                     indent=2,
                 )
@@ -594,7 +605,7 @@ def main():
 
         with open(prefix.with_name(prefix.name + "_selection.json"), "w") as f:
             json.dump(
-                {
+                json_safe({
                     "status": "ok",
                     "selected_grad_threshold": chosen["grad_threshold"],
                     "selected_moat_threshold": chosen["moat_threshold"],
@@ -614,7 +625,7 @@ def main():
                         }
                         for c in candidates
                     ],
-                },
+                }),
                 f,
                 indent=2,
             )
