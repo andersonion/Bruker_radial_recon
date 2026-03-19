@@ -109,8 +109,8 @@ def build_job_script(
     brain_grad_thresholds: str,
     brain_outer_rim_mm: float,
     brain_shell_close_iters: int,
+    brain_shell_dilate_iters: int,
     brain_shell_open_iters: int,
-    brain_shell_erode_iters: int,
     brain_shell_min_volume_mm3: float,
     brain_cavity_volume_min_mm3: float,
     brain_cavity_volume_max_mm3: float,
@@ -121,6 +121,9 @@ def build_job_script(
     brain_extent_z_min_mm: float,
     brain_extent_z_max_mm: float,
     brain_cavity_bbox_fill_frac_min: float,
+    brain_balloon_close_iters: int,
+    brain_balloon_fill_holes: bool,
+    brain_balloon_max_iters: int,
     brain_moat_thresholds: str,
     brain_shell_inner_band_mm: float,
     brain_moat_min_volume_mm3: float,
@@ -199,6 +202,7 @@ def build_job_script(
     lines.append(f"overwrite_flag={'1' if overwrite else '0'}")
     lines.append(f"tight_mask_flag={'1' if tight_mask else '0'}")
     lines.append(f"save_brain_debug_flag={'1' if save_brain_debug else '0'}")
+    lines.append(f"brain_balloon_fill_holes_flag={'1' if brain_balloon_fill_holes else '0'}")
     lines.append(f"diff_nii={shell_quote(str(diff_nii)) if diff_nii is not None else shell_quote('')}")
     lines.append(f"n4_exe={shell_quote(str(n4_path))}")
     lines.append(f"threshold_exe={shell_quote(str(thresholdimage_path))}")
@@ -332,8 +336,8 @@ def build_job_script(
     lines.append(f"        --grad_thresholds {shell_quote(brain_grad_thresholds)}")
     lines.append(f"        --outer_rim_mm {brain_outer_rim_mm}")
     lines.append(f"        --shell_close_iters {brain_shell_close_iters}")
+    lines.append(f"        --shell_dilate_iters {brain_shell_dilate_iters}")
     lines.append(f"        --shell_open_iters {brain_shell_open_iters}")
-    lines.append(f"        --shell_erode_iters {brain_shell_erode_iters}")
     lines.append(f"        --shell_min_volume_mm3 {brain_shell_min_volume_mm3}")
     lines.append(f"        --cavity_volume_min_mm3 {brain_cavity_volume_min_mm3}")
     lines.append(f"        --cavity_volume_max_mm3 {brain_cavity_volume_max_mm3}")
@@ -344,6 +348,8 @@ def build_job_script(
     lines.append(f"        --extent_z_min_mm {brain_extent_z_min_mm}")
     lines.append(f"        --extent_z_max_mm {brain_extent_z_max_mm}")
     lines.append(f"        --cavity_bbox_fill_frac_min {brain_cavity_bbox_fill_frac_min}")
+    lines.append(f"        --balloon_close_iters {brain_balloon_close_iters}")
+    lines.append(f"        --balloon_max_iters {brain_balloon_max_iters}")
     lines.append(f"        --moat_thresholds {shell_quote(brain_moat_thresholds)}")
     lines.append(f"        --shell_inner_band_mm {brain_shell_inner_band_mm}")
     lines.append(f"        --moat_min_volume_mm3 {brain_moat_min_volume_mm3}")
@@ -359,6 +365,10 @@ def build_job_script(
     lines.append(f"        --shell_gate_grad_max {brain_shell_gate_grad_max}")
     lines.append(f"        --tight_erode_iters {tight_mask_erode_iters}")
     lines.append("    )")
+    lines.append("")
+    lines.append('    if [[ "$brain_balloon_fill_holes_flag" == "1" ]]; then')
+    lines.append("        brain_cmd+=( --balloon_fill_holes )")
+    lines.append("    fi")
     lines.append("")
     lines.append('    if [[ "$tight_mask_flag" == "1" ]]; then')
     lines.append("        brain_cmd+=( --tight_mask )")
@@ -433,11 +443,11 @@ def main():
     p.add_argument("--brain_smooth_sigma", type=float, default=1.0)
     p.add_argument("--brain_grad_sigma", type=float, default=1.0)
 
-    p.add_argument("--brain_grad_thresholds", default="0.06,0.08,0.10,0.12,0.14")
+    p.add_argument("--brain_grad_thresholds", default="0.10,0.12,0.14,0.16,0.18,0.20")
     p.add_argument("--brain_outer_rim_mm", type=float, default=1.25)
-    p.add_argument("--brain_shell_close_iters", type=int, default=1)
-    p.add_argument("--brain_shell_open_iters", type=int, default=1)
-    p.add_argument("--brain_shell_erode_iters", type=int, default=1)
+    p.add_argument("--brain_shell_close_iters", type=int, default=2)
+    p.add_argument("--brain_shell_dilate_iters", type=int, default=1)
+    p.add_argument("--brain_shell_open_iters", type=int, default=0)
     p.add_argument("--brain_shell_min_volume_mm3", type=float, default=2.0)
 
     p.add_argument("--brain_cavity_volume_min_mm3", type=float, default=250.0)
@@ -450,7 +460,11 @@ def main():
     p.add_argument("--brain_extent_z_max_mm", type=float, default=30.0)
     p.add_argument("--brain_cavity_bbox_fill_frac_min", type=float, default=0.35)
 
-    p.add_argument("--brain_moat_thresholds", default="0.04,0.06,0.08,0.10,0.12,0.14")
+    p.add_argument("--brain_balloon_close_iters", type=int, default=2)
+    p.add_argument("--brain_balloon_fill_holes", action="store_true")
+    p.add_argument("--brain_balloon_max_iters", type=int, default=10000)
+
+    p.add_argument("--brain_moat_thresholds", default="0.04,0.06,0.08,0.10")
     p.add_argument("--brain_shell_inner_band_mm", type=float, default=1.25)
     p.add_argument("--brain_moat_min_volume_mm3", type=float, default=1.0)
     p.add_argument("--brain_moat_close_iters", type=int, default=1)
@@ -490,7 +504,11 @@ def main():
         return 1
 
     script_dir = Path(__file__).resolve().parent
-    helper_path = Path(args.brainmask_helper).expanduser().resolve() if args.brainmask_helper else (script_dir / "make_brain_mask_from_bfc.py")
+    helper_path = (
+        Path(args.brainmask_helper).expanduser().resolve()
+        if args.brainmask_helper
+        else (script_dir / "make_brain_mask_from_bfc.py")
+    )
     helper_source_text = read_text(helper_path)
 
     if args.runnos:
@@ -599,8 +617,8 @@ def main():
             brain_grad_thresholds=args.brain_grad_thresholds,
             brain_outer_rim_mm=args.brain_outer_rim_mm,
             brain_shell_close_iters=args.brain_shell_close_iters,
+            brain_shell_dilate_iters=args.brain_shell_dilate_iters,
             brain_shell_open_iters=args.brain_shell_open_iters,
-            brain_shell_erode_iters=args.brain_shell_erode_iters,
             brain_shell_min_volume_mm3=args.brain_shell_min_volume_mm3,
             brain_cavity_volume_min_mm3=args.brain_cavity_volume_min_mm3,
             brain_cavity_volume_max_mm3=args.brain_cavity_volume_max_mm3,
@@ -611,6 +629,9 @@ def main():
             brain_extent_z_min_mm=args.brain_extent_z_min_mm,
             brain_extent_z_max_mm=args.brain_extent_z_max_mm,
             brain_cavity_bbox_fill_frac_min=args.brain_cavity_bbox_fill_frac_min,
+            brain_balloon_close_iters=args.brain_balloon_close_iters,
+            brain_balloon_fill_holes=args.brain_balloon_fill_holes,
+            brain_balloon_max_iters=args.brain_balloon_max_iters,
             brain_moat_thresholds=args.brain_moat_thresholds,
             brain_shell_inner_band_mm=args.brain_shell_inner_band_mm,
             brain_moat_min_volume_mm3=args.brain_moat_min_volume_mm3,
