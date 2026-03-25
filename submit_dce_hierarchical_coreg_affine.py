@@ -42,7 +42,7 @@ def resolve_pipeline(args):
     launcher_dir = Path(__file__).resolve().parent
 
     if args.pipeline is None:
-        pipeline = launcher_dir / "dce_hierarchical_coreg_affine.py"
+        pipeline = launcher_dir / "dce_hierarchical_coreg.py"
     else:
         pipeline = Path(args.pipeline).resolve()
 
