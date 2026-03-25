@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import os
 import re
 import shlex
 import subprocess
@@ -12,17 +11,24 @@ from pathlib import Path
 def parse_args():
     ap = argparse.ArgumentParser(description="Submit hierarchical DCE coreg jobs")
 
-    ap.add_argument("--all-niis-dir", required=True)
-
-    # Optional now
-    ap.add_argument("--pipeline", default=None)
-
+    ap.add_argument(
+        "--all-niis-dir",
+        required=True,
+        help="Path to all_niis directory containing z<runno>/ folders",
+    )
+    ap.add_argument(
+        "--pipeline",
+        default=None,
+        help="Path to dce_hierarchical_coreg.py or dce_hierarchical_coreg_affine.py "
+             "(default: sibling of this launcher)",
+    )
     ap.add_argument("--run-glob", default="z*")
     ap.add_argument("--python", default=sys.executable)
 
     ap.add_argument("--partition", default="normal")
     ap.add_argument("--mem", default="12000M")
     ap.add_argument("--cpus-per-task", type=int, default=1)
+    ap.add_argument("--time", default=None)
 
     ap.add_argument("--affine-step", type=float, default=0.05)
     ap.add_argument("--conv-iters", default="100x100x100x20")
@@ -42,7 +48,18 @@ def resolve_pipeline(args):
     launcher_dir = Path(__file__).resolve().parent
 
     if args.pipeline is None:
-        pipeline = launcher_dir / "dce_hierarchical_coreg.py"
+        # Prefer affine pipeline if present, else fall back to non-affine name
+        affine = launcher_dir / "dce_hierarchical_coreg_affine.py"
+        vanilla = launcher_dir / "dce_hierarchical_coreg.py"
+        if affine.is_file():
+            pipeline = affine
+        elif vanilla.is_file():
+            pipeline = vanilla
+        else:
+            raise SystemExit(
+                "Could not auto-find pipeline next to launcher.\n"
+                f"Tried:\n  {affine}\n  {vanilla}"
+            )
     else:
         pipeline = Path(args.pipeline).resolve()
 
@@ -52,48 +69,133 @@ def resolve_pipeline(args):
     return pipeline
 
 
-def run(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr)
-    return p.stdout
+def run_cmd(cmd):
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed:\n  {' '.join(map(str, cmd))}\n\n"
+            f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+        )
+    return proc.stdout
 
 
-def sbatch(script):
-    out = run(["sbatch", script])
+def sbatch_submit(script_path: Path):
+    out = run_cmd(["sbatch", str(script_path)])
     m = re.search(r"Submitted batch job (\d+)", out)
     if not m:
-        raise RuntimeError(out)
+        raise RuntimeError(f"Could not parse sbatch output:\n{out}")
     return m.group(1)
 
 
-def write(path, text):
+def write_text(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     path.chmod(0o775)
 
 
-def get_nvols(python, nii):
-    code = f"import nibabel as nib;print(nib.load(r'{nii}').shape[3])"
-    return int(run([python, "-c", code]).strip())
+def get_nvols(python_exe: str, nii_path: Path) -> int:
+    code = (
+        "import nibabel as nib; "
+        f"img=nib.load(r'''{str(nii_path)}'''); "
+        "shape=img.shape; "
+        "assert len(shape)==4, f'Expected 4D, got {shape}'; "
+        "print(shape[3])"
+    )
+    out = run_cmd([python_exe, "-c", code]).strip()
+    return int(out)
+
+
+def parse_runno(run_dir: Path) -> str:
+    bn = run_dir.name
+    if bn.startswith("z") and len(bn) > 1:
+        return bn[1:]
+    return bn
+
+
+def strict_dce_files(run_dir: Path, runno: str):
+    out = []
+    for suffix in ("DCE_baseline", "DCE_block1", "DCE_block2"):
+        p = run_dir / f"{runno}_{suffix}.nii.gz"
+        if p.is_file():
+            out.append(p)
+    return out
+
+
+def shell_join(parts):
+    return " ".join(shlex.quote(str(x)) for x in parts)
+
+
+def build_job_script(
+    *,
+    job_name: str,
+    partition: str,
+    mem: str,
+    cpus_per_task: int,
+    stdout_path: Path,
+    cmd: str,
+    time_limit: str = None,
+    dependency: str = None,
+    array_spec: str = None,
+):
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={job_name}",
+        f"#SBATCH --partition={partition}",
+        f"#SBATCH --mem={mem}",
+        f"#SBATCH --cpus-per-task={cpus_per_task}",
+        f"#SBATCH --output={stdout_path}",
+        f"#SBATCH --error={stdout_path}",
+    ]
+
+    if time_limit:
+        lines.append(f"#SBATCH --time={time_limit}")
+    if dependency:
+        lines.append(f"#SBATCH --dependency={dependency}")
+    if array_spec:
+        lines.append(f"#SBATCH --array={array_spec}")
+
+    lines += [
+        "",
+        "set -euo pipefail",
+        'echo "Running on node: $(hostname)"',
+        "",
+        cmd,
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def main():
     args = parse_args()
 
-    all_niis = Path(args.all_niis_dir).resolve()
-    if not all_niis.is_dir():
-        raise SystemExit("Bad all_niis_dir")
+    all_niis_dir = Path(args.all_niis_dir).resolve()
+    if not all_niis_dir.is_dir():
+        raise SystemExit(f"Bad all_niis_dir: {all_niis_dir}")
 
     pipeline = resolve_pipeline(args)
-    python = str(Path(args.python).resolve())
+    python_exe = str(Path(args.python).resolve())
 
-    runs = sorted([p for p in all_niis.glob(args.run_glob) if p.is_dir()])
+    run_dirs = sorted([p for p in all_niis_dir.glob(args.run_glob) if p.is_dir()])
+    if not run_dirs:
+        raise SystemExit(f"No runs matched {all_niis_dir / args.run_glob}")
 
-    for run_dir in runs:
-        runno = run_dir.name[1:] if run_dir.name.startswith("z") else run_dir.name
+    common_args = [
+        "--affine_step", str(args.affine_step),
+        "--conv_iters", args.conv_iters,
+        "--conv_thresh", str(args.conv_thresh),
+        "--conv_window", str(args.conv_window),
+        "--shrink_factors", args.shrink_factors,
+        "--smoothing_sigmas", args.smoothing_sigmas,
+    ]
+    if args.verbose:
+        common_args.append("--verbose")
 
-        out_dir = all_niis / f"{runno}_coregistered"
+    submitted = 0
+    skipped = 0
+
+    for run_dir in run_dirs:
+        runno = parse_runno(run_dir)
+        out_dir = all_niis_dir / f"{runno}_coregistered"
         sbatch_dir = out_dir / "sbatch"
         work_dir = out_dir / "work"
 
@@ -105,92 +207,157 @@ def main():
 
         if args.skip_complete_runs and final_mean.exists() and t2_out.exists():
             print(f"SKIP {runno}")
+            skipped += 1
+            continue
+
+        dce_files = strict_dce_files(run_dir, runno)
+        if not dce_files:
+            print(f"SKIP {runno}: no strict DCE files found")
+            skipped += 1
             continue
 
         print(f"\n=== {runno} ===")
 
-        dce_files = list(run_dir.glob("*_DCE_*.nii.gz"))
-        if not dce_files:
-            print("No DCE files")
-            continue
+        prep_cmd = shell_join(
+            [python_exe, str(pipeline), "prep", "--run_dir", str(run_dir)] + common_args
+        )
+        prep_script = sbatch_dir / f"{runno}_prep.bash"
+        prep_log = sbatch_dir / "slurm-%j.out"
+        write_text(
+            prep_script,
+            build_job_script(
+                job_name=f"DCEprep_{runno}",
+                partition=args.partition,
+                mem=args.mem,
+                cpus_per_task=args.cpus_per_task,
+                stdout_path=prep_log,
+                cmd=prep_cmd,
+                time_limit=args.time,
+            ),
+        )
+        prep_id = "DRY" if args.dry_run else sbatch_submit(prep_script)
+        print(f"prep: {prep_id}")
 
-        common = f"--run_dir {run_dir} --affine_step {args.affine_step} " \
-                 f"--conv_iters {args.conv_iters} --conv_thresh {args.conv_thresh} " \
-                 f"--conv_window {args.conv_window} --shrink_factors {args.shrink_factors} " \
-                 f"--smoothing_sigmas {args.smoothing_sigmas}"
-
-        # PREP
-        prep_script = sbatch_dir / "prep.sh"
-        write(prep_script, f"""#!/bin/bash
-#SBATCH --mem={args.mem}
-#SBATCH --partition={args.partition}
-python3 {pipeline} prep {common}
-""")
-
-        prep_id = "DRY" if args.dry_run else sbatch(prep_script)
-        print("prep:", prep_id)
-
-        final_ids = []
+        final_apply_ids = []
 
         for dce in dce_files:
-            n = get_nvols(python, dce)
-            print(f"{dce.name}: {n} vols")
+            nvols = get_nvols(python_exe, dce)
+            tag = dce.name.replace(".nii.gz", "")
+            print(f"  {dce.name}: {nvols} vols")
 
-            tag = dce.stem
+            local_reg_cmd = shell_join(
+                [python_exe, str(pipeline), "local_reg", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
+            )
+            local_reg_script = sbatch_dir / f"{tag}_local_reg_array.bash"
+            local_reg_log = sbatch_dir / "slurm-%A_%a.out"
+            write_text(
+                local_reg_script,
+                build_job_script(
+                    job_name=f"LocReg_{runno}",
+                    partition=args.partition,
+                    mem=args.mem,
+                    cpus_per_task=args.cpus_per_task,
+                    stdout_path=local_reg_log,
+                    cmd=local_reg_cmd,
+                    time_limit=args.time,
+                    dependency=None if prep_id == "DRY" else f"afterok:{prep_id}",
+                    array_spec=f"0-{nvols - 1}",
+                ),
+            )
+            local_reg_id = "DRY" if args.dry_run else sbatch_submit(local_reg_script)
+            print(f"    local_reg: {local_reg_id}")
 
-            # LOCAL REG ARRAY
-            s = sbatch_dir / f"{tag}_local.sh"
-            write(s, f"""#!/bin/bash
-#SBATCH --mem={args.mem}
-#SBATCH --partition={args.partition}
-#SBATCH --array=0-{n-1}
-#SBATCH --dependency=afterok:{prep_id}
-python3 {pipeline} local_reg {common} --dce_nifti {dce}
-""")
-            jid1 = "DRY" if args.dry_run else sbatch(s)
+            local_mean_cmd = shell_join(
+                [python_exe, str(pipeline), "local_mean", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
+            )
+            local_mean_script = sbatch_dir / f"{tag}_local_mean.bash"
+            local_mean_log = sbatch_dir / "slurm-%j.out"
+            write_text(
+                local_mean_script,
+                build_job_script(
+                    job_name=f"LocMean_{runno}",
+                    partition=args.partition,
+                    mem=args.mem,
+                    cpus_per_task=args.cpus_per_task,
+                    stdout_path=local_mean_log,
+                    cmd=local_mean_cmd,
+                    time_limit=args.time,
+                    dependency=None if local_reg_id == "DRY" else f"afterok:{local_reg_id}",
+                ),
+            )
+            local_mean_id = "DRY" if args.dry_run else sbatch_submit(local_mean_script)
+            print(f"    local_mean: {local_mean_id}")
 
-            # LOCAL MEAN
-            s = sbatch_dir / f"{tag}_mean.sh"
-            write(s, f"""#!/bin/bash
-#SBATCH --mem={args.mem}
-#SBATCH --dependency=afterok:{jid1}
-python3 {pipeline} local_mean {common} --dce_nifti {dce}
-""")
-            jid2 = "DRY" if args.dry_run else sbatch(s)
+            mean_to_global_cmd = shell_join(
+                [python_exe, str(pipeline), "mean_to_global", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
+            )
+            mean_to_global_script = sbatch_dir / f"{tag}_mean_to_global.bash"
+            mean_to_global_log = sbatch_dir / "slurm-%j.out"
+            write_text(
+                mean_to_global_script,
+                build_job_script(
+                    job_name=f"Mean2Glob_{runno}",
+                    partition=args.partition,
+                    mem=args.mem,
+                    cpus_per_task=args.cpus_per_task,
+                    stdout_path=mean_to_global_log,
+                    cmd=mean_to_global_cmd,
+                    time_limit=args.time,
+                    dependency=None if local_mean_id == "DRY" else f"afterok:{local_mean_id}",
+                ),
+            )
+            mean_to_global_id = "DRY" if args.dry_run else sbatch_submit(mean_to_global_script)
+            print(f"    mean_to_global: {mean_to_global_id}")
 
-            # GLOBAL REG
-            s = sbatch_dir / f"{tag}_glob.sh"
-            write(s, f"""#!/bin/bash
-#SBATCH --mem={args.mem}
-#SBATCH --dependency=afterok:{jid2}
-python3 {pipeline} mean_to_global {common} --dce_nifti {dce}
-""")
-            jid3 = "DRY" if args.dry_run else sbatch(s)
+            final_apply_cmd = shell_join(
+                [python_exe, str(pipeline), "final_apply", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
+            )
+            final_apply_script = sbatch_dir / f"{tag}_final_apply_array.bash"
+            final_apply_log = sbatch_dir / "slurm-%A_%a.out"
+            write_text(
+                final_apply_script,
+                build_job_script(
+                    job_name=f"FinalApply_{runno}",
+                    partition=args.partition,
+                    mem=args.mem,
+                    cpus_per_task=args.cpus_per_task,
+                    stdout_path=final_apply_log,
+                    cmd=final_apply_cmd,
+                    time_limit=args.time,
+                    dependency=None if mean_to_global_id == "DRY" else f"afterok:{mean_to_global_id}",
+                    array_spec=f"0-{nvols - 1}",
+                ),
+            )
+            final_apply_id = "DRY" if args.dry_run else sbatch_submit(final_apply_script)
+            print(f"    final_apply: {final_apply_id}")
+            final_apply_ids.append(final_apply_id)
 
-            # FINAL APPLY ARRAY
-            s = sbatch_dir / f"{tag}_final.sh"
-            write(s, f"""#!/bin/bash
-#SBATCH --mem={args.mem}
-#SBATCH --array=0-{n-1}
-#SBATCH --dependency=afterok:{jid3}
-python3 {pipeline} final_apply {common} --dce_nifti {dce}
-""")
-            jid4 = "DRY" if args.dry_run else sbatch(s)
+        finalize_cmd = shell_join(
+            [python_exe, str(pipeline), "finalize", "--run_dir", str(run_dir)] + common_args
+        )
+        finalize_script = sbatch_dir / f"{runno}_finalize.bash"
+        finalize_log = sbatch_dir / "slurm-%j.out"
+        finalize_dep = None if (args.dry_run or not final_apply_ids) else "afterok:" + ":".join(final_apply_ids)
+        write_text(
+            finalize_script,
+            build_job_script(
+                job_name=f"DCEfinal_{runno}",
+                partition=args.partition,
+                mem=args.mem,
+                cpus_per_task=args.cpus_per_task,
+                stdout_path=finalize_log,
+                cmd=finalize_cmd,
+                time_limit=args.time,
+                dependency=finalize_dep,
+            ),
+        )
+        finalize_id = "DRY" if args.dry_run else sbatch_submit(finalize_script)
+        print(f"finalize: {finalize_id}")
 
-            final_ids.append(jid4)
+        submitted += 1
 
-        dep = ":".join(final_ids)
-
-        # FINALIZE
-        s = sbatch_dir / "final.sh"
-        write(s, f"""#!/bin/bash
-#SBATCH --mem={args.mem}
-#SBATCH --dependency=afterok:{dep}
-python3 {pipeline} finalize {common}
-""")
-        jid = "DRY" if args.dry_run else sbatch(s)
-
-        print("final:", jid)
+    print(f"\nSubmitted runs: {submitted}")
+    print(f"Skipped runs:   {skipped}")
 
 
 if __name__ == "__main__":
