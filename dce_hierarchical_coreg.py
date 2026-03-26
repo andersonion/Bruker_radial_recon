@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Hierarchical DCE coregistration pipeline with STRICT T2 lookup:
-    only ${runno}_T2.nii.gz is accepted as the T2 input.
+Hierarchical DCE coregistration pipeline with STRICT T2 lookup and
+two-pass gradient-assisted final T2 registration.
 
-This script assumes:
+STRICT input rules:
     all_niis/z<runno>/
         <runno>_DCE_baseline.nii.gz
         <runno>_DCE_block1.nii.gz
         <runno>_DCE_block2.nii.gz
         <runno>_T2.nii.gz
+
+Everything else is ignored.
 
 Outputs go to:
     all_niis/<runno>_coregistered/
@@ -18,6 +20,38 @@ Outputs go to:
         <same-basename final T2 file>
         <runno>_meanDCE_initial_allvols.nii.gz
         <runno>_meanDCE_coregistered_allvols.nii.gz
+
+Pipeline:
+    prep:
+        - per-DCE initial mean
+        - global initial mean across all original DCE volumes
+
+    local_reg:
+        - register each original DCE volume -> its own per-DCE initial mean
+
+    local_mean:
+        - mean of locally warped volumes for that DCE
+
+    mean_to_global:
+        - register that DCE's local-coreg mean -> global initial mean
+
+    final_apply:
+        - apply composite affine (local + mean_to_global) to each original DCE volume
+
+    finalize:
+        - collate final DCE 4Ds
+        - compute final global mean across all fully coregistered DCE volumes
+        - register T2 -> final global mean using:
+            pass 1: raw intensity affine
+            pass 2: gradient-magnitude affine refinement
+        - apply composite transform to original T2
+
+Dependencies:
+    - numpy
+    - nibabel
+    - ANTs in PATH:
+        antsRegistration
+        antsApplyTransforms
 """
 
 import argparse
@@ -85,6 +119,62 @@ def save_4d_like(data4d, ref_img, out_path):
     out = nib.Nifti1Image(data4d.astype(np.float32), ref_img.affine, hdr)
     out.header.set_data_dtype(np.float32)
     nib.save(out, str(out_path))
+
+
+def smooth1d_axis(arr, kernel, axis):
+    pad = len(kernel) // 2
+    pad_width = [(0, 0)] * arr.ndim
+    pad_width[axis] = (pad, pad)
+    padded = np.pad(arr, pad_width, mode="edge")
+
+    def conv_func(v):
+        return np.convolve(v, kernel, mode="valid")
+
+    return np.apply_along_axis(conv_func, axis, padded)
+
+
+def smooth3d_binomial(data, passes=1):
+    """
+    Very lightweight smoothing to stabilize gradient magnitude.
+    Kernel is [1,4,6,4,1]/16, applied separably.
+    """
+    if passes <= 0:
+        return data.astype(np.float32)
+
+    kernel = np.array([1, 4, 6, 4, 1], dtype=np.float32)
+    kernel /= np.sum(kernel)
+
+    out = data.astype(np.float32, copy=True)
+    for _ in range(passes):
+        out = smooth1d_axis(out, kernel, axis=0)
+        out = smooth1d_axis(out, kernel, axis=1)
+        out = smooth1d_axis(out, kernel, axis=2)
+    return out.astype(np.float32)
+
+
+def gradient_magnitude_3d(data, zooms=None):
+    """
+    Compute gradient magnitude using numpy.gradient.
+    """
+    if zooms is None:
+        gx, gy, gz = np.gradient(data.astype(np.float32))
+    else:
+        gx, gy, gz = np.gradient(
+            data.astype(np.float32),
+            float(zooms[0]),
+            float(zooms[1]),
+            float(zooms[2]),
+        )
+    gm = np.sqrt(gx * gx + gy * gy + gz * gz, dtype=np.float32)
+    return gm.astype(np.float32)
+
+
+def write_gradient_mag_image(in_img: nib.Nifti1Image, in_data: np.ndarray, out_path: Path, smooth_passes: int):
+    sm = smooth3d_binomial(in_data, passes=smooth_passes)
+    zooms = in_img.header.get_zooms()[:3]
+    gm = gradient_magnitude_3d(sm, zooms=zooms)
+    save_3d_like(gm, in_img, out_path)
+    return out_path
 
 
 def ants_affine_reg(
@@ -441,6 +531,7 @@ def cmd_final_apply(args):
 
 def cmd_finalize(args):
     require_exe("antsRegistration")
+    require_exe("antsApplyTransforms")
 
     run_dir = Path(args.run_dir).resolve()
     runno, out_dir, work_dir, _, dce_inputs, t2_input = get_paths(run_dir)
@@ -477,13 +568,22 @@ def cmd_finalize(args):
 
     final_mean = out_dir / f"{runno}_meanDCE_coregistered_allvols.nii.gz"
     compute_mean_across_all_3d_vols(final_4d_paths, final_mean)
+    print(f"FINAL_MEAN {final_mean}")
 
+    #
+    # Two-pass T2 registration:
+    #   pass 1: raw T2 -> final_mean
+    #   pass 2: gradient-magnitude(pass1 warped T2) -> gradient-magnitude(final_mean)
+    #   apply composite [pass2_aff, pass1_aff] to original T2
+    #
     t2_out = out_dir / t2_input.name
-    prefix = work_dir / "T2_to_finalMean_"
-    out = ants_affine_reg(
+
+    # Pass 1
+    t2_pass1_prefix = work_dir / "T2_to_finalMean_pass1_"
+    pass1 = ants_affine_reg(
         fixed=final_mean,
         moving=t2_input,
-        out_prefix=prefix,
+        out_prefix=t2_pass1_prefix,
         affine_step=args.affine_step,
         conv_iters=args.conv_iters,
         conv_thresh=args.conv_thresh,
@@ -492,9 +592,52 @@ def cmd_finalize(args):
         smoothing_sigmas=args.smoothing_sigmas,
         verbose=args.verbose,
     )
-    shutil.copy2(out["warped"], t2_out)
+
+    # Build gradient images
+    final_mean_img, final_mean_dat = load_3d(final_mean)
+    pass1_img, pass1_dat = load_3d(pass1["warped"])
+
+    fixed_grad = work_dir / "T2_to_finalMean_fixed_grad.nii.gz"
+    moving_grad = work_dir / "T2_to_finalMean_pass1Warped_grad.nii.gz"
+
+    write_gradient_mag_image(
+        in_img=final_mean_img,
+        in_data=final_mean_dat,
+        out_path=fixed_grad,
+        smooth_passes=args.t2_grad_smooth_passes,
+    )
+    write_gradient_mag_image(
+        in_img=pass1_img,
+        in_data=pass1_dat,
+        out_path=moving_grad,
+        smooth_passes=args.t2_grad_smooth_passes,
+    )
+
+    # Pass 2
+    t2_pass2_prefix = work_dir / "T2_to_finalMean_pass2_grad_"
+    pass2 = ants_affine_reg(
+        fixed=fixed_grad,
+        moving=moving_grad,
+        out_prefix=t2_pass2_prefix,
+        affine_step=args.t2_grad_affine_step,
+        conv_iters=args.t2_grad_conv_iters,
+        conv_thresh=args.t2_grad_conv_thresh,
+        conv_window=args.t2_grad_conv_window,
+        shrink_factors=args.t2_grad_shrink_factors,
+        smoothing_sigmas=args.t2_grad_smoothing_sigmas,
+        verbose=args.verbose,
+    )
+
+    # Apply composite to ORIGINAL T2
+    ants_apply_transforms(
+        fixed=final_mean,
+        moving=t2_input,
+        out_path=t2_out,
+        transforms=[pass2["affine"], pass1["affine"]],
+        verbose=args.verbose,
+    )
+
     print(f"T2_FINAL {t2_out}")
-    print(f"FINAL_MEAN {final_mean}")
     return 0
 
 
@@ -509,6 +652,16 @@ def main():
         p.add_argument("--conv_window", type=int, default=15)
         p.add_argument("--shrink_factors", default="8x4x2x1")
         p.add_argument("--smoothing_sigmas", default="3x2x1x0vox")
+
+        # T2 gradient-refinement controls
+        p.add_argument("--t2_grad_affine_step", type=float, default=0.02)
+        p.add_argument("--t2_grad_conv_iters", default="100x100x100x20")
+        p.add_argument("--t2_grad_conv_thresh", type=float, default=1e-7)
+        p.add_argument("--t2_grad_conv_window", type=int, default=15)
+        p.add_argument("--t2_grad_shrink_factors", default="8x4x2x1")
+        p.add_argument("--t2_grad_smoothing_sigmas", default="3x2x1x0vox")
+        p.add_argument("--t2_grad_smooth_passes", type=int, default=1)
+
         p.add_argument("--verbose", action="store_true")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
