@@ -30,6 +30,9 @@ def parse_args():
     ap.add_argument("--cpus-per-task", type=int, default=1)
     ap.add_argument("--time", default=None)
 
+    ap.add_argument("--first-round-target", choices=["mean", "firstvol"], default="mean")
+    ap.add_argument("--reg-smooth-passes", type=int, default=0)
+
     ap.add_argument("--affine-step", type=float, default=0.05)
     ap.add_argument("--conv-iters", default="100x100x100x20")
     ap.add_argument("--conv-thresh", type=float, default=1e-7)
@@ -37,37 +40,42 @@ def parse_args():
     ap.add_argument("--shrink-factors", default="8x4x2x1")
     ap.add_argument("--smoothing-sigmas", default="3x2x1x0vox")
 
-    # Optional pass-through knobs for the updated T2 gradient-refinement pipeline
+    ap.add_argument("--t2-rigid-step", type=float, default=0.1)
+    ap.add_argument("--t2-rigid-conv-iters", default="100x100x100x20")
+    ap.add_argument("--t2-rigid-conv-thresh", type=float, default=1e-7)
+    ap.add_argument("--t2-rigid-conv-window", type=int, default=15)
+    ap.add_argument("--t2-rigid-shrink-factors", default="8x4x2x1")
+    ap.add_argument("--t2-rigid-smoothing-sigmas", default="3x2x1x0vox")
+
+    ap.add_argument("--t2-affine-step", type=float, default=0.025)
+    ap.add_argument("--t2-affine-conv-iters", default="100x100x100x20")
+    ap.add_argument("--t2-affine-conv-thresh", type=float, default=1e-7)
+    ap.add_argument("--t2-affine-conv-window", type=int, default=15)
+    ap.add_argument("--t2-affine-shrink-factors", default="8x4x2x1")
+    ap.add_argument("--t2-affine-smoothing-sigmas", default="3x2x1x0vox")
+
+    ap.add_argument("--t2-grad-rigid-step", type=float, default=0.05)
+    ap.add_argument("--t2-grad-rigid-conv-iters", default="100x100x100x20")
+    ap.add_argument("--t2-grad-rigid-conv-thresh", type=float, default=1e-7)
+    ap.add_argument("--t2-grad-rigid-conv-window", type=int, default=15)
+    ap.add_argument("--t2-grad-rigid-shrink-factors", default="8x4x2x1")
+    ap.add_argument("--t2-grad-rigid-smoothing-sigmas", default="3x2x1x0vox")
+
     ap.add_argument("--t2-grad-affine-step", type=float, default=0.02)
-    ap.add_argument("--t2-grad-conv-iters", default="100x100x100x20")
-    ap.add_argument("--t2-grad-conv-thresh", type=float, default=1e-7)
-    ap.add_argument("--t2-grad-conv-window", type=int, default=15)
-    ap.add_argument("--t2-grad-shrink-factors", default="8x4x2x1")
-    ap.add_argument("--t2-grad-smoothing-sigmas", default="3x2x1x0vox")
+    ap.add_argument("--t2-grad-affine-conv-iters", default="100x100x100x20")
+    ap.add_argument("--t2-grad-affine-conv-thresh", type=float, default=1e-7)
+    ap.add_argument("--t2-grad-affine-conv-window", type=int, default=15)
+    ap.add_argument("--t2-grad-affine-shrink-factors", default="8x4x2x1")
+    ap.add_argument("--t2-grad-affine-smoothing-sigmas", default="3x2x1x0vox")
     ap.add_argument("--t2-grad-smooth-passes", type=int, default=1)
 
     ap.add_argument("--skip-complete-runs", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
 
-    ap.add_argument(
-        "--submit-retries",
-        type=int,
-        default=8,
-        help="Number of sbatch retry attempts on temporary submission failures",
-    )
-    ap.add_argument(
-        "--submit-sleep-seconds",
-        type=float,
-        default=10.0,
-        help="Initial sleep before retrying sbatch after temporary failure",
-    )
-    ap.add_argument(
-        "--inter-submit-delay",
-        type=float,
-        default=0.25,
-        help="Delay after each successful sbatch so we do not hammer Slurm",
-    )
+    ap.add_argument("--submit-retries", type=int, default=8)
+    ap.add_argument("--submit-sleep-seconds", type=float, default=10.0)
+    ap.add_argument("--inter-submit-delay", type=float, default=0.25)
 
     return ap.parse_args()
 
@@ -138,15 +146,11 @@ def sbatch_submit(script_path: Path, retries: int, sleep_seconds: float, inter_s
 
         delay = sleep_seconds * (2 ** (attempt - 1))
         if verbose:
-            print(
-                f"      sbatch temporary failure on attempt {attempt}/{retries}; "
-                f"sleeping {delay:.1f}s then retrying"
-            )
+            print(f"      sbatch temporary failure on attempt {attempt}/{retries}; sleeping {delay:.1f}s then retrying")
         time.sleep(delay)
 
     raise RuntimeError(
-        f"sbatch failed after {retries} attempts for {script_path}\n\n"
-        f"STDOUT:\n{last_stdout}\n\nSTDERR:\n{last_stderr}"
+        f"sbatch failed after retries for {script_path}\n\nSTDOUT:\n{last_stdout}\n\nSTDERR:\n{last_stderr}"
     )
 
 
@@ -166,9 +170,7 @@ def get_nvols(python_exe: str, nii_path: Path) -> int:
     )
     rc, out, err = run_cmd([python_exe, "-c", code])
     if rc != 0:
-        raise RuntimeError(
-            f"Failed to read number of volumes from {nii_path}\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}"
-        )
+        raise RuntimeError(f"Failed to read number of volumes from {nii_path}\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}")
     return int(out.strip())
 
 
@@ -247,18 +249,43 @@ def main():
         raise SystemExit(f"No runs matched {all_niis_dir / args.run_glob}")
 
     common_args = [
+        "--first_round_target", args.first_round_target,
+        "--reg_smooth_passes", str(args.reg_smooth_passes),
+
         "--affine_step", str(args.affine_step),
         "--conv_iters", args.conv_iters,
         "--conv_thresh", str(args.conv_thresh),
         "--conv_window", str(args.conv_window),
         "--shrink_factors", args.shrink_factors,
         "--smoothing_sigmas", args.smoothing_sigmas,
+
+        "--t2_rigid_step", str(args.t2_rigid_step),
+        "--t2_rigid_conv_iters", args.t2_rigid_conv_iters,
+        "--t2_rigid_conv_thresh", str(args.t2_rigid_conv_thresh),
+        "--t2_rigid_conv_window", str(args.t2_rigid_conv_window),
+        "--t2_rigid_shrink_factors", args.t2_rigid_shrink_factors,
+        "--t2_rigid_smoothing_sigmas", args.t2_rigid_smoothing_sigmas,
+
+        "--t2_affine_step", str(args.t2_affine_step),
+        "--t2_affine_conv_iters", args.t2_affine_conv_iters,
+        "--t2_affine_conv_thresh", str(args.t2_affine_conv_thresh),
+        "--t2_affine_conv_window", str(args.t2_affine_conv_window),
+        "--t2_affine_shrink_factors", args.t2_affine_shrink_factors,
+        "--t2_affine_smoothing_sigmas", args.t2_affine_smoothing_sigmas,
+
+        "--t2_grad_rigid_step", str(args.t2_grad_rigid_step),
+        "--t2_grad_rigid_conv_iters", args.t2_grad_rigid_conv_iters,
+        "--t2_grad_rigid_conv_thresh", str(args.t2_grad_rigid_conv_thresh),
+        "--t2_grad_rigid_conv_window", str(args.t2_grad_rigid_conv_window),
+        "--t2_grad_rigid_shrink_factors", args.t2_grad_rigid_shrink_factors,
+        "--t2_grad_rigid_smoothing_sigmas", args.t2_grad_rigid_smoothing_sigmas,
+
         "--t2_grad_affine_step", str(args.t2_grad_affine_step),
-        "--t2_grad_conv_iters", args.t2_grad_conv_iters,
-        "--t2_grad_conv_thresh", str(args.t2_grad_conv_thresh),
-        "--t2_grad_conv_window", str(args.t2_grad_conv_window),
-        "--t2_grad_shrink_factors", args.t2_grad_shrink_factors,
-        "--t2_grad_smoothing_sigmas", args.t2_grad_smoothing_sigmas,
+        "--t2_grad_affine_conv_iters", args.t2_grad_affine_conv_iters,
+        "--t2_grad_affine_conv_thresh", str(args.t2_grad_affine_conv_thresh),
+        "--t2_grad_affine_conv_window", str(args.t2_grad_affine_conv_window),
+        "--t2_grad_affine_shrink_factors", args.t2_grad_affine_shrink_factors,
+        "--t2_grad_affine_smoothing_sigmas", args.t2_grad_affine_smoothing_sigmas,
         "--t2_grad_smooth_passes", str(args.t2_grad_smooth_passes),
     ]
     if args.verbose:
@@ -294,7 +321,6 @@ def main():
         print(f"\n=== {runno} ===")
 
         try:
-            # prep
             prep_cmd = shell_join(
                 [python_exe, str(pipeline), "prep", "--run_dir", str(run_dir)] + common_args
             )
@@ -312,15 +338,8 @@ def main():
                     time_limit=args.time,
                 ),
             )
-            prep_id = (
-                "DRY" if args.dry_run else
-                sbatch_submit(
-                    prep_script,
-                    retries=args.submit_retries,
-                    sleep_seconds=args.submit_sleep_seconds,
-                    inter_submit_delay=args.inter_submit_delay,
-                    verbose=args.verbose,
-                )
+            prep_id = "DRY" if args.dry_run else sbatch_submit(
+                prep_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
             )
             print(f"prep: {prep_id}")
 
@@ -331,7 +350,6 @@ def main():
                 tag = dce.name.replace(".nii.gz", "")
                 print(f"  {dce.name}: {nvols} vols")
 
-                # local_reg array
                 local_reg_cmd = shell_join(
                     [python_exe, str(pipeline), "local_reg", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -351,19 +369,11 @@ def main():
                         array_spec=f"0-{nvols - 1}",
                     ),
                 )
-                local_reg_id = (
-                    "DRY" if args.dry_run else
-                    sbatch_submit(
-                        local_reg_script,
-                        retries=args.submit_retries,
-                        sleep_seconds=args.submit_sleep_seconds,
-                        inter_submit_delay=args.inter_submit_delay,
-                        verbose=args.verbose,
-                    )
+                local_reg_id = "DRY" if args.dry_run else sbatch_submit(
+                    local_reg_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
                 )
                 print(f"    local_reg: {local_reg_id}")
 
-                # local_mean
                 local_mean_cmd = shell_join(
                     [python_exe, str(pipeline), "local_mean", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -382,19 +392,11 @@ def main():
                         dependency=None if local_reg_id == "DRY" else f"afterany:{local_reg_id}",
                     ),
                 )
-                local_mean_id = (
-                    "DRY" if args.dry_run else
-                    sbatch_submit(
-                        local_mean_script,
-                        retries=args.submit_retries,
-                        sleep_seconds=args.submit_sleep_seconds,
-                        inter_submit_delay=args.inter_submit_delay,
-                        verbose=args.verbose,
-                    )
+                local_mean_id = "DRY" if args.dry_run else sbatch_submit(
+                    local_mean_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
                 )
                 print(f"    local_mean: {local_mean_id}")
 
-                # mean_to_global
                 mean_to_global_cmd = shell_join(
                     [python_exe, str(pipeline), "mean_to_global", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -413,19 +415,11 @@ def main():
                         dependency=None if local_mean_id == "DRY" else f"afterok:{local_mean_id}",
                     ),
                 )
-                mean_to_global_id = (
-                    "DRY" if args.dry_run else
-                    sbatch_submit(
-                        mean_to_global_script,
-                        retries=args.submit_retries,
-                        sleep_seconds=args.submit_sleep_seconds,
-                        inter_submit_delay=args.inter_submit_delay,
-                        verbose=args.verbose,
-                    )
+                mean_to_global_id = "DRY" if args.dry_run else sbatch_submit(
+                    mean_to_global_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
                 )
                 print(f"    mean_to_global: {mean_to_global_id}")
 
-                # final_apply array
                 final_apply_cmd = shell_join(
                     [python_exe, str(pipeline), "final_apply", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -445,20 +439,12 @@ def main():
                         array_spec=f"0-{nvols - 1}",
                     ),
                 )
-                final_apply_id = (
-                    "DRY" if args.dry_run else
-                    sbatch_submit(
-                        final_apply_script,
-                        retries=args.submit_retries,
-                        sleep_seconds=args.submit_sleep_seconds,
-                        inter_submit_delay=args.inter_submit_delay,
-                        verbose=args.verbose,
-                    )
+                final_apply_id = "DRY" if args.dry_run else sbatch_submit(
+                    final_apply_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
                 )
                 print(f"    final_apply: {final_apply_id}")
                 final_apply_ids.append(final_apply_id)
 
-            # finalize
             finalize_cmd = shell_join(
                 [python_exe, str(pipeline), "finalize", "--run_dir", str(run_dir)] + common_args
             )
@@ -478,15 +464,8 @@ def main():
                     dependency=finalize_dep,
                 ),
             )
-            finalize_id = (
-                "DRY" if args.dry_run else
-                sbatch_submit(
-                    finalize_script,
-                    retries=args.submit_retries,
-                    sleep_seconds=args.submit_sleep_seconds,
-                    inter_submit_delay=args.inter_submit_delay,
-                    verbose=args.verbose,
-                )
+            finalize_id = "DRY" if args.dry_run else sbatch_submit(
+                finalize_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
             )
             print(f"finalize: {finalize_id}")
 

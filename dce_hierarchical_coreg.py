@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Hierarchical DCE coregistration pipeline with STRICT T2 lookup and
-two-pass gradient-assisted final T2 registration.
+Hierarchical DCE coregistration pipeline with:
+- strict T2 lookup: only ${runno}_T2.nii.gz
+- optional first-round local target:
+    * mean of 4D  (default)
+    * first volume of 4D
+- optional light smoothing before registration (registration inputs only)
+- T2 registration split into rigid and affine stages, then gradient rigid+affine refinement
 
-STRICT input rules:
+Strict input rules:
     all_niis/z<runno>/
         <runno>_DCE_baseline.nii.gz
         <runno>_DCE_block1.nii.gz
@@ -20,38 +25,6 @@ Outputs go to:
         <same-basename final T2 file>
         <runno>_meanDCE_initial_allvols.nii.gz
         <runno>_meanDCE_coregistered_allvols.nii.gz
-
-Pipeline:
-    prep:
-        - per-DCE initial mean
-        - global initial mean across all original DCE volumes
-
-    local_reg:
-        - register each original DCE volume -> its own per-DCE initial mean
-
-    local_mean:
-        - mean of locally warped volumes for that DCE
-
-    mean_to_global:
-        - register that DCE's local-coreg mean -> global initial mean
-
-    final_apply:
-        - apply composite affine (local + mean_to_global) to each original DCE volume
-
-    finalize:
-        - collate final DCE 4Ds
-        - compute final global mean across all fully coregistered DCE volumes
-        - register T2 -> final global mean using:
-            pass 1: raw intensity affine
-            pass 2: gradient-magnitude affine refinement
-        - apply composite transform to original T2
-
-Dependencies:
-    - numpy
-    - nibabel
-    - ANTs in PATH:
-        antsRegistration
-        antsApplyTransforms
 """
 
 import argparse
@@ -134,10 +107,6 @@ def smooth1d_axis(arr, kernel, axis):
 
 
 def smooth3d_binomial(data, passes=1):
-    """
-    Very lightweight smoothing to stabilize gradient magnitude.
-    Kernel is [1,4,6,4,1]/16, applied separably.
-    """
     if passes <= 0:
         return data.astype(np.float32)
 
@@ -153,9 +122,6 @@ def smooth3d_binomial(data, passes=1):
 
 
 def gradient_magnitude_3d(data, zooms=None):
-    """
-    Compute gradient magnitude using numpy.gradient.
-    """
     if zooms is None:
         gx, gy, gz = np.gradient(data.astype(np.float32))
     else:
@@ -177,18 +143,30 @@ def write_gradient_mag_image(in_img: nib.Nifti1Image, in_data: np.ndarray, out_p
     return out_path
 
 
-def ants_affine_reg(
+def maybe_write_smoothed_image(in_img: nib.Nifti1Image, in_data: np.ndarray, out_path: Path, smooth_passes: int):
+    sm = smooth3d_binomial(in_data, passes=smooth_passes)
+    save_3d_like(sm, in_img, out_path)
+    return out_path
+
+
+def ants_linear_reg(
+    *,
     fixed: Path,
     moving: Path,
     out_prefix: Path,
-    affine_step: float,
+    transform_type: str,
+    step_size: float,
     conv_iters: str,
     conv_thresh: float,
     conv_window: int,
     shrink_factors: str,
     smoothing_sigmas: str,
+    initial_transform: Path = None,
     verbose=False,
 ):
+    if transform_type not in ("Rigid", "Affine"):
+        raise ValueError(f"Unsupported transform_type: {transform_type}")
+
     warped = Path(str(out_prefix) + "Warped.nii.gz")
     affine = Path(str(out_prefix) + "0GenericAffine.mat")
 
@@ -197,8 +175,14 @@ def ants_affine_reg(
         "--float",
         "-d", "3",
         "-v", "1",
+    ]
+
+    if initial_transform is not None:
+        cmd += ["-r", str(initial_transform)]
+
+    cmd += [
         "-m", f"Mattes[{fixed},{moving},1,32,regular,0.3]",
-        "-t", f"Affine[{affine_step}]",
+        "-t", f"{transform_type}[{step_size}]",
         "-c", f"[{conv_iters},{conv_thresh},{conv_window}]",
         "-s", smoothing_sigmas,
         "-f", shrink_factors,
@@ -206,6 +190,7 @@ def ants_affine_reg(
         "-z", "1",
         "-o", f"[{out_prefix},{warped}]",
     ]
+
     run_cmd(cmd, verbose=verbose)
 
     if not warped.exists():
@@ -238,6 +223,13 @@ def compute_mean_from_single_4d(nifti_4d: Path, out_mean_3d: Path):
     mean3d = np.mean(data, axis=3, dtype=np.float64).astype(np.float32)
     save_3d_like(mean3d, img, out_mean_3d)
     return out_mean_3d
+
+
+def extract_first_vol_from_4d(nifti_4d: Path, out_3d: Path):
+    img, data = load_4d(nifti_4d)
+    first = data[..., 0].astype(np.float32)
+    save_3d_like(first, img, out_3d)
+    return out_3d
 
 
 def compute_mean_across_all_3d_vols(dce_4d_paths, out_mean_3d: Path):
@@ -288,10 +280,6 @@ def compute_mean_from_3d_stack(vol_paths, ref_img, out_mean_3d: Path):
 
 
 def strict_t2_input(run_dir: Path, runno: str) -> Path:
-    """
-    STRICT lookup:
-        only ${runno}_T2.nii.gz is accepted.
-    """
     p = run_dir / f"{runno}_T2.nii.gz"
     if not p.is_file():
         raise RuntimeError(
@@ -331,8 +319,13 @@ def manifest_dir_for(work_dir: Path, dce_path: Path):
     return work_dir / "per_nifti" / dce_path.name
 
 
-def local_mean_initial_path(out_dir: Path, dce_path: Path):
-    return out_dir / f"{strip_nii_gz(dce_path.name)}_mean_initial.nii.gz"
+def local_round1_target_path(out_dir: Path, dce_path: Path, target_mode: str):
+    stem = strip_nii_gz(dce_path.name)
+    if target_mode == "mean":
+        return out_dir / f"{stem}_round1_target_mean.nii.gz"
+    if target_mode == "firstvol":
+        return out_dir / f"{stem}_round1_target_firstvol.nii.gz"
+    raise ValueError(f"Unknown target_mode: {target_mode}")
 
 
 def local_mean_coreg_path(out_dir: Path, dce_path: Path):
@@ -359,6 +352,19 @@ def mean_to_global_prefix(work_dir: Path, dce_path: Path):
     return manifest_dir_for(work_dir, dce_path) / "mean_to_global_xfm" / "mean_"
 
 
+def get_local_round1_fixed_for_registration(out_dir: Path, work_dir: Path, dce_path: Path, target_mode: str, reg_smooth_passes: int):
+    base_target = local_round1_target_path(out_dir, dce_path, target_mode)
+    fixed_img, fixed_dat = load_3d(base_target)
+
+    if reg_smooth_passes > 0:
+        reg_fixed = manifest_dir_for(work_dir, dce_path) / "round1_fixed_smoothed.nii.gz"
+        reg_fixed.parent.mkdir(parents=True, exist_ok=True)
+        maybe_write_smoothed_image(fixed_img, fixed_dat, reg_fixed, reg_smooth_passes)
+        return reg_fixed
+
+    return base_target
+
+
 def cmd_prep(args):
     run_dir = Path(args.run_dir).resolve()
     runno, out_dir, work_dir, _, dce_inputs, _ = get_paths(run_dir)
@@ -381,9 +387,15 @@ def cmd_prep(args):
 
         (md / "n_tasks.txt").write_text(f"{nT}\n")
 
-        mean_initial = local_mean_initial_path(out_dir, dce)
-        compute_mean_from_single_4d(dce, mean_initial)
-        print(f"Prepared {dce.name}: {nT} tasks")
+        target_path = local_round1_target_path(out_dir, dce, args.first_round_target)
+        if args.first_round_target == "mean":
+            compute_mean_from_single_4d(dce, target_path)
+        elif args.first_round_target == "firstvol":
+            extract_first_vol_from_4d(dce, target_path)
+        else:
+            raise SystemExit(f"Unknown --first-round-target: {args.first_round_target}")
+
+        print(f"Prepared {dce.name}: {nT} tasks, round1 target={args.first_round_target}")
 
     global_initial = out_dir / f"{runno}_meanDCE_initial_allvols.nii.gz"
     compute_mean_across_all_3d_vols(dce_inputs, global_initial)
@@ -400,24 +412,35 @@ def cmd_local_reg(args):
 
     task_id = int(os.environ["SLURM_ARRAY_TASK_ID"]) if args.task_id is None else int(args.task_id)
 
-    mean_initial = local_mean_initial_path(out_dir, dce_path)
-    if not mean_initial.exists():
-        raise SystemExit(f"Missing local initial mean: {mean_initial}")
+    fixed_reg = get_local_round1_fixed_for_registration(
+        out_dir=out_dir,
+        work_dir=work_dir,
+        dce_path=dce_path,
+        target_mode=args.first_round_target,
+        reg_smooth_passes=args.reg_smooth_passes,
+    )
 
     img, data = load_4d(dce_path)
     if task_id < 0 or task_id >= data.shape[3]:
         raise SystemExit(f"task_id {task_id} out of range for {dce_path.name}")
 
     vol = data[..., task_id].astype(np.float32)
-    moving_path = manifest_dir_for(work_dir, dce_path) / f"orig_vol{task_id:04d}.nii.gz"
-    nib.save(nib.Nifti1Image(vol, img.affine, img.header), str(moving_path))
+    moving_orig = manifest_dir_for(work_dir, dce_path) / f"orig_vol{task_id:04d}.nii.gz"
+    nib.save(nib.Nifti1Image(vol, img.affine, img.header), str(moving_orig))
+
+    moving_for_reg = moving_orig
+    if args.reg_smooth_passes > 0:
+        moving_reg = manifest_dir_for(work_dir, dce_path) / f"orig_vol{task_id:04d}_smoothed.nii.gz"
+        maybe_write_smoothed_image(img, vol, moving_reg, args.reg_smooth_passes)
+        moving_for_reg = moving_reg
 
     prefix = local_reg_prefix(work_dir, dce_path, task_id)
-    out = ants_affine_reg(
-        fixed=mean_initial,
-        moving=moving_path,
+    out = ants_linear_reg(
+        fixed=fixed_reg,
+        moving=moving_for_reg,
         out_prefix=prefix,
-        affine_step=args.affine_step,
+        transform_type="Affine",
+        step_size=args.affine_step,
         conv_iters=args.conv_iters,
         conv_thresh=args.conv_thresh,
         conv_window=args.conv_window,
@@ -428,7 +451,13 @@ def cmd_local_reg(args):
 
     warped_path = local_warped_vol_path(work_dir, dce_path, task_id)
     warped_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(out["warped"], warped_path)
+    ants_apply_transforms(
+        fixed=local_round1_target_path(out_dir, dce_path, args.first_round_target),
+        moving=moving_orig,
+        out_path=warped_path,
+        transforms=[out["affine"]],
+        verbose=args.verbose,
+    )
 
     print(f"LOCAL_REG {dce_path.name} vol={task_id} -> {warped_path}")
     return 0
@@ -443,13 +472,18 @@ def cmd_local_mean(args):
     nT = data.shape[3]
 
     vol_paths = [local_warped_vol_path(work_dir, dce_path, t) for t in range(nT)]
+    existing = [p for p in vol_paths if p.exists()]
     missing = [p for p in vol_paths if not p.exists()]
-    if missing:
-        raise SystemExit(f"Missing locally warped vols for {dce_path.name}; example: {missing[0]}")
 
-    ref_img, _ = load_3d(vol_paths[0])
+    if not existing:
+        raise SystemExit(f"No locally warped vols exist for {dce_path.name}")
+
+    if missing:
+        print(f"WARNING: {len(missing)} locally warped vols missing for {dce_path.name}; continuing with {len(existing)}")
+
+    ref_img, _ = load_3d(existing[0])
     out_mean = local_mean_coreg_path(out_dir, dce_path)
-    compute_mean_from_3d_stack(vol_paths, ref_img, out_mean)
+    compute_mean_from_3d_stack(existing, ref_img, out_mean)
 
     print(f"LOCAL_MEAN {dce_path.name} -> {out_mean}")
     return 0
@@ -462,20 +496,34 @@ def cmd_mean_to_global(args):
     dce_path = Path(args.dce_nifti).resolve()
     runno, out_dir, work_dir, _, _, _ = get_paths(run_dir)
 
-    moving = local_mean_coreg_path(out_dir, dce_path)
-    fixed = out_dir / f"{runno}_meanDCE_initial_allvols.nii.gz"
+    moving_orig = local_mean_coreg_path(out_dir, dce_path)
+    fixed_orig = out_dir / f"{runno}_meanDCE_initial_allvols.nii.gz"
 
-    if not moving.exists():
-        raise SystemExit(f"Missing local coreg mean: {moving}")
-    if not fixed.exists():
-        raise SystemExit(f"Missing global initial mean: {fixed}")
+    if not moving_orig.exists():
+        raise SystemExit(f"Missing local coreg mean: {moving_orig}")
+    if not fixed_orig.exists():
+        raise SystemExit(f"Missing global initial mean: {fixed_orig}")
+
+    moving_for_reg = moving_orig
+    fixed_for_reg = fixed_orig
+
+    if args.reg_smooth_passes > 0:
+        moving_img, moving_dat = load_3d(moving_orig)
+        fixed_img, fixed_dat = load_3d(fixed_orig)
+
+        moving_for_reg = manifest_dir_for(work_dir, dce_path) / "mean_to_global_moving_smoothed.nii.gz"
+        fixed_for_reg = manifest_dir_for(work_dir, dce_path) / "mean_to_global_fixed_smoothed.nii.gz"
+
+        maybe_write_smoothed_image(moving_img, moving_dat, moving_for_reg, args.reg_smooth_passes)
+        maybe_write_smoothed_image(fixed_img, fixed_dat, fixed_for_reg, args.reg_smooth_passes)
 
     prefix = mean_to_global_prefix(work_dir, dce_path)
-    out = ants_affine_reg(
-        fixed=fixed,
-        moving=moving,
+    out = ants_linear_reg(
+        fixed=fixed_for_reg,
+        moving=moving_for_reg,
         out_prefix=prefix,
-        affine_step=args.affine_step,
+        transform_type="Affine",
+        step_size=args.affine_step,
         conv_iters=args.conv_iters,
         conv_thresh=args.conv_thresh,
         conv_window=args.conv_window,
@@ -485,7 +533,13 @@ def cmd_mean_to_global(args):
     )
 
     warped_mean = local_mean_to_global_path(out_dir, dce_path)
-    shutil.copy2(out["warped"], warped_mean)
+    ants_apply_transforms(
+        fixed=fixed_orig,
+        moving=moving_orig,
+        out_path=warped_mean,
+        transforms=[out["affine"]],
+        verbose=args.verbose,
+    )
 
     print(f"MEAN_TO_GLOBAL {dce_path.name} -> {warped_mean}")
     return 0
@@ -550,12 +604,17 @@ def cmd_finalize(args):
         _, dat4 = load_4d(dce)
         nT = dat4.shape[3]
         vol_paths = [final_apply_vol_path(work_dir, dce, t) for t in range(nT)]
+        existing = [p for p in vol_paths if p.exists()]
         missing = [p for p in vol_paths if not p.exists()]
-        if missing:
-            raise SystemExit(f"Missing final warped vols for {dce.name}; example: {missing[0]}")
 
-        reg_4d = np.zeros((fixed_dat.shape[0], fixed_dat.shape[1], fixed_dat.shape[2], nT), dtype=np.float32)
-        for t, p in enumerate(vol_paths):
+        if not existing:
+            raise SystemExit(f"No final warped vols exist for {dce.name}")
+
+        if missing:
+            print(f"WARNING: {len(missing)} final warped vols missing for {dce.name}; collating {len(existing)} only")
+
+        reg_4d = np.zeros((fixed_dat.shape[0], fixed_dat.shape[1], fixed_dat.shape[2], len(existing)), dtype=np.float32)
+        for t, p in enumerate(existing):
             _, vd = load_3d(p)
             if vd.shape != fixed_dat.shape:
                 raise SystemExit(f"Shape mismatch for {p}: {vd.shape} vs {fixed_dat.shape}")
@@ -570,35 +629,60 @@ def cmd_finalize(args):
     compute_mean_across_all_3d_vols(final_4d_paths, final_mean)
     print(f"FINAL_MEAN {final_mean}")
 
-    #
-    # Two-pass T2 registration:
-    #   pass 1: raw T2 -> final_mean
-    #   pass 2: gradient-magnitude(pass1 warped T2) -> gradient-magnitude(final_mean)
-    #   apply composite [pass2_aff, pass1_aff] to original T2
-    #
     t2_out = out_dir / t2_input.name
 
-    # Pass 1
-    t2_pass1_prefix = work_dir / "T2_to_finalMean_pass1_"
-    pass1 = ants_affine_reg(
-        fixed=final_mean,
-        moving=t2_input,
-        out_prefix=t2_pass1_prefix,
-        affine_step=args.affine_step,
-        conv_iters=args.conv_iters,
-        conv_thresh=args.conv_thresh,
-        conv_window=args.conv_window,
-        shrink_factors=args.shrink_factors,
-        smoothing_sigmas=args.smoothing_sigmas,
+    final_mean_for_reg = final_mean
+    t2_for_reg = t2_input
+
+    if args.reg_smooth_passes > 0:
+        fm_img, fm_dat = load_3d(final_mean)
+        t2_img, t2_dat = load_3d(t2_input)
+
+        final_mean_for_reg = work_dir / "T2_fixed_smoothed.nii.gz"
+        t2_for_reg = work_dir / "T2_moving_smoothed.nii.gz"
+
+        maybe_write_smoothed_image(fm_img, fm_dat, final_mean_for_reg, args.reg_smooth_passes)
+        maybe_write_smoothed_image(t2_img, t2_dat, t2_for_reg, args.reg_smooth_passes)
+
+    # Pass 1a: rigid on intensity
+    t2_rigid_prefix = work_dir / "T2_to_finalMean_rigid_"
+    rigid1 = ants_linear_reg(
+        fixed=final_mean_for_reg,
+        moving=t2_for_reg,
+        out_prefix=t2_rigid_prefix,
+        transform_type="Rigid",
+        step_size=args.t2_rigid_step,
+        conv_iters=args.t2_rigid_conv_iters,
+        conv_thresh=args.t2_rigid_conv_thresh,
+        conv_window=args.t2_rigid_conv_window,
+        shrink_factors=args.t2_rigid_shrink_factors,
+        smoothing_sigmas=args.t2_rigid_smoothing_sigmas,
         verbose=args.verbose,
     )
 
-    # Build gradient images
+    # Pass 1b: affine on intensity, initialized from rigid
+    t2_affine_prefix = work_dir / "T2_to_finalMean_affine_"
+    affine1 = ants_linear_reg(
+        fixed=final_mean_for_reg,
+        moving=t2_for_reg,
+        out_prefix=t2_affine_prefix,
+        transform_type="Affine",
+        step_size=args.t2_affine_step,
+        conv_iters=args.t2_affine_conv_iters,
+        conv_thresh=args.t2_affine_conv_thresh,
+        conv_window=args.t2_affine_conv_window,
+        shrink_factors=args.t2_affine_shrink_factors,
+        smoothing_sigmas=args.t2_affine_smoothing_sigmas,
+        initial_transform=rigid1["affine"],
+        verbose=args.verbose,
+    )
+
+    # Build gradient images from original-grid fixed and affine-warped T2
     final_mean_img, final_mean_dat = load_3d(final_mean)
-    pass1_img, pass1_dat = load_3d(pass1["warped"])
+    affine1_img, affine1_dat = load_3d(affine1["warped"])
 
     fixed_grad = work_dir / "T2_to_finalMean_fixed_grad.nii.gz"
-    moving_grad = work_dir / "T2_to_finalMean_pass1Warped_grad.nii.gz"
+    moving_grad = work_dir / "T2_to_finalMean_affineWarped_grad.nii.gz"
 
     write_gradient_mag_image(
         in_img=final_mean_img,
@@ -607,24 +691,42 @@ def cmd_finalize(args):
         smooth_passes=args.t2_grad_smooth_passes,
     )
     write_gradient_mag_image(
-        in_img=pass1_img,
-        in_data=pass1_dat,
+        in_img=affine1_img,
+        in_data=affine1_dat,
         out_path=moving_grad,
         smooth_passes=args.t2_grad_smooth_passes,
     )
 
-    # Pass 2
-    t2_pass2_prefix = work_dir / "T2_to_finalMean_pass2_grad_"
-    pass2 = ants_affine_reg(
+    # Pass 2a: rigid on gradients
+    t2_grad_rigid_prefix = work_dir / "T2_to_finalMean_grad_rigid_"
+    rigid2 = ants_linear_reg(
         fixed=fixed_grad,
         moving=moving_grad,
-        out_prefix=t2_pass2_prefix,
-        affine_step=args.t2_grad_affine_step,
-        conv_iters=args.t2_grad_conv_iters,
-        conv_thresh=args.t2_grad_conv_thresh,
-        conv_window=args.t2_grad_conv_window,
-        shrink_factors=args.t2_grad_shrink_factors,
-        smoothing_sigmas=args.t2_grad_smoothing_sigmas,
+        out_prefix=t2_grad_rigid_prefix,
+        transform_type="Rigid",
+        step_size=args.t2_grad_rigid_step,
+        conv_iters=args.t2_grad_rigid_conv_iters,
+        conv_thresh=args.t2_grad_rigid_conv_thresh,
+        conv_window=args.t2_grad_rigid_conv_window,
+        shrink_factors=args.t2_grad_rigid_shrink_factors,
+        smoothing_sigmas=args.t2_grad_rigid_smoothing_sigmas,
+        verbose=args.verbose,
+    )
+
+    # Pass 2b: affine on gradients, initialized from grad rigid
+    t2_grad_affine_prefix = work_dir / "T2_to_finalMean_grad_affine_"
+    affine2 = ants_linear_reg(
+        fixed=fixed_grad,
+        moving=moving_grad,
+        out_prefix=t2_grad_affine_prefix,
+        transform_type="Affine",
+        step_size=args.t2_grad_affine_step,
+        conv_iters=args.t2_grad_affine_conv_iters,
+        conv_thresh=args.t2_grad_affine_conv_thresh,
+        conv_window=args.t2_grad_affine_conv_window,
+        shrink_factors=args.t2_grad_affine_shrink_factors,
+        smoothing_sigmas=args.t2_grad_affine_smoothing_sigmas,
+        initial_transform=rigid2["affine"],
         verbose=args.verbose,
     )
 
@@ -633,7 +735,7 @@ def cmd_finalize(args):
         fixed=final_mean,
         moving=t2_input,
         out_path=t2_out,
-        transforms=[pass2["affine"], pass1["affine"]],
+        transforms=[affine2["affine"], affine1["affine"], rigid1["affine"]],
         verbose=args.verbose,
     )
 
@@ -646,6 +748,11 @@ def main():
 
     def add_common(p):
         p.add_argument("--run_dir", required=True)
+
+        p.add_argument("--first_round_target", choices=["mean", "firstvol"], default="mean")
+        p.add_argument("--reg_smooth_passes", type=int, default=0)
+
+        # General affine registration knobs for DCE stages
         p.add_argument("--affine_step", type=float, default=0.05)
         p.add_argument("--conv_iters", default="100x100x100x20")
         p.add_argument("--conv_thresh", type=float, default=1e-7)
@@ -653,13 +760,37 @@ def main():
         p.add_argument("--shrink_factors", default="8x4x2x1")
         p.add_argument("--smoothing_sigmas", default="3x2x1x0vox")
 
-        # T2 gradient-refinement controls
+        # T2 intensity rigid
+        p.add_argument("--t2_rigid_step", type=float, default=0.1)
+        p.add_argument("--t2_rigid_conv_iters", default="100x100x100x20")
+        p.add_argument("--t2_rigid_conv_thresh", type=float, default=1e-7)
+        p.add_argument("--t2_rigid_conv_window", type=int, default=15)
+        p.add_argument("--t2_rigid_shrink_factors", default="8x4x2x1")
+        p.add_argument("--t2_rigid_smoothing_sigmas", default="3x2x1x0vox")
+
+        # T2 intensity affine
+        p.add_argument("--t2_affine_step", type=float, default=0.025)
+        p.add_argument("--t2_affine_conv_iters", default="100x100x100x20")
+        p.add_argument("--t2_affine_conv_thresh", type=float, default=1e-7)
+        p.add_argument("--t2_affine_conv_window", type=int, default=15)
+        p.add_argument("--t2_affine_shrink_factors", default="8x4x2x1")
+        p.add_argument("--t2_affine_smoothing_sigmas", default="3x2x1x0vox")
+
+        # T2 gradient refinement rigid
+        p.add_argument("--t2_grad_rigid_step", type=float, default=0.05)
+        p.add_argument("--t2_grad_rigid_conv_iters", default="100x100x100x20")
+        p.add_argument("--t2_grad_rigid_conv_thresh", type=float, default=1e-7)
+        p.add_argument("--t2_grad_rigid_conv_window", type=int, default=15)
+        p.add_argument("--t2_grad_rigid_shrink_factors", default="8x4x2x1")
+        p.add_argument("--t2_grad_rigid_smoothing_sigmas", default="3x2x1x0vox")
+
+        # T2 gradient refinement affine
         p.add_argument("--t2_grad_affine_step", type=float, default=0.02)
-        p.add_argument("--t2_grad_conv_iters", default="100x100x100x20")
-        p.add_argument("--t2_grad_conv_thresh", type=float, default=1e-7)
-        p.add_argument("--t2_grad_conv_window", type=int, default=15)
-        p.add_argument("--t2_grad_shrink_factors", default="8x4x2x1")
-        p.add_argument("--t2_grad_smoothing_sigmas", default="3x2x1x0vox")
+        p.add_argument("--t2_grad_affine_conv_iters", default="100x100x100x20")
+        p.add_argument("--t2_grad_affine_conv_thresh", type=float, default=1e-7)
+        p.add_argument("--t2_grad_affine_conv_window", type=int, default=15)
+        p.add_argument("--t2_grad_affine_shrink_factors", default="8x4x2x1")
+        p.add_argument("--t2_grad_affine_smoothing_sigmas", default="3x2x1x0vox")
         p.add_argument("--t2_grad_smooth_passes", type=int, default=1)
 
         p.add_argument("--verbose", action="store_true")
