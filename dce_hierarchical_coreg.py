@@ -1,47 +1,23 @@
 #!/usr/bin/env python3
 """
-Hierarchical DCE coregistration pipeline using antsRegistration directly
-with Mattes + Affine (no antsRegistrationSyNQuick.sh).
+Hierarchical DCE coregistration pipeline with STRICT T2 lookup:
+    only ${runno}_T2.nii.gz is accepted as the T2 input.
 
-Input layout:
+This script assumes:
     all_niis/z<runno>/
-        <runno>_DCE_baseline.nii.gz   (4D)
-        <runno>_DCE_block1.nii.gz     (4D)
-        <runno>_DCE_block2.nii.gz     (4D)
-        <runno>_T2.nii.gz             (3D)
+        <runno>_DCE_baseline.nii.gz
+        <runno>_DCE_block1.nii.gz
+        <runno>_DCE_block2.nii.gz
+        <runno>_T2.nii.gz
 
-Output layout:
+Outputs go to:
     all_niis/<runno>_coregistered/
         sbatch/
         work/
-        <same-basename DCE outputs as inputs>
-        <same-basename T2 output as input>
+        <same-basename final DCE files>
+        <same-basename final T2 file>
         <runno>_meanDCE_initial_allvols.nii.gz
         <runno>_meanDCE_coregistered_allvols.nii.gz
-        plus intermediate averages in the output folder
-
-Strategy:
-    A) Per DCE 4D:
-       1. initial mean of that 4D
-       2. register each volume -> that mean (array job per volume)
-       3. make new mean from locally coregistered volumes
-
-    B) Per run:
-       4. global original mean across all original DCE volumes (equal-weight per 3D vol)
-       5. register each "new mean" -> global original mean
-       6. apply composite transforms to each original volume:
-            original vol -> local mean
-            local-coreg mean -> global original mean
-       7. collate final 4D outputs
-       8. final global mean across all final coregistered DCE vols
-       9. T2 -> final global mean
-
-Dependencies:
-    - numpy
-    - nibabel
-    - ANTs in PATH:
-        antsRegistration
-        antsApplyTransforms
 """
 
 import argparse
@@ -57,13 +33,13 @@ import numpy as np
 def run_cmd(cmd, verbose=False):
     if verbose:
         print("RUN:", " ".join(map(str, cmd)))
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"Command failed (exit {p.returncode}): {' '.join(map(str, cmd))}\n\n"
-            f"STDOUT:\n{p.stdout}\n\nSTDERR:\n{p.stderr}\n"
+            f"Command failed:\n  {' '.join(map(str, cmd))}\n\n"
+            f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         )
-    return p.stdout
+    return proc.stdout
 
 
 def require_exe(exe_name):
@@ -79,18 +55,7 @@ def parse_runno(run_dir: Path) -> str:
 
 
 def strip_nii_gz(name: str) -> str:
-    if name.endswith(".nii.gz"):
-        return name[:-7]
-    return Path(name).stem
-
-
-def find_unique(folder: Path, pattern: str):
-    hits = sorted(folder.glob(pattern))
-    if not hits:
-        return None
-    if len(hits) > 1:
-        raise RuntimeError(f"Ambiguous matches in {folder} for '{pattern}':\n  " + "\n  ".join(map(str, hits)))
-    return hits[0]
+    return name[:-7] if name.endswith(".nii.gz") else Path(name).stem
 
 
 def load_3d(path: Path):
@@ -109,24 +74,17 @@ def load_4d(path: Path):
     return img, data
 
 
-def save_3d_like(data3d: np.ndarray, ref_img: nib.Nifti1Image, out_path: Path):
+def save_3d_like(data3d, ref_img, out_path):
     out = nib.Nifti1Image(data3d.astype(np.float32), ref_img.affine, ref_img.header)
     out.header.set_data_dtype(np.float32)
     nib.save(out, str(out_path))
 
 
-def save_4d_like(data4d: np.ndarray, ref_img: nib.Nifti1Image, out_path: Path):
+def save_4d_like(data4d, ref_img, out_path):
     hdr = ref_img.header.copy()
     out = nib.Nifti1Image(data4d.astype(np.float32), ref_img.affine, hdr)
     out.header.set_data_dtype(np.float32)
     nib.save(out, str(out_path))
-
-
-def parse_x_list(text: str, cast_type=float):
-    vals = [cast_type(x.strip()) for x in text.split("x") if x.strip() != ""]
-    if len(vals) == 0:
-        raise ValueError(f"Could not parse multi-resolution list from '{text}'")
-    return vals
 
 
 def ants_affine_reg(
@@ -139,25 +97,8 @@ def ants_affine_reg(
     conv_window: int,
     shrink_factors: str,
     smoothing_sigmas: str,
-    winsorize_lower: float = 0.005,
-    winsorize_upper: float = 0.995,
-    hist_match: int = 0,
     verbose=False,
 ):
-    """
-    Direct antsRegistration affine-only registration with Mattes metric.
-
-    Example form:
-      antsRegistration --float -d 3 -v \
-        -m Mattes[ fixed,moving,1,32,regular,0.3 ] \
-        -t Affine[0.05] \
-        -c [ 100x100x100x20,1.e-7,15 ] \
-        -s 3x2x1x0vox \
-        -f 8x4x2x1 \
-        -u 1 -z 1 \
-        -o [prefix,warped]
-    """
-
     warped = Path(str(out_prefix) + "Warped.nii.gz")
     affine = Path(str(out_prefix) + "0GenericAffine.mat")
 
@@ -171,12 +112,10 @@ def ants_affine_reg(
         "-c", f"[{conv_iters},{conv_thresh},{conv_window}]",
         "-s", smoothing_sigmas,
         "-f", shrink_factors,
-        "-u", str(hist_match),
+        "-u", "1",
         "-z", "1",
-        "--winsorize-image-intensities", f"[{winsorize_lower},{winsorize_upper}]",
         "-o", f"[{out_prefix},{warped}]",
     ]
-
     run_cmd(cmd, verbose=verbose)
 
     if not warped.exists():
@@ -184,38 +123,34 @@ def ants_affine_reg(
     if not affine.exists():
         raise RuntimeError(f"Expected affine transform not found: {affine}")
 
-    return {
-        "warped": warped,
-        "affine": affine,
-    }
+    return {"warped": warped, "affine": affine}
 
 
-def ants_apply_transforms(fixed: Path, moving: Path, out_path: Path, transforms, interp="Linear", verbose=False):
+def ants_apply_transforms(fixed: Path, moving: Path, out_path: Path, transforms, verbose=False):
     cmd = [
         "antsApplyTransforms",
         "-d", "3",
         "-i", str(moving),
         "-r", str(fixed),
         "-o", str(out_path),
-        "-n", interp,
+        "-n", "Linear",
     ]
     for t in transforms:
         cmd += ["-t", str(t)]
     run_cmd(cmd, verbose=verbose)
+
     if not out_path.exists():
         raise RuntimeError(f"antsApplyTransforms failed to write: {out_path}")
 
 
-def compute_mean_from_single_4d(nifti_4d: Path, out_mean_3d: Path, verbose=False):
+def compute_mean_from_single_4d(nifti_4d: Path, out_mean_3d: Path):
     img, data = load_4d(nifti_4d)
     mean3d = np.mean(data, axis=3, dtype=np.float64).astype(np.float32)
     save_3d_like(mean3d, img, out_mean_3d)
-    if verbose:
-        print(f"Wrote single-4D mean: {out_mean_3d}")
     return out_mean_3d
 
 
-def compute_mean_across_all_3d_vols(dce_4d_paths, out_mean_3d: Path, verbose=False):
+def compute_mean_across_all_3d_vols(dce_4d_paths, out_mean_3d: Path):
     imgs_data = []
     vol_counts = []
 
@@ -223,6 +158,9 @@ def compute_mean_across_all_3d_vols(dce_4d_paths, out_mean_3d: Path, verbose=Fal
         img, data = load_4d(p)
         imgs_data.append((img, data))
         vol_counts.append(data.shape[3])
+
+    if not imgs_data:
+        raise ValueError("No DCE 4D paths provided.")
 
     base_shape = imgs_data[0][1].shape[:3]
     for p, (_, d) in zip(dce_4d_paths, imgs_data):
@@ -241,13 +179,10 @@ def compute_mean_across_all_3d_vols(dce_4d_paths, out_mean_3d: Path, verbose=Fal
     mean3d = (acc / float(total_vols)).astype(np.float32)
     ref_img = imgs_data[0][0]
     save_3d_like(mean3d, ref_img, out_mean_3d)
-
-    if verbose:
-        print(f"Wrote pooled mean: {out_mean_3d} from {len(dce_4d_paths)} files / {total_vols} vols")
     return out_mean_3d
 
 
-def compute_mean_from_3d_stack(vol_paths, ref_img, out_mean_3d: Path, verbose=False):
+def compute_mean_from_3d_stack(vol_paths, ref_img, out_mean_3d: Path):
     if not vol_paths:
         raise ValueError("No 3D paths provided for mean.")
 
@@ -259,12 +194,33 @@ def compute_mean_from_3d_stack(vol_paths, ref_img, out_mean_3d: Path, verbose=Fa
         acc += dat
     mean3d = (acc / float(len(vol_paths))).astype(np.float32)
     save_3d_like(mean3d, ref_img, out_mean_3d)
-    if verbose:
-        print(f"Wrote mean from {len(vol_paths)} warped 3D vols: {out_mean_3d}")
     return out_mean_3d
 
 
-def get_paths(run_dir: Path, dce_suffixes, t2_suffix):
+def strict_t2_input(run_dir: Path, runno: str) -> Path:
+    """
+    STRICT lookup:
+        only ${runno}_T2.nii.gz is accepted.
+    """
+    p = run_dir / f"{runno}_T2.nii.gz"
+    if not p.is_file():
+        raise RuntimeError(
+            f"Strict T2 not found:\n  expected {p}\n"
+            "Everything else is ignored by design."
+        )
+    return p
+
+
+def strict_dce_inputs(run_dir: Path, runno: str):
+    out = []
+    for suffix in ("DCE_baseline", "DCE_block1", "DCE_block2"):
+        p = run_dir / f"{runno}_{suffix}.nii.gz"
+        if p.is_file():
+            out.append(p)
+    return out
+
+
+def get_paths(run_dir: Path):
     runno = parse_runno(run_dir)
     all_niis_dir = run_dir.parent
     out_dir = all_niis_dir / f"{runno}_coregistered"
@@ -275,13 +231,8 @@ def get_paths(run_dir: Path, dce_suffixes, t2_suffix):
     work_dir.mkdir(parents=True, exist_ok=True)
     sbatch_dir.mkdir(parents=True, exist_ok=True)
 
-    dce_inputs = []
-    for suf in dce_suffixes:
-        p = find_unique(run_dir, f"*_{suf}.nii.gz")
-        if p is not None:
-            dce_inputs.append(p)
-
-    t2_input = find_unique(run_dir, f"*_{t2_suffix}.nii.gz")
+    dce_inputs = strict_dce_inputs(run_dir, runno)
+    t2_input = strict_t2_input(run_dir, runno)
 
     return runno, out_dir, work_dir, sbatch_dir, dce_inputs, t2_input
 
@@ -290,23 +241,16 @@ def manifest_dir_for(work_dir: Path, dce_path: Path):
     return work_dir / "per_nifti" / dce_path.name
 
 
-def manifest_path_for(work_dir: Path, dce_path: Path):
-    return manifest_dir_for(work_dir, dce_path) / "manifest.tsv"
-
-
 def local_mean_initial_path(out_dir: Path, dce_path: Path):
-    stem = strip_nii_gz(dce_path.name)
-    return out_dir / f"{stem}_mean_initial.nii.gz"
+    return out_dir / f"{strip_nii_gz(dce_path.name)}_mean_initial.nii.gz"
 
 
 def local_mean_coreg_path(out_dir: Path, dce_path: Path):
-    stem = strip_nii_gz(dce_path.name)
-    return out_dir / f"{stem}_mean_localcoreg.nii.gz"
+    return out_dir / f"{strip_nii_gz(dce_path.name)}_mean_localcoreg.nii.gz"
 
 
 def local_mean_to_global_path(out_dir: Path, dce_path: Path):
-    stem = strip_nii_gz(dce_path.name)
-    return out_dir / f"{stem}_mean_localcoreg_to_global.nii.gz"
+    return out_dir / f"{strip_nii_gz(dce_path.name)}_mean_localcoreg_to_global.nii.gz"
 
 
 def local_reg_prefix(work_dir: Path, dce_path: Path, t_idx: int):
@@ -325,27 +269,12 @@ def mean_to_global_prefix(work_dir: Path, dce_path: Path):
     return manifest_dir_for(work_dir, dce_path) / "mean_to_global_xfm" / "mean_"
 
 
-def reg_kwargs_from_args(args):
-    return dict(
-        affine_step=args.affine_step,
-        conv_iters=args.conv_iters,
-        conv_thresh=args.conv_thresh,
-        conv_window=args.conv_window,
-        shrink_factors=args.shrink_factors,
-        smoothing_sigmas=args.smoothing_sigmas,
-        winsorize_lower=args.winsorize_lower,
-        winsorize_upper=args.winsorize_upper,
-        hist_match=args.hist_match,
-    )
-
-
 def cmd_prep(args):
     run_dir = Path(args.run_dir).resolve()
-    dce_suffixes = [s.strip() for s in args.dce_suffixes.split(",") if s.strip()]
-    runno, out_dir, work_dir, _, dce_inputs, _ = get_paths(run_dir, dce_suffixes, args.t2_suffix)
+    runno, out_dir, work_dir, _, dce_inputs, _ = get_paths(run_dir)
 
     if not dce_inputs:
-        raise SystemExit(f"No DCE inputs found in {run_dir}")
+        raise SystemExit(f"No strict DCE inputs found in {run_dir}")
 
     print(f"=== PREP {run_dir.name} (runno={runno}) ===")
 
@@ -360,20 +289,14 @@ def cmd_prep(args):
         (md / "final_warped_vols").mkdir(exist_ok=True)
         (md / "mean_to_global_xfm").mkdir(exist_ok=True)
 
-        manifest = manifest_path_for(work_dir, dce)
-        with open(manifest, "w") as f:
-            for t in range(nT):
-                f.write(f"{t}\n")
-
         (md / "n_tasks.txt").write_text(f"{nT}\n")
 
         mean_initial = local_mean_initial_path(out_dir, dce)
-        compute_mean_from_single_4d(dce, mean_initial, verbose=args.verbose)
-
+        compute_mean_from_single_4d(dce, mean_initial)
         print(f"Prepared {dce.name}: {nT} tasks")
 
     global_initial = out_dir / f"{runno}_meanDCE_initial_allvols.nii.gz"
-    compute_mean_across_all_3d_vols(dce_inputs, global_initial, verbose=args.verbose)
+    compute_mean_across_all_3d_vols(dce_inputs, global_initial)
     print(f"Global original mean: {global_initial}")
     return 0
 
@@ -383,13 +306,9 @@ def cmd_local_reg(args):
 
     run_dir = Path(args.run_dir).resolve()
     dce_path = Path(args.dce_nifti).resolve()
-    dce_suffixes = [s.strip() for s in args.dce_suffixes.split(",") if s.strip()]
-    _, out_dir, work_dir, _, _, _ = get_paths(run_dir, dce_suffixes, args.t2_suffix)
+    _, out_dir, work_dir, _, _, _ = get_paths(run_dir)
 
-    if args.task_id is None:
-        task_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-    else:
-        task_id = int(args.task_id)
+    task_id = int(os.environ["SLURM_ARRAY_TASK_ID"]) if args.task_id is None else int(args.task_id)
 
     mean_initial = local_mean_initial_path(out_dir, dce_path)
     if not mean_initial.exists():
@@ -397,7 +316,7 @@ def cmd_local_reg(args):
 
     img, data = load_4d(dce_path)
     if task_id < 0 or task_id >= data.shape[3]:
-        raise SystemExit(f"task_id {task_id} out of range for {dce_path.name} with nT={data.shape[3]}")
+        raise SystemExit(f"task_id {task_id} out of range for {dce_path.name}")
 
     vol = data[..., task_id].astype(np.float32)
     moving_path = manifest_dir_for(work_dir, dce_path) / f"orig_vol{task_id:04d}.nii.gz"
@@ -408,8 +327,13 @@ def cmd_local_reg(args):
         fixed=mean_initial,
         moving=moving_path,
         out_prefix=prefix,
+        affine_step=args.affine_step,
+        conv_iters=args.conv_iters,
+        conv_thresh=args.conv_thresh,
+        conv_window=args.conv_window,
+        shrink_factors=args.shrink_factors,
+        smoothing_sigmas=args.smoothing_sigmas,
         verbose=args.verbose,
-        **reg_kwargs_from_args(args),
     )
 
     warped_path = local_warped_vol_path(work_dir, dce_path, task_id)
@@ -423,8 +347,7 @@ def cmd_local_reg(args):
 def cmd_local_mean(args):
     run_dir = Path(args.run_dir).resolve()
     dce_path = Path(args.dce_nifti).resolve()
-    dce_suffixes = [s.strip() for s in args.dce_suffixes.split(",") if s.strip()]
-    _, out_dir, work_dir, _, _, _ = get_paths(run_dir, dce_suffixes, args.t2_suffix)
+    _, out_dir, work_dir, _, _, _ = get_paths(run_dir)
 
     _, data = load_4d(dce_path)
     nT = data.shape[3]
@@ -432,11 +355,11 @@ def cmd_local_mean(args):
     vol_paths = [local_warped_vol_path(work_dir, dce_path, t) for t in range(nT)]
     missing = [p for p in vol_paths if not p.exists()]
     if missing:
-        raise SystemExit(f"Missing {len(missing)} locally warped vols for {dce_path.name}; example: {missing[0]}")
+        raise SystemExit(f"Missing locally warped vols for {dce_path.name}; example: {missing[0]}")
 
     ref_img, _ = load_3d(vol_paths[0])
     out_mean = local_mean_coreg_path(out_dir, dce_path)
-    compute_mean_from_3d_stack(vol_paths, ref_img, out_mean, verbose=args.verbose)
+    compute_mean_from_3d_stack(vol_paths, ref_img, out_mean)
 
     print(f"LOCAL_MEAN {dce_path.name} -> {out_mean}")
     return 0
@@ -447,8 +370,7 @@ def cmd_mean_to_global(args):
 
     run_dir = Path(args.run_dir).resolve()
     dce_path = Path(args.dce_nifti).resolve()
-    dce_suffixes = [s.strip() for s in args.dce_suffixes.split(",") if s.strip()]
-    runno, out_dir, work_dir, _, _, _ = get_paths(run_dir, dce_suffixes, args.t2_suffix)
+    runno, out_dir, work_dir, _, _, _ = get_paths(run_dir)
 
     moving = local_mean_coreg_path(out_dir, dce_path)
     fixed = out_dir / f"{runno}_meanDCE_initial_allvols.nii.gz"
@@ -463,8 +385,13 @@ def cmd_mean_to_global(args):
         fixed=fixed,
         moving=moving,
         out_prefix=prefix,
+        affine_step=args.affine_step,
+        conv_iters=args.conv_iters,
+        conv_thresh=args.conv_thresh,
+        conv_window=args.conv_window,
+        shrink_factors=args.shrink_factors,
+        smoothing_sigmas=args.smoothing_sigmas,
         verbose=args.verbose,
-        **reg_kwargs_from_args(args),
     )
 
     warped_mean = local_mean_to_global_path(out_dir, dce_path)
@@ -479,17 +406,13 @@ def cmd_final_apply(args):
 
     run_dir = Path(args.run_dir).resolve()
     dce_path = Path(args.dce_nifti).resolve()
-    dce_suffixes = [s.strip() for s in args.dce_suffixes.split(",") if s.strip()]
-    runno, out_dir, work_dir, _, _, _ = get_paths(run_dir, dce_suffixes, args.t2_suffix)
+    runno, out_dir, work_dir, _, _, _ = get_paths(run_dir)
 
-    if args.task_id is None:
-        task_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-    else:
-        task_id = int(args.task_id)
+    task_id = int(os.environ["SLURM_ARRAY_TASK_ID"]) if args.task_id is None else int(args.task_id)
 
     dce_img, dce_data = load_4d(dce_path)
     if task_id < 0 or task_id >= dce_data.shape[3]:
-        raise SystemExit(f"task_id {task_id} out of range for {dce_path.name} with nT={dce_data.shape[3]}")
+        raise SystemExit(f"task_id {task_id} out of range for {dce_path.name}")
 
     fixed = out_dir / f"{runno}_meanDCE_initial_allvols.nii.gz"
     if not fixed.exists():
@@ -500,24 +423,17 @@ def cmd_final_apply(args):
         vol = dce_data[..., task_id].astype(np.float32)
         nib.save(nib.Nifti1Image(vol, dce_img.affine, dce_img.header), str(moving_orig))
 
-    local_prefix = local_reg_prefix(work_dir, dce_path, task_id)
-    local_aff = Path(str(local_prefix) + "0GenericAffine.mat")
+    local_aff = Path(str(local_reg_prefix(work_dir, dce_path, task_id)) + "0GenericAffine.mat")
+    global_aff = Path(str(mean_to_global_prefix(work_dir, dce_path)) + "0GenericAffine.mat")
+
     if not local_aff.exists():
-        raise SystemExit(f"Missing local affine for {dce_path.name} vol={task_id}: {local_aff}")
-
-    global_prefix = mean_to_global_prefix(work_dir, dce_path)
-    global_aff = Path(str(global_prefix) + "0GenericAffine.mat")
+        raise SystemExit(f"Missing local affine: {local_aff}")
     if not global_aff.exists():
-        raise SystemExit(f"Missing global affine for {dce_path.name}: {global_aff}")
-
-    # Composite is: local then global.
-    # antsApplyTransforms list order for affine-only case:
-    #   first list global, then local
-    transforms = [global_aff, local_aff]
+        raise SystemExit(f"Missing global affine: {global_aff}")
 
     out3d = final_apply_vol_path(work_dir, dce_path, task_id)
     out3d.parent.mkdir(parents=True, exist_ok=True)
-    ants_apply_transforms(fixed, moving_orig, out3d, transforms, interp="Linear", verbose=args.verbose)
+    ants_apply_transforms(fixed, moving_orig, out3d, [global_aff, local_aff], verbose=args.verbose)
 
     print(f"FINAL_APPLY {dce_path.name} vol={task_id} -> {out3d}")
     return 0
@@ -527,8 +443,7 @@ def cmd_finalize(args):
     require_exe("antsRegistration")
 
     run_dir = Path(args.run_dir).resolve()
-    dce_suffixes = [s.strip() for s in args.dce_suffixes.split(",") if s.strip()]
-    runno, out_dir, work_dir, _, dce_inputs, t2_input = get_paths(run_dir, dce_suffixes, args.t2_suffix)
+    runno, out_dir, work_dir, _, dce_inputs, t2_input = get_paths(run_dir)
 
     if not dce_inputs:
         raise SystemExit(f"No DCE inputs found in {run_dir}")
@@ -546,7 +461,7 @@ def cmd_finalize(args):
         vol_paths = [final_apply_vol_path(work_dir, dce, t) for t in range(nT)]
         missing = [p for p in vol_paths if not p.exists()]
         if missing:
-            raise SystemExit(f"Missing {len(missing)} final warped vols for {dce.name}; example: {missing[0]}")
+            raise SystemExit(f"Missing final warped vols for {dce.name}; example: {missing[0]}")
 
         reg_4d = np.zeros((fixed_dat.shape[0], fixed_dat.shape[1], fixed_dat.shape[2], nT), dtype=np.float32)
         for t, p in enumerate(vol_paths):
@@ -561,43 +476,39 @@ def cmd_finalize(args):
         print(f"FINAL_4D {out4d}")
 
     final_mean = out_dir / f"{runno}_meanDCE_coregistered_allvols.nii.gz"
-    compute_mean_across_all_3d_vols(final_4d_paths, final_mean, verbose=args.verbose)
+    compute_mean_across_all_3d_vols(final_4d_paths, final_mean)
 
-    if t2_input is not None:
-        t2_out = out_dir / t2_input.name
-        prefix = work_dir / "T2_to_finalMean_"
-        out = ants_affine_reg(
-            fixed=final_mean,
-            moving=t2_input,
-            out_prefix=prefix,
-            verbose=args.verbose,
-            **reg_kwargs_from_args(args),
-        )
-        shutil.copy2(out["warped"], t2_out)
-        print(f"T2_FINAL {t2_out}")
-    else:
-        print("No T2 found; skipping T2 registration")
-
+    t2_out = out_dir / t2_input.name
+    prefix = work_dir / "T2_to_finalMean_"
+    out = ants_affine_reg(
+        fixed=final_mean,
+        moving=t2_input,
+        out_prefix=prefix,
+        affine_step=args.affine_step,
+        conv_iters=args.conv_iters,
+        conv_thresh=args.conv_thresh,
+        conv_window=args.conv_window,
+        shrink_factors=args.shrink_factors,
+        smoothing_sigmas=args.smoothing_sigmas,
+        verbose=args.verbose,
+    )
+    shutil.copy2(out["warped"], t2_out)
+    print(f"T2_FINAL {t2_out}")
     print(f"FINAL_MEAN {final_mean}")
     return 0
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Hierarchical DCE coregistration pipeline with antsRegistration Affine+Mattes")
+    ap = argparse.ArgumentParser(description="Hierarchical DCE coregistration pipeline")
 
     def add_common(p):
-        p.add_argument("--run_dir", required=True, help="Path to z<runno> input folder")
-        p.add_argument("--dce_suffixes", default="DCE_baseline,DCE_block1,DCE_block2")
-        p.add_argument("--t2_suffix", default="T2")
-        p.add_argument("--affine_step", type=float, default=0.05, help="Affine step size for Affine[x.xx]")
-        p.add_argument("--conv_iters", default="100x100x100x20", help="Convergence iterations per level")
-        p.add_argument("--conv_thresh", type=float, default=1.0e-7, help="Convergence threshold")
-        p.add_argument("--conv_window", type=int, default=15, help="Convergence window size")
-        p.add_argument("--shrink_factors", default="8x4x2x1", help="Multi-res shrink factors")
-        p.add_argument("--smoothing_sigmas", default="3x2x1x0vox", help="Multi-res smoothing sigmas")
-        p.add_argument("--winsorize_lower", type=float, default=0.005)
-        p.add_argument("--winsorize_upper", type=float, default=0.995)
-        p.add_argument("--hist_match", type=int, default=0, choices=[0, 1], help="-u flag to antsRegistration")
+        p.add_argument("--run_dir", required=True)
+        p.add_argument("--affine_step", type=float, default=0.05)
+        p.add_argument("--conv_iters", default="100x100x100x20")
+        p.add_argument("--conv_thresh", type=float, default=1e-7)
+        p.add_argument("--conv_window", type=int, default=15)
+        p.add_argument("--shrink_factors", default="8x4x2x1")
+        p.add_argument("--smoothing_sigmas", default="3x2x1x0vox")
         p.add_argument("--verbose", action="store_true")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
