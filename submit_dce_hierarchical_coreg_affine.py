@@ -37,28 +37,36 @@ def parse_args():
     ap.add_argument("--shrink-factors", default="8x4x2x1")
     ap.add_argument("--smoothing-sigmas", default="3x2x1x0vox")
 
+    # Optional pass-through knobs for the updated T2 gradient-refinement pipeline
+    ap.add_argument("--t2-grad-affine-step", type=float, default=0.02)
+    ap.add_argument("--t2-grad-conv-iters", default="100x100x100x20")
+    ap.add_argument("--t2-grad-conv-thresh", type=float, default=1e-7)
+    ap.add_argument("--t2-grad-conv-window", type=int, default=15)
+    ap.add_argument("--t2-grad-shrink-factors", default="8x4x2x1")
+    ap.add_argument("--t2-grad-smoothing-sigmas", default="3x2x1x0vox")
+    ap.add_argument("--t2-grad-smooth-passes", type=int, default=1)
+
     ap.add_argument("--skip-complete-runs", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
 
-    # New submission-robustness knobs
     ap.add_argument(
         "--submit-retries",
         type=int,
         default=8,
-        help="Number of sbatch retry attempts on temporary submission failures (default: %(default)s)",
+        help="Number of sbatch retry attempts on temporary submission failures",
     )
     ap.add_argument(
         "--submit-sleep-seconds",
         type=float,
         default=10.0,
-        help="Initial sleep before retrying sbatch after temporary failure (default: %(default)s)",
+        help="Initial sleep before retrying sbatch after temporary failure",
     )
     ap.add_argument(
         "--inter-submit-delay",
         type=float,
         default=0.25,
-        help="Small delay after each successful sbatch to avoid hammering controller (default: %(default)s)",
+        help="Delay after each successful sbatch so we do not hammer Slurm",
     )
 
     return ap.parse_args()
@@ -245,6 +253,13 @@ def main():
         "--conv_window", str(args.conv_window),
         "--shrink_factors", args.shrink_factors,
         "--smoothing_sigmas", args.smoothing_sigmas,
+        "--t2_grad_affine_step", str(args.t2_grad_affine_step),
+        "--t2_grad_conv_iters", args.t2_grad_conv_iters,
+        "--t2_grad_conv_thresh", str(args.t2_grad_conv_thresh),
+        "--t2_grad_conv_window", str(args.t2_grad_conv_window),
+        "--t2_grad_shrink_factors", args.t2_grad_shrink_factors,
+        "--t2_grad_smoothing_sigmas", args.t2_grad_smoothing_sigmas,
+        "--t2_grad_smooth_passes", str(args.t2_grad_smooth_passes),
     ]
     if args.verbose:
         common_args.append("--verbose")
@@ -279,6 +294,7 @@ def main():
         print(f"\n=== {runno} ===")
 
         try:
+            # prep
             prep_cmd = shell_join(
                 [python_exe, str(pipeline), "prep", "--run_dir", str(run_dir)] + common_args
             )
@@ -315,6 +331,7 @@ def main():
                 tag = dce.name.replace(".nii.gz", "")
                 print(f"  {dce.name}: {nvols} vols")
 
+                # local_reg array
                 local_reg_cmd = shell_join(
                     [python_exe, str(pipeline), "local_reg", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -330,7 +347,7 @@ def main():
                         stdout_path=local_reg_log,
                         cmd=local_reg_cmd,
                         time_limit=args.time,
-                        dependency=None if prep_id == "DRY" else f"afterok:{prep_id}",
+                        dependency=None if prep_id == "DRY" else f"afterany:{prep_id}",
                         array_spec=f"0-{nvols - 1}",
                     ),
                 )
@@ -346,6 +363,7 @@ def main():
                 )
                 print(f"    local_reg: {local_reg_id}")
 
+                # local_mean
                 local_mean_cmd = shell_join(
                     [python_exe, str(pipeline), "local_mean", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -361,7 +379,7 @@ def main():
                         stdout_path=local_mean_log,
                         cmd=local_mean_cmd,
                         time_limit=args.time,
-                        dependency=None if local_reg_id == "DRY" else f"afterok:{local_reg_id}",
+                        dependency=None if local_reg_id == "DRY" else f"afterany:{local_reg_id}",
                     ),
                 )
                 local_mean_id = (
@@ -376,6 +394,7 @@ def main():
                 )
                 print(f"    local_mean: {local_mean_id}")
 
+                # mean_to_global
                 mean_to_global_cmd = shell_join(
                     [python_exe, str(pipeline), "mean_to_global", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -406,6 +425,7 @@ def main():
                 )
                 print(f"    mean_to_global: {mean_to_global_id}")
 
+                # final_apply array
                 final_apply_cmd = shell_join(
                     [python_exe, str(pipeline), "final_apply", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
@@ -438,12 +458,13 @@ def main():
                 print(f"    final_apply: {final_apply_id}")
                 final_apply_ids.append(final_apply_id)
 
+            # finalize
             finalize_cmd = shell_join(
                 [python_exe, str(pipeline), "finalize", "--run_dir", str(run_dir)] + common_args
             )
             finalize_script = sbatch_dir / f"{runno}_finalize.bash"
             finalize_log = sbatch_dir / "slurm-%j.out"
-            finalize_dep = None if (args.dry_run or not final_apply_ids) else "afterok:" + ":".join(final_apply_ids)
+            finalize_dep = None if (args.dry_run or not final_apply_ids) else "afterany:" + ":".join(final_apply_ids)
             write_text(
                 finalize_script,
                 build_job_script(
