@@ -7,6 +7,8 @@ Hierarchical DCE coregistration pipeline with:
     * first volume of 4D
 - optional light smoothing before registration (registration inputs only)
 - T2 registration split into rigid and affine stages, then gradient rigid+affine refinement
+- FIXED work-directory naming: no '.nii.gz' directory names
+- HARD FAIL on missing warped volumes to avoid corrupting time series
 
 Strict input rules:
     all_niis/z<runno>/
@@ -316,7 +318,8 @@ def get_paths(run_dir: Path):
 
 
 def manifest_dir_for(work_dir: Path, dce_path: Path):
-    return work_dir / "per_nifti" / dce_path.name
+    # FIXED: do not use ".nii.gz" as part of directory name
+    return work_dir / "per_nifti" / strip_nii_gz(dce_path.name)
 
 
 def local_round1_target_path(out_dir: Path, dce_path: Path, target_mode: str):
@@ -472,18 +475,16 @@ def cmd_local_mean(args):
     nT = data.shape[3]
 
     vol_paths = [local_warped_vol_path(work_dir, dce_path, t) for t in range(nT)]
-    existing = [p for p in vol_paths if p.exists()]
     missing = [p for p in vol_paths if not p.exists()]
-
-    if not existing:
-        raise SystemExit(f"No locally warped vols exist for {dce_path.name}")
-
     if missing:
-        print(f"WARNING: {len(missing)} locally warped vols missing for {dce_path.name}; continuing with {len(existing)}")
+        raise SystemExit(
+            f"Missing {len(missing)} locally warped vols for {dce_path.name}; "
+            f"example: {missing[0]}"
+        )
 
-    ref_img, _ = load_3d(existing[0])
+    ref_img, _ = load_3d(vol_paths[0])
     out_mean = local_mean_coreg_path(out_dir, dce_path)
-    compute_mean_from_3d_stack(existing, ref_img, out_mean)
+    compute_mean_from_3d_stack(vol_paths, ref_img, out_mean)
 
     print(f"LOCAL_MEAN {dce_path.name} -> {out_mean}")
     return 0
@@ -604,17 +605,15 @@ def cmd_finalize(args):
         _, dat4 = load_4d(dce)
         nT = dat4.shape[3]
         vol_paths = [final_apply_vol_path(work_dir, dce, t) for t in range(nT)]
-        existing = [p for p in vol_paths if p.exists()]
         missing = [p for p in vol_paths if not p.exists()]
-
-        if not existing:
-            raise SystemExit(f"No final warped vols exist for {dce.name}")
-
         if missing:
-            print(f"WARNING: {len(missing)} final warped vols missing for {dce.name}; collating {len(existing)} only")
+            raise SystemExit(
+                f"Missing {len(missing)} final warped vols for {dce.name}; "
+                f"example: {missing[0]}"
+            )
 
-        reg_4d = np.zeros((fixed_dat.shape[0], fixed_dat.shape[1], fixed_dat.shape[2], len(existing)), dtype=np.float32)
-        for t, p in enumerate(existing):
+        reg_4d = np.zeros((fixed_dat.shape[0], fixed_dat.shape[1], fixed_dat.shape[2], nT), dtype=np.float32)
+        for t, p in enumerate(vol_paths):
             _, vd = load_3d(p)
             if vd.shape != fixed_dat.shape:
                 raise SystemExit(f"Shape mismatch for {p}: {vd.shape} vs {fixed_dat.shape}")
@@ -660,7 +659,7 @@ def cmd_finalize(args):
         verbose=args.verbose,
     )
 
-    # Pass 1b: affine on intensity, initialized from rigid
+    # Pass 1b: affine on intensity
     t2_affine_prefix = work_dir / "T2_to_finalMean_affine_"
     affine1 = ants_linear_reg(
         fixed=final_mean_for_reg,
@@ -677,7 +676,6 @@ def cmd_finalize(args):
         verbose=args.verbose,
     )
 
-    # Build gradient images from original-grid fixed and affine-warped T2
     final_mean_img, final_mean_dat = load_3d(final_mean)
     affine1_img, affine1_dat = load_3d(affine1["warped"])
 
@@ -713,7 +711,7 @@ def cmd_finalize(args):
         verbose=args.verbose,
     )
 
-    # Pass 2b: affine on gradients, initialized from grad rigid
+    # Pass 2b: affine on gradients
     t2_grad_affine_prefix = work_dir / "T2_to_finalMean_grad_affine_"
     affine2 = ants_linear_reg(
         fixed=fixed_grad,
@@ -730,7 +728,6 @@ def cmd_finalize(args):
         verbose=args.verbose,
     )
 
-    # Apply composite to ORIGINAL T2
     ants_apply_transforms(
         fixed=final_mean,
         moving=t2_input,
