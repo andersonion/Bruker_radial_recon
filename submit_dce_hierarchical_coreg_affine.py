@@ -12,16 +12,8 @@ from pathlib import Path
 def parse_args():
     ap = argparse.ArgumentParser(description="Submit hierarchical DCE coreg jobs")
 
-    ap.add_argument(
-        "--all-niis-dir",
-        required=True,
-        help="Path to all_niis directory containing z<runno>/ folders",
-    )
-    ap.add_argument(
-        "--pipeline",
-        default=None,
-        help="Path to pipeline script (default: sibling of this launcher; prefers vanilla first)",
-    )
+    ap.add_argument("--all-niis-dir", required=True)
+    ap.add_argument("--pipeline", default=None, help="Default: sibling of this launcher; prefers vanilla first")
     ap.add_argument("--run-glob", default="z*")
     ap.add_argument("--python", default=sys.executable)
 
@@ -82,26 +74,20 @@ def parse_args():
 
 def resolve_pipeline(args):
     launcher_dir = Path(__file__).resolve().parent
-
     if args.pipeline is None:
         vanilla = launcher_dir / "dce_hierarchical_coreg.py"
         affine = launcher_dir / "dce_hierarchical_coreg_affine.py"
-
         if vanilla.is_file():
             pipeline = vanilla
         elif affine.is_file():
             pipeline = affine
         else:
-            raise SystemExit(
-                "Could not auto-find pipeline next to launcher.\n"
-                f"Tried:\n  {vanilla}\n  {affine}"
-            )
+            raise SystemExit(f"Could not auto-find pipeline.\nTried:\n  {vanilla}\n  {affine}")
     else:
         pipeline = Path(args.pipeline).resolve()
 
     if not pipeline.is_file():
         raise SystemExit(f"Pipeline not found: {pipeline}")
-
     return pipeline
 
 
@@ -138,20 +124,15 @@ def sbatch_submit(script_path: Path, retries: int, sleep_seconds: float, inter_s
 
         if not temporary or attempt == retries:
             raise RuntimeError(
-                f"Command failed:\n"
-                f"  sbatch {script_path}\n\n"
-                f"STDOUT:\n{out}\n\n"
-                f"STDERR:\n{err}"
+                f"Command failed:\n  sbatch {script_path}\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}"
             )
 
         delay = sleep_seconds * (2 ** (attempt - 1))
         if verbose:
-            print(f"      sbatch temporary failure on attempt {attempt}/{retries}; sleeping {delay:.1f}s then retrying")
+            print(f"      sbatch temporary failure attempt {attempt}/{retries}; sleeping {delay:.1f}s")
         time.sleep(delay)
 
-    raise RuntimeError(
-        f"sbatch failed after retries for {script_path}\n\nSTDOUT:\n{last_stdout}\n\nSTDERR:\n{last_stderr}"
-    )
+    raise RuntimeError(f"sbatch failed after retries for {script_path}\n\nSTDOUT:\n{last_stdout}\n\nSTDERR:\n{last_stderr}")
 
 
 def write_text(path: Path, text: str):
@@ -215,7 +196,6 @@ def build_job_script(
         f"#SBATCH --output={stdout_path}",
         f"#SBATCH --error={stdout_path}",
     ]
-
     if time_limit:
         lines.append(f"#SBATCH --time={time_limit}")
     if dependency:
@@ -232,6 +212,36 @@ def build_job_script(
         "",
     ]
     return "\n".join(lines)
+
+
+def existing_local_reg_task_ids(work_dir: Path, dce_path: Path, nvols: int):
+    stem = dce_path.name[:-7]
+    base = work_dir / "per_nifti" / stem
+    done = []
+    for t in range(nvols):
+        aff = base / "local_reg_xfm" / f"vol{t:04d}_0GenericAffine.mat"
+        warped = base / "local_warped_vols" / f"vol{t:04d}.nii.gz"
+        if aff.exists() and warped.exists():
+            done.append(t)
+    return done
+
+
+def existing_final_apply_task_ids(work_dir: Path, dce_path: Path, nvols: int):
+    stem = dce_path.name[:-7]
+    base = work_dir / "per_nifti" / stem
+    done = []
+    for t in range(nvols):
+        out3d = base / "final_warped_vols" / f"vol{t:04d}.nii.gz"
+        if out3d.exists():
+            done.append(t)
+    return done
+
+
+def compress_task_ids(task_ids):
+    if not task_ids:
+        return None
+    # Slurm supports comma-separated explicit IDs
+    return ",".join(str(x) for x in task_ids)
 
 
 def main():
@@ -321,9 +331,7 @@ def main():
         print(f"\n=== {runno} ===")
 
         try:
-            prep_cmd = shell_join(
-                [python_exe, str(pipeline), "prep", "--run_dir", str(run_dir)] + common_args
-            )
+            prep_cmd = shell_join([python_exe, str(pipeline), "prep", "--run_dir", str(run_dir)] + common_args)
             prep_script = sbatch_dir / f"{runno}_prep.bash"
             prep_log = sbatch_dir / "slurm-%j.out"
             write_text(
@@ -350,35 +358,45 @@ def main():
                 tag = dce.name.replace(".nii.gz", "")
                 print(f"  {dce.name}: {nvols} vols")
 
-                local_reg_cmd = shell_join(
-                    [python_exe, str(pipeline), "local_reg", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
-                )
-                local_reg_script = sbatch_dir / f"{tag}_local_reg_array.bash"
-                local_reg_log = sbatch_dir / "slurm-%A_%a.out"
-                write_text(
-                    local_reg_script,
-                    build_job_script(
-                        job_name=f"LocReg_{runno}",
-                        partition=args.partition,
-                        mem=args.mem,
-                        cpus_per_task=args.cpus_per_task,
-                        stdout_path=local_reg_log,
-                        cmd=local_reg_cmd,
-                        time_limit=args.time,
-                        dependency=None if prep_id == "DRY" else f"afterany:{prep_id}",
-                        array_spec=f"0-{nvols - 1}",
-                    ),
-                )
-                local_reg_id = "DRY" if args.dry_run else sbatch_submit(
-                    local_reg_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
-                )
-                print(f"    local_reg: {local_reg_id}")
+                # local_reg array only for missing tasks
+                done_local = set(existing_local_reg_task_ids(work_dir, dce, nvols))
+                missing_local = [t for t in range(nvols) if t not in done_local]
+                if missing_local:
+                    local_reg_cmd = shell_join(
+                        [python_exe, str(pipeline), "local_reg", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
+                    )
+                    local_reg_script = sbatch_dir / f"{tag}_local_reg_array.bash"
+                    local_reg_log = sbatch_dir / "slurm-%A_%a.out"
+                    write_text(
+                        local_reg_script,
+                        build_job_script(
+                            job_name=f"LocReg_{runno}",
+                            partition=args.partition,
+                            mem=args.mem,
+                            cpus_per_task=args.cpus_per_task,
+                            stdout_path=local_reg_log,
+                            cmd=local_reg_cmd,
+                            time_limit=args.time,
+                            dependency=None if prep_id == "DRY" else f"afterany:{prep_id}",
+                            array_spec=compress_task_ids(missing_local),
+                        ),
+                    )
+                    local_reg_id = "DRY" if args.dry_run else sbatch_submit(
+                        local_reg_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
+                    )
+                    print(f"    local_reg: {local_reg_id}  missing={len(missing_local)}")
+                else:
+                    local_reg_id = "SKIPPED"
+                    print(f"    local_reg: all tasks already done")
 
                 local_mean_cmd = shell_join(
                     [python_exe, str(pipeline), "local_mean", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
                 )
                 local_mean_script = sbatch_dir / f"{tag}_local_mean.bash"
                 local_mean_log = sbatch_dir / "slurm-%j.out"
+                local_mean_dep = None
+                if local_reg_id not in ("DRY", "SKIPPED"):
+                    local_mean_dep = f"afterany:{local_reg_id}"
                 write_text(
                     local_mean_script,
                     build_job_script(
@@ -389,7 +407,7 @@ def main():
                         stdout_path=local_mean_log,
                         cmd=local_mean_cmd,
                         time_limit=args.time,
-                        dependency=None if local_reg_id == "DRY" else f"afterany:{local_reg_id}",
+                        dependency=local_mean_dep,
                     ),
                 )
                 local_mean_id = "DRY" if args.dry_run else sbatch_submit(
@@ -420,34 +438,38 @@ def main():
                 )
                 print(f"    mean_to_global: {mean_to_global_id}")
 
-                final_apply_cmd = shell_join(
-                    [python_exe, str(pipeline), "final_apply", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
-                )
-                final_apply_script = sbatch_dir / f"{tag}_final_apply_array.bash"
-                final_apply_log = sbatch_dir / "slurm-%A_%a.out"
-                write_text(
-                    final_apply_script,
-                    build_job_script(
-                        job_name=f"FinalApply_{runno}",
-                        partition=args.partition,
-                        mem=args.mem,
-                        cpus_per_task=args.cpus_per_task,
-                        stdout_path=final_apply_log,
-                        cmd=final_apply_cmd,
-                        time_limit=args.time,
-                        dependency=None if mean_to_global_id == "DRY" else f"afterok:{mean_to_global_id}",
-                        array_spec=f"0-{nvols - 1}",
-                    ),
-                )
-                final_apply_id = "DRY" if args.dry_run else sbatch_submit(
-                    final_apply_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
-                )
-                print(f"    final_apply: {final_apply_id}")
-                final_apply_ids.append(final_apply_id)
+                # final_apply array only for missing tasks
+                done_final = set(existing_final_apply_task_ids(work_dir, dce, nvols))
+                missing_final = [t for t in range(nvols) if t not in done_final]
+                if missing_final:
+                    final_apply_cmd = shell_join(
+                        [python_exe, str(pipeline), "final_apply", "--run_dir", str(run_dir), "--dce_nifti", str(dce)] + common_args
+                    )
+                    final_apply_script = sbatch_dir / f"{tag}_final_apply_array.bash"
+                    final_apply_log = sbatch_dir / "slurm-%A_%a.out"
+                    write_text(
+                        final_apply_script,
+                        build_job_script(
+                            job_name=f"FinalApply_{runno}",
+                            partition=args.partition,
+                            mem=args.mem,
+                            cpus_per_task=args.cpus_per_task,
+                            stdout_path=final_apply_log,
+                            cmd=final_apply_cmd,
+                            time_limit=args.time,
+                            dependency=None if mean_to_global_id == "DRY" else f"afterok:{mean_to_global_id}",
+                            array_spec=compress_task_ids(missing_final),
+                        ),
+                    )
+                    final_apply_id = "DRY" if args.dry_run else sbatch_submit(
+                        final_apply_script, args.submit_retries, args.submit_sleep_seconds, args.inter_submit_delay, args.verbose
+                    )
+                    print(f"    final_apply: {final_apply_id}  missing={len(missing_final)}")
+                    final_apply_ids.append(final_apply_id)
+                else:
+                    print(f"    final_apply: all tasks already done")
 
-            finalize_cmd = shell_join(
-                [python_exe, str(pipeline), "finalize", "--run_dir", str(run_dir)] + common_args
-            )
+            finalize_cmd = shell_join([python_exe, str(pipeline), "finalize", "--run_dir", str(run_dir)] + common_args)
             finalize_script = sbatch_dir / f"{runno}_finalize.bash"
             finalize_log = sbatch_dir / "slurm-%j.out"
             finalize_dep = None if (args.dry_run or not final_apply_ids) else "afterany:" + ":".join(final_apply_ids)
