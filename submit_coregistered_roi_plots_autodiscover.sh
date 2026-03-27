@@ -8,7 +8,7 @@ set -euo pipefail
 #
 #   all_niis/${runno}_coregistered
 #
-# while sourcing ROI mask definitions from:
+# while sourcing ROI mask definitions + .method files from:
 #
 #   all_niis/z${runno}
 #
@@ -18,39 +18,11 @@ set -euo pipefail
 # where REGION is one of:
 #   CM, CSF, Hc
 #
-# Example:
-#   bash submit_coregistered_roi_plots_autodiscover.sh
+# Output files are written into:
+#   all_niis/${runno}_coregistered/
 #
-# Optional:
-#   bash submit_coregistered_roi_plots_autodiscover.sh /custom/base/all_niis
-#
-# Assumes environment variables:
-#   MRI
-#   WORK
-#
-# Plot script used:
-#   $WORK/DCE_dev/Bruker_radial_recon/plot_roi_intensity.py
-#
-# Submitted job behavior:
-#   - one job per runno
-#   - each job runs up to 3 regions sequentially: CM, CSF, Hc
-#
-# Output structure:
+# and job helper/log files are written into:
 #   all_niis/${runno}_coregistered/sbatch_roi_plots/
-#       submit_*.sbatch
-#       logs/
-#       helper_run_*.sh
-#
-# Default plotting command mirrors your recent usage:
-#   --img2-baseline ${runno}_DCE_baseline.nii.gz
-#   --norm-method affine2boundline
-#   --affine-source roi
-#   --title-tag "${runno} ${region}"
-#   --title-mode compact
-#   --time-unit min
-#   --affine-solver robust
-#   --std-max-ratio 1.7
-#   --a-positive
 
 ###############################################################################
 # User-tunable defaults
@@ -108,9 +80,6 @@ parse_mask_xyzr() {
     local base
     base="$(basename "$mask_path")"
 
-    # Matches:
-    #   ..._roi_mask_xyz_57_38_49_r2.5.nii.gz
-    #   ..._roi_mask_xyz_57_38_49_r3.nii.gz
     if [[ "$base" =~ xyz_([0-9]+)_([0-9]+)_([0-9]+)_r([0-9]+([.][0-9]+)?) ]]; then
         echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]} ${BASH_REMATCH[4]}"
         return 0
@@ -137,6 +106,39 @@ find_first_mask_for_region() {
     return 0
 }
 
+ensure_method_sidecar() {
+    local coreg_img="$1"
+    local zdir="$2"
+    local coreg_dir="$3"
+
+    local stem
+    local coreg_method
+    local z_method
+
+    stem="$(basename "$coreg_img")"
+    stem="${stem%.nii.gz}"
+    stem="${stem%.nii}"
+
+    coreg_method="$coreg_dir/${stem}.method"
+    z_method="$zdir/${stem}.method"
+
+    if [[ -f "$coreg_method" ]]; then
+        return 0
+    fi
+
+    if [[ -f "$z_method" ]]; then
+        cp -f "$z_method" "$coreg_method"
+        log "Copied method sidecar: $z_method -> $coreg_method"
+        return 0
+    fi
+
+    echo "ERROR: missing method sidecar for $coreg_img" >&2
+    echo "       looked for:" >&2
+    echo "         $coreg_method" >&2
+    echo "         $z_method" >&2
+    return 1
+}
+
 submit_one_runno() {
     local runno="$1"
     local zdir="$2"
@@ -159,6 +161,11 @@ submit_one_runno() {
         return 0
     fi
 
+    # Make sure .method sidecars exist next to the coregistered inputs.
+    ensure_method_sidecar "$img1" "$zdir" "$coreg_dir" || return 1
+    ensure_method_sidecar "$img2" "$zdir" "$coreg_dir" || return 1
+    ensure_method_sidecar "$baseline" "$zdir" "$coreg_dir" || return 1
+
     local sbatch_dir="$coreg_dir/sbatch_roi_plots"
     local log_dir="$sbatch_dir/logs"
     mkdir -p "$sbatch_dir" "$log_dir"
@@ -166,14 +173,15 @@ submit_one_runno() {
     local helper_script="$sbatch_dir/helper_run_${runno}_roi_plots.sh"
     local submit_script="$sbatch_dir/submit_${runno}_roi_plots.sbatch"
 
-    # Gather region/mask info now so the helper script is fully explicit.
     local found_count=0
     local region
     local mask
     local parsed
     local x y z r
-
     local helper_body=""
+    local plot_out
+    local mask_out
+
     for region in "${REGIONS[@]}"; do
         if mask="$(find_first_mask_for_region "$zdir" "$runno" "$region")"; then
             if ! parsed="$(parse_mask_xyzr "$mask")"; then
@@ -182,13 +190,19 @@ submit_one_runno() {
             fi
             read -r x y z r <<< "$parsed"
 
+            # Force outputs into the same folder the input images came from.
+            plot_out="$coreg_dir/${runno}_${region}_roi_intensity_xyz_${x}_${y}_${z}_r${r}.png"
+            mask_out="$coreg_dir/${runno}_${region}_roi_mask_xyz_${x}_${y}_${z}_r${r}.nii.gz"
+
             helper_body+=$'\n'
             helper_body+="echo \"===================================================================\""$'\n'
             helper_body+="echo \"RUNNO : $runno\""$'\n'
             helper_body+="echo \"REGION: $region\""$'\n'
-            helper_body+="echo \"MASK  : $mask\""$'\n'
-            helper_body+="echo \"CENTER: $x $y $z\""$'\n'
-            helper_body+="echo \"RADIUS: $r\""$'\n'
+            helper_body+="echo \"SRC MASK: $mask\""$'\n'
+            helper_body+="echo \"CENTER : $x $y $z\""$'\n'
+            helper_body+="echo \"RADIUS : $r\""$'\n'
+            helper_body+="echo \"OUT PNG: $plot_out\""$'\n'
+            helper_body+="echo \"OUT MSK: $mask_out\""$'\n'
             helper_body+="echo \"===================================================================\""$'\n'
             helper_body+="python \"$PLOT_SCRIPT\" \\"$'\n'
             helper_body+="    \"$img1\" \\"$'\n'
@@ -203,7 +217,9 @@ submit_one_runno() {
             helper_body+="    --center \"$x\" \"$y\" \"$z\" \\"$'\n'
             helper_body+="    --affine-solver robust \\"$'\n'
             helper_body+="    --std-max-ratio 1.7 \\"$'\n'
-            helper_body+="    --a-positive"$'\n'
+            helper_body+="    --a-positive \\"$'\n'
+            helper_body+="    --out \"$plot_out\" \\"$'\n'
+            helper_body+="    --mask-out \"$mask_out\""$'\n'
 
             ((found_count+=1))
         else
@@ -254,7 +270,7 @@ EOF
 set -euo pipefail
 
 echo "[\$(date '+%F %T')] Slurm job starting for $runno"
-echo "[\$(date '+%F %T')] Node: \$(hostname)"
+echo "[\$(date '+%F %T')] Node : \$(hostname)"
 echo "[\$(date '+%F %T')] JobID: \$SLURM_JOB_ID"
 
 "$helper_script"
@@ -284,15 +300,12 @@ if [[ ${#zdirs[@]} -eq 0 ]]; then
 fi
 
 submitted=0
-skipped=0
-
 for zdir in "${zdirs[@]}"; do
     [[ -d "$zdir" ]] || continue
 
     zbase="$(basename "$zdir")"
     if [[ ! "$zbase" =~ ^z(.+)$ ]]; then
         log "SKIP non-run folder: $zdir"
-        ((skipped+=1))
         continue
     fi
 
@@ -301,14 +314,11 @@ for zdir in "${zdirs[@]}"; do
 
     if [[ ! -d "$coreg_dir" ]]; then
         log "SKIP $runno : missing coregistered dir $coreg_dir"
-        ((skipped+=1))
         continue
     fi
 
     if submit_one_runno "$runno" "$zdir" "$coreg_dir"; then
         ((submitted+=1))
-    else
-        ((skipped+=1))
     fi
 done
 
