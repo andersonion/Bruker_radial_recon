@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Collect selected Bruker-derived NIfTI+method files into a single folder and
-emit a minimal CSV aligned 1:1 with input rows.
+Collect selected Bruker-derived NIfTI+method files into standardized locations
+and emit a minimal CSV aligned 1:1 with input rows.
 
 Supports:
 - Baseline
@@ -9,20 +9,13 @@ Supports:
 - Block2
 - T2
 - CEST
+- T1_FISP_stack
 
-Additional CEST behavior:
-- Harvest raw Bruker CEST directory into:
-    {study_dir}/raw_CEST/{runno}/{scanno}/
-- Also copy sibling FILES (not directories) from the raw parent directory.
-
-Important rules:
-- ONLY .nii.gz files are used for matching.
-- Ignore files not beginning with 1–2 digits + '_'
-- Lower scanno wins if duplicates exist.
-- Overwrite protection enabled by default.
-- Duplicate destination detection enabled.
-- If all_niis/z{runno} exists:
-    ONLY process CEST for that runno.
+Special behavior:
+- CEST NIfTI/method goes into all_niis/
+- CEST raw data goes into raw_CEST/{runno}/
+- T1_FISP_stack goes directly into all_niis/z{runno}/
+- If all_niis/z{runno} exists, only process CEST and T1_FISP_stack.
 """
 
 import argparse
@@ -31,7 +24,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from glob import glob
@@ -44,7 +36,14 @@ LEADING_SCANNO_RE = re.compile(r"^(?P<scanno>\d{1,2})_")
 
 EXCEL_LIKE_EXTS = {".xlsx", ".xls", ".ods"}
 
-CSV_HEADERS = ["Baseline", "Block1", "Block2", "T2", "CEST"]
+CSV_HEADERS = [
+    "Baseline",
+    "Block1",
+    "Block2",
+    "T2",
+    "CEST",
+    "T1_FISP_stack",
+]
 
 
 @dataclass
@@ -53,6 +52,7 @@ class PatternSpec:
     src_glob: str
     dest_stem: str
     is_cest: bool = False
+    goes_to_zrunno: bool = False
 
 
 PATTERNS: List[PatternSpec] = [
@@ -82,6 +82,12 @@ PATTERNS: List[PatternSpec] = [
         dest_stem="CEST",
         is_cest=True,
     ),
+    PatternSpec(
+        key="T1_FISP_stack",
+        src_glob="*_*_T1_TrueFISP.nii.gz",
+        dest_stem="T1_FISP_stack",
+        goes_to_zrunno=True,
+    ),
 ]
 
 
@@ -90,10 +96,7 @@ def parse_args() -> argparse.Namespace:
         description="Collect Bruker-derived NIfTI/method files."
     )
 
-    ap.add_argument(
-        "inventory_path",
-        help="Input inventory (.csv, .xlsx, .xls, .ods)",
-    )
+    ap.add_argument("inventory_path", help="Input inventory (.csv, .xlsx, .xls, .ods)")
 
     ap.add_argument(
         "--study_dir",
@@ -158,7 +161,6 @@ def convert_to_csv_with_libreoffice(
     libreoffice_cmd: str,
     verbose: bool = False,
 ) -> str:
-
     os.makedirs(output_dir, exist_ok=True)
 
     cmd = [
@@ -174,24 +176,38 @@ def convert_to_csv_with_libreoffice(
     if verbose:
         print("Running:", " ".join(cmd))
 
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"LibreOffice command not found: {libreoffice_cmd}"
+        ) from e
 
     if proc.returncode != 0:
         raise RuntimeError(
-            f"LibreOffice conversion failed:\n{proc.stderr}"
+            "LibreOffice conversion failed.\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}\n"
         )
 
     base = os.path.splitext(os.path.basename(input_path))[0]
     out_csv = os.path.join(output_dir, base + ".csv")
 
     if not os.path.isfile(out_csv):
-        raise RuntimeError(f"Converted CSV not found: {out_csv}")
+        candidates = sorted(
+            glob(os.path.join(output_dir, "*.csv")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        if not candidates:
+            raise RuntimeError(f"No CSV created in {output_dir}")
+        out_csv = candidates[0]
 
     return out_csv
 
@@ -202,7 +218,6 @@ def read_inventory_to_dataframe(
     libreoffice_cmd: str,
     verbose: bool = False,
 ) -> pd.DataFrame:
-
     inv_path = os.path.abspath(inventory_path)
     ext = os.path.splitext(inv_path)[1].lower()
 
@@ -228,20 +243,17 @@ def list_data_dirs(
     nii_subdir: str,
     bfolder: str,
 ) -> List[str]:
-
     base = os.path.join(study_dir, date_mmddyy, nii_subdir)
     pattern = os.path.join(base, f"*{bfolder}*1_1")
 
-    matches = [
+    return sorted(
         p for p in glob(pattern)
         if os.path.isdir(p)
-    ]
-
-    return sorted(matches)
+    )
 
 
-def extract_scanno(fname: str) -> Optional[int]:
-    bn = os.path.basename(fname)
+def extract_scanno(path: str) -> Optional[int]:
+    bn = os.path.basename(path)
     m = LEADING_SCANNO_RE.match(bn)
 
     if not m:
@@ -251,29 +263,24 @@ def extract_scanno(fname: str) -> Optional[int]:
 
 
 def pick_best_candidate(files: List[str]) -> Tuple[Optional[int], Optional[str], List[int]]:
-
     valid = []
 
     for fpath in files:
         scanno = extract_scanno(fpath)
-
         if scanno is None:
             continue
-
         valid.append((scanno, fpath))
 
     if not valid:
         return None, None, []
 
     valid.sort(key=lambda x: x[0])
-
     all_scannos = sorted(set(v[0] for v in valid))
 
     return valid[0][0], valid[0][1], all_scannos
 
 
 def find_method_pair(nii_path: str) -> Optional[str]:
-
     if not nii_path.endswith(".nii.gz"):
         return None
 
@@ -290,9 +297,8 @@ def ensure_no_collision(
     seen_destinations: Set[str],
     overwrite: bool,
 ) -> bool:
-
     if dst in seen_destinations:
-        print(f"DUPLICATE DESTINATION DETECTED: {dst}")
+        print(f"DUPLICATE DESTINATION DETECTED, SKIPPING: {dst}")
         return False
 
     seen_destinations.add(dst)
@@ -308,8 +314,7 @@ def safe_copy_file(
     src: str,
     dst: str,
     dry_run: bool,
-):
-
+) -> None:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     if dry_run:
@@ -323,8 +328,7 @@ def safe_copytree(
     dst: str,
     overwrite: bool,
     dry_run: bool,
-):
-
+) -> bool:
     if os.path.exists(dst):
         if not overwrite:
             print(f"RAW DEST EXISTS, SKIPPING: {dst}")
@@ -347,10 +351,8 @@ def process_raw_cest(
     overwrite: bool,
     dry_run: bool,
     verbose: bool,
-):
-
+) -> None:
     raw_dir = nii_dir.replace("/nii/", "/raw/")
-
     scanno_dir = os.path.join(raw_dir, str(scanno))
 
     if not os.path.isdir(scanno_dir):
@@ -360,21 +362,26 @@ def process_raw_cest(
     raw_cest_root = os.path.join(study_dir, "raw_CEST")
     runno_root = os.path.join(raw_cest_root, runno)
 
-    os.makedirs(runno_root, exist_ok=True)
+    if os.path.exists(runno_root) and not overwrite:
+        print(f"RAW CEST RUNNO DEST EXISTS, SKIPPING RAW COPY: {runno_root}")
+        return
 
-    # copy scanno folder
+    if os.path.exists(runno_root) and overwrite and not dry_run:
+        shutil.rmtree(runno_root)
+
+    if not dry_run:
+        os.makedirs(runno_root, exist_ok=True)
+
     dst_scanno_dir = os.path.join(runno_root, str(scanno))
 
     safe_copytree(
-        scanno_dir,
-        dst_scanno_dir,
+        src=scanno_dir,
+        dst=dst_scanno_dir,
         overwrite=overwrite,
         dry_run=dry_run,
     )
 
-    # copy sibling FILES only
     for item in sorted(os.listdir(raw_dir)):
-
         src_item = os.path.join(raw_dir, item)
 
         if os.path.isdir(src_item):
@@ -383,20 +390,48 @@ def process_raw_cest(
         dst_item = os.path.join(runno_root, item)
 
         if os.path.exists(dst_item) and not overwrite:
+            print(f"RAW SIBLING EXISTS, SKIPPING: {dst_item}")
             continue
 
         if verbose:
             print(f"        raw sibling file: {src_item}")
 
         safe_copy_file(
-            src_item,
-            dst_item,
+            src=src_item,
+            dst=dst_item,
             dry_run=dry_run,
         )
 
 
-def main() -> int:
+def mark_all_missing(out_row: Dict[str, str]) -> None:
+    for key in CSV_HEADERS:
+        out_row[key] = "MISSING"
 
+
+def destination_paths_for_spec(
+    spec: PatternSpec,
+    runno: str,
+    all_niis_dir: str,
+    dry_run: bool,
+) -> Tuple[str, str]:
+    if spec.goes_to_zrunno:
+        dest_dir = os.path.join(all_niis_dir, f"z{runno}")
+
+        if not dry_run:
+            os.makedirs(dest_dir, exist_ok=True)
+
+        nii_dst = os.path.join(dest_dir, f"{runno}_{spec.dest_stem}.nii.gz")
+        method_dst = os.path.join(dest_dir, f"{runno}_{spec.dest_stem}.method")
+
+        return nii_dst, method_dst
+
+    nii_dst = os.path.join(all_niis_dir, f"{runno}_{spec.dest_stem}.nii.gz")
+    method_dst = os.path.join(all_niis_dir, f"{runno}_{spec.dest_stem}.method")
+
+    return nii_dst, method_dst
+
+
+def main() -> int:
     args = parse_args()
 
     all_niis_dir = os.path.join(args.study_dir, "all_niis")
@@ -417,24 +452,16 @@ def main() -> int:
         "Arunno_or_Crunno",
     ]
 
-    missing = [
-        c for c in required_cols
-        if c not in df.columns
-    ]
+    missing = [c for c in required_cols if c not in df.columns]
 
     if missing:
         raise RuntimeError(f"Missing required columns: {missing}")
 
     out_rows = []
-
     seen_destinations: Set[str] = set()
 
     for idx, row in df.iterrows():
-
-        out_row = {
-            k: ""
-            for k in CSV_HEADERS
-        }
+        out_row = {key: "" for key in CSV_HEADERS}
 
         runno = row.get("Arunno_or_Crunno")
 
@@ -447,49 +474,44 @@ def main() -> int:
         bfolder = row.get("Bruker_folder")
         scan_date_raw = row.get("Scan Date")
 
-        if pd.isna(bfolder):
-            for k in CSV_HEADERS:
-                out_row[k] = "MISSING"
+        if pd.isna(bfolder) or str(bfolder).strip() == "":
+            mark_all_missing(out_row)
             out_rows.append(out_row)
             continue
 
         date_mmddyy = scan_date_to_mmddyy(scan_date_raw)
 
         if date_mmddyy is None:
-            for k in CSV_HEADERS:
-                out_row[k] = "MISSING"
+            mark_all_missing(out_row)
             out_rows.append(out_row)
             continue
 
         bfolder = str(bfolder).strip()
 
         data_dirs = list_data_dirs(
-            args.study_dir,
-            date_mmddyy,
-            args.nii_subdir,
-            bfolder,
+            study_dir=args.study_dir,
+            date_mmddyy=date_mmddyy,
+            nii_subdir=args.nii_subdir,
+            bfolder=bfolder,
         )
 
         if not data_dirs:
-            for k in CSV_HEADERS:
-                out_row[k] = "MISSING"
+            mark_all_missing(out_row)
             out_rows.append(out_row)
             continue
 
-        # zRUNNO rule
         zrunno_dir = os.path.join(all_niis_dir, f"z{runno}")
-
-        cest_only_mode = os.path.isdir(zrunno_dir)
-
-        if args.verbose and cest_only_mode:
-            print(f"[row {idx}] z{runno} exists -> CEST-only mode")
+        zrunno_exists = os.path.isdir(zrunno_dir)
 
         if args.verbose:
-            print(f"[row {idx}] runno={runno}")
+            print(f"[row {idx}] runno={runno} date={date_mmddyy} bfolder={bfolder}")
+            if zrunno_exists:
+                print(f"    z{runno} exists -> only processing CEST and T1_FISP_stack")
+            for dd in data_dirs:
+                print(f"    data_dir: {dd}")
 
         for spec in PATTERNS:
-
-            if cest_only_mode and not spec.is_cest:
+            if zrunno_exists and spec.key not in {"CEST", "T1_FISP_stack"}:
                 continue
 
             chosen_scanno = None
@@ -497,12 +519,10 @@ def main() -> int:
             candidate_scannos = []
 
             for dd in data_dirs:
-
                 candidates = glob(os.path.join(dd, spec.src_glob))
-
                 scanno, rep, all_scannos = pick_best_candidate(candidates)
 
-                if scanno is not None:
+                if scanno is not None and rep is not None:
                     chosen_scanno = scanno
                     chosen_rep = rep
                     candidate_scannos = all_scannos
@@ -524,46 +544,44 @@ def main() -> int:
                 out_row[spec.key] = "MISSING"
                 continue
 
-            out_row[spec.key] = str(chosen_scanno)
-
-            nii_dst = os.path.join(
-                all_niis_dir,
-                f"{runno}_{spec.dest_stem}.nii.gz",
-            )
-
-            method_dst = os.path.join(
-                all_niis_dir,
-                f"{runno}_{spec.dest_stem}.method",
+            nii_dst, method_dst = destination_paths_for_spec(
+                spec=spec,
+                runno=runno,
+                all_niis_dir=all_niis_dir,
+                dry_run=args.dry_run,
             )
 
             nii_ok = ensure_no_collision(
-                nii_dst,
-                seen_destinations,
-                args.overwrite,
+                dst=nii_dst,
+                seen_destinations=seen_destinations,
+                overwrite=args.overwrite,
             )
 
             method_ok = ensure_no_collision(
-                method_dst,
-                seen_destinations,
-                args.overwrite,
+                dst=method_dst,
+                seen_destinations=seen_destinations,
+                overwrite=args.overwrite,
             )
 
-            if nii_ok:
-                safe_copy_file(
-                    chosen_rep,
-                    nii_dst,
-                    dry_run=args.dry_run,
-                )
+            if not (nii_ok and method_ok):
+                out_row[spec.key] = "MISSING"
+                continue
 
-            if method_ok:
-                safe_copy_file(
-                    method_path,
-                    method_dst,
-                    dry_run=args.dry_run,
-                )
+            safe_copy_file(
+                src=chosen_rep,
+                dst=nii_dst,
+                dry_run=args.dry_run,
+            )
+
+            safe_copy_file(
+                src=method_path,
+                dst=method_dst,
+                dry_run=args.dry_run,
+            )
+
+            out_row[spec.key] = str(chosen_scanno)
 
             if spec.is_cest:
-
                 process_raw_cest(
                     nii_dir=os.path.dirname(chosen_rep),
                     scanno=chosen_scanno,
@@ -576,16 +594,13 @@ def main() -> int:
 
             if args.verbose:
                 print(f"    {spec.key}: scanno={chosen_scanno}")
+                print(f"        nii.gz: {chosen_rep}")
+                print(f"        method: {method_path}")
 
         out_rows.append(out_row)
 
     with open(args.out_csv, "w", newline="") as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=CSV_HEADERS,
-        )
-
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         writer.writeheader()
         writer.writerows(out_rows)
 
