@@ -1,0 +1,139 @@
+### REQUIRED PARAMETERS ###
+project_name=26.invivoT2.01
+#optional_external_inputs_dir=/mnt/newStor/paros/paros_WORK/bj/GLP1_T2s/
+
+control_comma_list=B25122902,B25122903,B25122904,B25123000,B25123002,B25123003,B25123005,B25123008,B25123009,B26010600,B26010602,B26010604,B26010605,B26010606,B26010607,B26010608,B26010800,B26010801,B26010802,B26010803,B26010804,B26010807,B26010808,B26010900,B26010901,B26010902,A26011503,A26011505,A26011601,A26011604,A26012001,A26012002,A26012005,A26012101,A26040801,A26040803,A26040804,A26041401,A26041601,A26041602,C25121102,C26011302,C26011303,C26011401,C26011402,C26011403,C26011501,C26042201,C26042202,C26042301,C26042302,P26011505,P26011601,P26011604,P26012002,P26012003,P26012005,P26012101,P26021101,V26011303,V26011304,V26011401,V26011402,V26011403,V26011501,V26011502,V26011504,V26042201,V26042202,V26042301,V26042302,A21080903,A21090607,A21090610,A21100404,A21100408,A21100411,A21100414,A21112201,A21112204,A21112207,A21112210,A21112213,A21112216,A21112225,A21112228,A22011003,A22011006,A22011009,A22011012,A22020703,A22020710,A22020713,A22020716,A22020720,A22020723,A22030701,A22030705,A22030708,A22030711,A22030715,A22040401,A22040404,A22040407,A22040410,A22050901,A22050908,A22050912,A22060601,A22060604,A22060615,A22060618,A22060621,A22070404,A22070407,A22070414,A22070417,A22080818,A22080821,A22080807,A22080810,A22080813,A22080816,A22090508,A22090511,A22100304,A22100307,A22110102,A23011802,A23011805,A22092901,A22092904,A23011703,A23011706,A23011707,A23011710,T1template,T2template
+## Hint: control_comma_list should include all runnos that you want to contribute to the creation of the MDT (aka template)
+
+compare_comma_list=B25122902,B25122903,B25122904,B25123000,B25123002,B25123003,B25123005,B25123008,B25123009,B26010600,B26010602,B26010604,B26010605,B26010606,B26010607,B26010608,B26010800,B26010801,B26010802,B26010803,B26010804,B26010807,B26010808,B26010900,B26010901,B26010902,A26011503,A26011505,A26011601,A26011604,A26012001,A26012002,A26012005,A26012101,A26040801,A26040802,A26040803,A26040804,A26041401,A26041601,A26041602,C25121102,C26011302,C26011303,C26011401,C26011402,C26011403,C26011501,C26042201,C26042202,C26042301,C26042302,P26011505,P26011601,P26011604,P26012002,P26012003,P26012005,P26012101,P26021101,V25121102,V26011303,V26011304,V26011401,V26011402,V26011403,V26011501,V26011502,V26011504,V26042201,V26042202,V26042301,V26042302,A21080903,A21090607,A21090610,A21100404,A21100408,A21100411,A21100414,A21112201,A21112204,A21112207,A21112210,A21112213,A21112216,A21112225,A21112228,A22011003,A22011006,A22011009,A22011012,A22020703,A22020710,A22020713,A22020716,A22020720,A22020723,A22030701,A22030705,A22030708,A22030711,A22030715,A22040401,A22040404,A22040407,A22040410,A22050901,A22050908,A22050912,A22060601,A22060604,A22060615,A22060618,A22060621,A22070404,A22070407,A22070414,A22070417,A22080818,A22080821,A22080807,A22080810,A22080813,A22080816,A22090508,A22090511,A22100304,A22100307,A22110102,A23011802,A23011805,A22092901,A22092904,A23011703,A23011706,A23011707,A23011710,T1template,T2template
+## Hint: compare_comma_list should include all runnos that should be independently re-registered to the final MDT once it has been created.
+
+#group_1_runnos=N51211,N51221,N51231,N51383,N51386
+#group_2_runnos=N51136,N51201,N51234,N51241,N51252
+## Hint: group_1_runnos and group_2_runnos should be mutually exclusive, as they are used for VBA and label statistical comparisons
+
+#custom_predictor_string=nos2_vs_cvn
+## Hint: This is optional, and is how you can "name" the groups; i.e. nos2 is the name of group_1 and cvn is the name of group_2 in the example above.
+## Hint: This will default to control_vs_treated if not specified.
+
+channel_comma_list=T2,mask
+## Hint: At a minimum, this must at least include any contrasts used to drive registration.
+
+# Rigid (coarse) alignment options
+rigid_atlas_name=invivoAPOE1
+rigid_contrast=T2
+
+# Non-linear (diffeomorphic) registration options
+mdt_contrast=T2
+mdt_creation_strategy=iterative
+## Hint: options for mdt_creation_strategy include 'iterative' and 'pairwise'
+
+mdt_iterations=6
+## Hint: You want at least 4 mdt_iterations, as this is the first fully-sampled level
+
+diffeo_transform_parameters=0.5,3,0.5
+diffeo_iterations=100x100x100x60
+
+### Various optional parameters ###
+
+#optional_suffix=April2017analysis
+## Hint: optional_suffix will be appended to the main directory names, before -inputs/-work/-results.
+
+#vbm_reference_space=N51211
+vbm_reference_space=/mnt/newStor/paros/paros_WORK/bj/GLP1_T2s/GLP1_SAMBA_ref_2.nii.gz
+## Hint: vbm_reference_space can be a specific runno, an arbitrary image, the name of an atlas, or 'native' (the first control runno).
+
+
+## Connectivity processing options
+
+#convert_labels_to_RAS=1
+## Hint: historically, the default working orientation is ALS, so convert_labels_to_RAS will turn final labels from ALS to RAS.
+
+do_connectivity=0
+## Hint: do_connectivity=1 will process the 4D diffusion nifti stack and bvals/bvecs to be used as input into another program such mrtrix or DSI studio
+##       Only DSI studio is fully supported right now for bval/bvec processing and formatting.
+
+#eddy_current_correction=1
+## Hint: When turned on eddy current correction was used during DTI tensor processing, the resulting rotations will be applied to the bvecs as well.
+
+
+## Affine registration options
+
+#affine_contrast=dwi
+#affine_target=N51231
+## Hint: affine_target will be the first control runno if not specified.  Future support will allow for the average of the rigidly aligned images to be the affine registration target.
+
+
+## Image orientation options 
+
+working_image_orientation=ALS
+## Hint: All work will be performed in working_image_orientation, which is ALS by default which is based on the current standard atlas orientation.
+## Hint: Support of arbitrary orientations is forthcoming, and will be RAS in the future.
+
+original_study_orientation=ALS
+## Hint: This describes the current orientation of all the incoming images, assuming they are uniformly oriented.
+## Hint: Support for handling outliers is forthcoming and will be in the form of:
+##       original_orientation_N51201=LPI (i.e. original_orientation_$runno=...)
+original_orientation_B25122902=RIA
+original_orientation_B25122903=RIA
+original_orientation_B25122904=RIA
+#flip_x=1
+## Hint: flip_x=1 will rotate incoming images from PRS to ALS.
+## Hint: This will be deprecated shortly.
+
+
+#flip_z=0
+## Hint: flip_z=1 will rotate incoming images from ARI to ALS.
+## Hint: This will be deprecated shortly.
+
+## Hint: flip_x=1 and flip_z=1 will take images from PLI to ALS.
+
+
+
+
+# Label options
+create_labels=1
+label_atlas_name=invivoAPOE1
+## Hint: This is the name of the ANATOMY (i.e. images) upon which your source labels are overlaid
+
+#label_input_file=
+## Hint: If the name of your labels does not exactly match the label_atlas_name--perhaps due to multiple
+##       versions of labels for the same anatomicaly atlas
+
+
+label_space=pre_rigid
+## Hint: Multiple, comma-limited label_space options can be specified, and include:
+##       'pre_rigid': Native space of incoming images without any transforms applied
+##       'post_rigid' (or 'pre_affine'): Only the rigid linear transform will be applied to the images (no scaling or shearing)
+##       'post_affine': The rigid and affine linear transforms will be applied to the images (translation+rotation+scaling+shearing)
+##       'MDT': All images will be affinely and diffeomorphically mapped into the MDT label set
+##       'atlas': All images will be affinely and diffeomorphically mapped into the original atlas label set	
+  
+# Masking/skull-stripping options	
+skull_strip_contrast=T2
+## Hint: our automated skull-stripping is optimized for dwi
+
+threshold_code=4
+do_mask=1
+port_atlas_mask=0
+## Hint: port_atlas_mask will align and scale the atlas mask to the results of the automated skull-stripping
+
+#pre_masked=0
+## Hint: pre_masked=1 will result in do_mask=0; this is if your input images are already masked.
+
+
+## VBA Options
+
+#vba_contrast_comma_list=dwi,fa,e1,jac
+## Hint: If not all contrasts should be analyzed with VBA, this comma-delimited list of image contrasts will specify which ones will be used with VBA. If this variable is not set, VBA will be performed on all available contrasts (except the nii4D).
+
+#smoothing_comma_list=1,2,3,0.1mm
+## Hint: This comma-delimited list specifies the smoothing radii you want to try before performing VBA; no specified units defaults to 'vox', while 'mm' can be specified if need be.
+
+#vba_analysis_software=surfstat
+## Hint: multiple comma-delimited options can be specified and include: surfstat (default),fsl,ANTsR, and spm.
+## Hint: fsl must be included if you want to do nonparametric testing
+
+#nonparametric_permutations=6000
+#fdr_masks=ROI:51:1051,label:1:2:3:4:5:6,fa:0.3:1
+## Hint: Full help on how to specify ROI/label-based and threshholded contrast-based fdr maps is forthcoming.
